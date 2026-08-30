@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
-## [Niewydane] — od 0.3.1
+## [0.3.2] — 2026-08-30
 
 ### Naprawione — sprzątanie ToSort po konwersji na CHD
 - Po zrobieniu gry na CHD jej źródło w ToSort jest sprzątane porządnie:
