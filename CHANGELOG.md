@@ -2,6 +2,23 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [Niewydane] — od 0.3.1
+
+### Naprawione — sprzątanie ToSort po konwersji na CHD
+- Po zrobieniu gry na CHD jej źródło w ToSort jest sprzątane porządnie:
+  **wspólne tory** (np. filler GD-ROM „Track 2" identyczny w setkach gier,
+  chroniony przez nieposiadane gry z DAT) nie zostają już w dziesiątkach kopii —
+  **redukcja do JEDNEJ kopii** w całym przebiegu (`kept_shared`); nadmiarowe
+  kasowane. **Puste podkatalogi** ToSort po skasowanych torach są usuwane.
+  (`convert._purge_redundant_tosort_tracks`; test
+  `test_purge_shared_track_reduced_to_single_copy`.)
+
+### Utrzymanie (jednorazowo, na danych użytkownika)
+- Usunięto zalegające resztki źródeł z `to sort` gier będących już CHD
+  (Dreamcast — 11 podkatalogów; naomi2 — 3 zipy + zbłąkany tor).
+- Wyczyszczono indeks z **5763** martwych wpisów (pliki nieistniejące na
+  dostępnych dyskach) + **1055** osieroconych rekordów członków archiwów.
+
 ## [0.3.1] — 2026-08-21
 
 ### Zmienione

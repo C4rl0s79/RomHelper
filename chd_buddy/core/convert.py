@@ -641,59 +641,78 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB) -> Optional[Path]:
 
 
 def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
-                                   log: LogCB, needed_crc=None) -> int:
+                                   log: LogCB, needed_crc=None,
+                                   kept_shared=None) -> int:
     """Kasuje z ToSort ŹRÓDŁO gry JUŻ zrobionej na CHD (w docelowym): luźne
-    pliki ścieżek ORAZ archiwa ZIP/7z zawierające te ścieżki. Chroni sumy
-    potrzebne innym, niezaspokojonym grom (`needed_sha1`, `needed_crc`), nie
-    rusza symlinków. Zwraca ile skasowano.
+    pliki ścieżek ORAZ archiwa ZIP/7z zawierające te ścieżki.
 
-    WAŻNE: dopasowanie jak w matcherze — po SHA-1, a GDY GO BRAK (członek
-    archiwum ze skanu SZYBKIEGO ma tylko CRC32) po CRC32+rozmiar. Bez tego
-    fallbacku ZIP-y wciągnięte skanem szybkim nigdy nie były kasowane, mimo że
-    gra jest już na CHD."""
+    Tory POTRZEBNE niezaspokojonym grom (`needed_sha1`/`needed_crc`) to zwykle
+    WSPÓLNE filler-tory (np. GD-ROM „Track 2", identyczny w setkach gier). Nie
+    trzymamy ich w dziesiątkach kopii — redukujemy do JEDNEJ w całym przebiegu
+    (`kept_shared`), resztę kasujemy. Puste podkatalogi po skasowanych torach
+    też usuwamy. Symlinki nietknięte. Zwraca ile skasowano.
+
+    Dopasowanie jak w matcherze: po SHA-1, a gdy brak — po CRC32+rozmiar."""
     needed_crc = needed_crc or set()
+    if kept_shared is None:
+        kept_shared = set()
     n = 0
+    touched_dirs: set = set()
     candidate_archives: set = set()
     for rom in game.roms:
         sha1 = (rom.sha1 or "").lower()
         crc = (rom.crc or "").lower().zfill(8) if rom.crc else ""
         size = rom.size or 0
-        # potrzebne niezaspokojonej grze (po SHA-1 albo CRC+rozmiar) → zostaw
-        if sha1 and sha1 in needed_sha1:
-            continue
-        if crc and size and (crc, size) in needed_crc:
-            continue
-        # 1) LUŹNE kopie ścieżki — po SHA-1, w razie braku po CRC32+rozmiar
+        protected = ((sha1 and sha1 in needed_sha1)
+                     or (crc and size and (crc, size) in needed_crc))
+        # LUŹNE kopie ścieżki w ToSort (po SHA-1, w razie braku CRC32+rozmiar)
         rows = index.find_sha1(sha1, include_chd_content=False) if sha1 else []
         if not rows and crc and size:
             rows = index.find_crc(crc, size)
-        for row in rows:
-            p = row["path"]
-            np = os.path.normcase(p)
-            if not any(np.startswith(dp) for dp in del_prefixes):
-                continue                      # nie w ToSort — nie ruszamy
-            if row["is_link"] or row["missing"]:
-                continue
+        copies = [r for r in rows
+                  if any(os.path.normcase(r["path"]).startswith(dp)
+                         for dp in del_prefixes)
+                  and not r["is_link"] and not r["missing"]]
+
+        if protected:
+            # WSPÓLNY tor: zostaw dokładnie 1 kopię w CAŁYM przebiegu.
+            key = sha1 or f"{crc}:{size}"
+            if key in kept_shared:
+                continue                      # 1 kopię już zachowaliśmy wcześniej
+            kept_shared.add(key)
+            victims = copies[1:]              # copies[0] zostaje jako ta jedna
+        else:
+            victims = copies                  # nikt nie potrzebuje → kasuj wszystkie
+
+        for row in victims:
+            p2 = row["path"]
             try:
-                os.unlink(p)
-                index.remove_path(p)
+                os.unlink(p2)
+                index.remove_path(p2)
                 n += 1
-                log(f"KASUJ z ToSort (gra już na CHD): {p}")
+                touched_dirs.add(os.path.dirname(p2))
+                tag = ("nadmiarowy wspólny tor" if protected
+                       else "gra już na CHD")
+                log(f"KASUJ z ToSort ({tag}): {p2}")
             except OSError as e:
-                log(f"  nie skasowano {p}: {e}")
-        # 2) ARCHIWA (ZIP/7z) zawierające tę ścieżkę — SHA-1, potem CRC+rozmiar
+                log(f"  nie skasowano {p2}: {e}")
+
+        if protected:
+            continue                          # archiwum ze wspólnym torem zostaw
+        # ARCHIWA (ZIP/7z) zawierające tę ścieżkę — SHA-1, potem CRC+rozmiar
         try:
             marchs = index.find_member_sha1(sha1) if sha1 else []
             if not marchs and crc and size:
                 marchs = index.find_member_crc(crc, size)
             for m in marchs:
                 ap = m["archive"]
-                if any(os.path.normcase(ap).startswith(dp) for dp in del_prefixes):
+                if any(os.path.normcase(ap).startswith(dp)
+                       for dp in del_prefixes):
                     candidate_archives.add(ap)
         except Exception:
             pass
     # skasuj archiwum tylko gdy ŻADEN jego członek nie jest potrzebny
-    # niezaspokojonej grze (po SHA-1 albo CRC+rozmiar — jak wyżej).
+    # niezaspokojonej grze (po SHA-1 albo CRC+rozmiar).
     for ap in candidate_archives:
         try:
             members = index._db.execute(
@@ -718,9 +737,23 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
             os.unlink(ap)
             index.remove_path(ap)
             n += 1
+            touched_dirs.add(os.path.dirname(ap))
             log(f"KASUJ z ToSort archiwum (gra już na CHD): {ap}")
         except OSError as e:
             log(f"  nie skasowano archiwum {ap}: {e}")
+    # posprzątaj PUSTE podkatalogi ToSort po skasowanych plikach (od najgłębszych)
+    for d in sorted(touched_dirs, key=len, reverse=True):
+        nd = os.path.normcase(d)
+        if not any(nd.startswith(dp) for dp in del_prefixes):
+            continue                          # tylko wewnątrz ToSort
+        if any(nd + os.sep == dp for dp in del_prefixes):
+            continue                          # nie kasuj korzenia ToSort
+        try:
+            if not os.listdir(d):
+                os.rmdir(d)
+                log(f"KASUJ pusty podkatalog ToSort: {d}")
+        except OSError:
+            pass
     return n
 
 
@@ -971,6 +1004,11 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                     + os.sep for r in (delete_roots or []) if r]
     n_total = sum(len(r.entry.games) for r in reports) or 1
     gi = 0
+    # WSPÓLNE tory (np. filler GD-ROM „Track 2", identyczny w setkach gier):
+    # chronione przez needed_sha1 nieposiadanych gier. Zamiast trzymać dziesiątki
+    # kopii — redukujemy do JEDNEJ w całym przebiegu. Klucz sha1/crc:size, który
+    # już ma zachowaną 1 kopię.
+    _kept_shared: set = set()
     for rep in reports:
         if cancel is not None and cancel.is_set():
             break
@@ -1103,7 +1141,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         and is_havechd):
                     st.tosort_purged += _purge_redundant_tosort_tracks(
                         game, index, del_prefixes, _needed_sha1, log,
-                        needed_crc=_needed_crc)
+                        needed_crc=_needed_crc, kept_shared=_kept_shared)
                 continue
             if all(s.state in (RomState.HAVE, RomState.HAVE_CHD) for s in sts):
                 # zaspokojona bez konwersji (np. już luźna w docelowym) — jeśli
@@ -1112,7 +1150,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         and any(s.state == RomState.HAVE_CHD for s in sts)):
                     st.tosort_purged += _purge_redundant_tosort_tracks(
                         game, index, del_prefixes, _needed_sha1, log,
-                        needed_crc=_needed_crc)
+                        needed_crc=_needed_crc, kept_shared=_kept_shared)
                 continue
             if on_progress:
                 on_progress(gi, n_total, f"konwersja (ze źródła): {game.name}")
