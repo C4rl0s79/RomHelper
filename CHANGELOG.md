@@ -5,6 +5,21 @@ Format: [semver](https://semver.org). Najnowsze na górze.
 ## [0.5.0] — 2026-09-05
 
 ### Dodane
+- **Wykrywanie ZŁEGO KONTENERA CHD w skanie** (gra DVD spakowana jako CD i
+  odwrotnie). Dotąd matcher patrzył tylko na TREŚĆ (`data_sha1==profil`), więc
+  DVD zrobione przez `createcd` — o ile treść po deframe się zgadzała —
+  pokazywało się jako „komplet" i było niewidoczne. Teraz deep-probe zapisuje
+  `files.bad_container` (typ kontenera z nagłówka vs medium w DAT), a matcher
+  degraduje taki CHD z HAVE_CHD do „do naprawy"; w liście gier nota „🧩 zły
+  kontener CHD". Tani check (bez ekstrakcji), raz per plik (kolumna -1/0/1,
+  backfill dla już zindeksowanych). Wymaga chdman. Test
+  `test_match_flags_bad_container_chd`.
+- **Naprawa kontenera wpięta w „Napraw"**: gdy zaznaczone „konwertuj do formatu
+  docelowego", „Napraw" uruchamia też `rebuild_bad_chds` (CD→DVD w miejscu +
+  CD o złym układzie wg cue) — więc skan wykryje, a naprawa sama poprawi także
+  pliki, o których nie wiadomo, że są błędne. Po naprawie flaga `bad_container`
+  jest zerowana (raport od razu „komplet"). Osobny przycisk **„Odbuduj CHD wg
+  cue"** zostaje do ręcznego uruchamiania poza kolejnością.
 - **Format ClrMamePro** obsługiwany obok Logiqx XML — `parse_dat` auto-wykrywa
   format (po pierwszym znaku) i parsuje tekstowe `game ( … rom ( … ) )`
   (`datfile._parse_cmpro` + `_cmpro_header`; test

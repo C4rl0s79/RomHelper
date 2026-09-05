@@ -29,6 +29,7 @@ from typing import Optional, Sequence
 from .datfile import DatRom
 from .datstore import DatEntry
 from .fileindex import FileIndex
+from .models import MediaType
 
 
 class RomState(Enum):
@@ -63,6 +64,9 @@ class RomStatus:
                                     # potrzebne ROM-y; źródła NIE kasować
     is_translation: bool = False    # slot SPEŁNIONY świadomą podmianą na
                                     # tłumaczenie (translations.json) — GUI 🌐
+    bad_container: bool = False     # CHD ma ZŁY kontener vs medium DAT (np. gra
+                                    # DVD zrobiona jako CD) — „do naprawy",
+                                    # naprawia „Odbuduj CHD wg cue"
 
     @property
     def canonical_path(self) -> Path:
@@ -473,12 +477,24 @@ def match_game(entry: DatEntry, game, index: FileIndex,
         state = RomState.WRONG_NAME
     else:
         state = RomState.ELSEWHERE
+    # ZŁY KONTENER (np. gra DVD spakowana jako CD): treść się zgadza, więc bez
+    # tego byłby „komplet" — ale w emulatorze nie ruszy. Degradujemy do „do
+    # naprawy"; naprawia „Odbuduj CHD wg cue" (rebuild_bad_chds, CD→DVD).
+    bad_cont = False
+    try:
+        bad_cont = ("bad_container" in chd_row.keys()
+                    and chd_row["bad_container"] == 1)
+    except Exception:
+        bad_cont = False
+    if bad_cont and state == RomState.HAVE_CHD:
+        state = RomState.WRONG_NAME
     for s in statuses:
         s.state = state
         s.via_chd = True
         s.member = ""
         s.source_path = src
         s.canonical_override = str(canonical)
+        s.bad_container = bad_cont
     return statuses
 
 
@@ -548,6 +564,22 @@ def deep_probe_chds(
 
     identified = 0
     seen: set[str] = set()
+
+    def _flag_container(pth, chd_info, media) -> None:
+        """Zapisz, czy KONTENER CHD zgadza się z medium gry w DAT (createcd vs
+        createdvd). Tani — z nagłówka (bez ekstrakcji). Niepewne → 0 (nie strasz)."""
+        try:
+            if chd_info is None or media is None:
+                index.set_bad_container(pth, 0)
+                return
+            dm = chd_info.detected_media
+            if dm == MediaType.UNKNOWN or media == MediaType.UNKNOWN:
+                index.set_bad_container(pth, 0)
+                return
+            index.set_bad_container(pth, 1 if dm != media else 0)
+        except Exception:
+            pass
+
     # 1. PASS: zbierz kandydatów (CHD bez identyfikacji, nie deep_fail-stale) —
     #    żeby pasek OGÓLNY pokazał realny licznik „X/Y", a nie stał na 0/0.
     candidates: list = []
@@ -561,7 +593,12 @@ def deep_probe_chds(
                 continue
             seen.add(key)
             if row["data_sha1"] and row["data_sha1"] in known:
-                continue          # już zidentyfikowany
+                # zidentyfikowany po TREŚCI; ale jeśli KONTENER jeszcze
+                # niesprawdzony (bad_container=-1) — dołóż na TANI check
+                # (bez ekstrakcji), żeby wykryć np. DVD zrobione jako CD.
+                bc = row["bad_container"] if "bad_container" in row.keys() else 0
+                if bc != -1:
+                    continue
             # PORAŻKA TEŻ JEST WYNIKIEM: plik już przeszedł głęboką
             # identyfikację bez dopasowania i się NIE ZMIENIŁ => nie mielimy
             # go ponownie co skan. Ponowną próbę wymusza pełny skan katalogu.
@@ -585,6 +622,16 @@ def deep_probe_chds(
                 on_progress(ci, total_cand,
                             f"identyfikacja CHD ({ci + 1}/{total_cand}): "
                             f"{path.name}")
+            # JUŻ zidentyfikowany po treści, tu tylko dlatego, że KONTENER nie
+            # był sprawdzony → TANI check (nagłówek, bez ekstrakcji) i dalej.
+            dsha_known = row["data_sha1"] and row["data_sha1"] in known
+            if dsha_known:
+                try:
+                    _info = chd.info(path)
+                except OSError:
+                    _info = None
+                _flag_container(path, _info, known[row["data_sha1"]].media)
+                continue
             # 1) tani nagłówek
             hit = ""
             info = None
@@ -598,6 +645,7 @@ def deep_probe_chds(
                 _log(f"CHD info: {path.name}: {e}")
             if hit:
                 index.set_data_sha1(path, hit)
+                _flag_container(path, info, known[hit].media)
                 identified += 1
                 _log(f"CHD OK (nagłówek): {path.name} -> {known[hit].game}")
                 continue
@@ -640,6 +688,10 @@ def deep_probe_chds(
                               cancel_event=cancel_event, chd_info=info)
             if r.ok and r.sha1:
                 index.set_data_sha1(path, r.sha1)
+                # kontener: media dopasowanej gry vs typ CHD z nagłówka (info).
+                _media = r.media if r.media is not None else (
+                    known[r.sha1].media if r.sha1 in known else None)
+                _flag_container(path, info, _media)
                 identified += 1
                 _log(f"CHD OK ({r.method}): {path.name} -> {r.game}")
             elif cancel_event is not None and cancel_event.is_set():

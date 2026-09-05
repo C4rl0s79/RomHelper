@@ -56,7 +56,11 @@ CREATE TABLE IF NOT EXISTS files (
     scanned_at TEXT NOT NULL DEFAULT '',
     -- mtime_ns pliku w chwili NIEUDANEJ głębokiej identyfikacji CHD:
     -- porażka też jest wynikiem — nie mielimy tego samego pliku co skan.
-    deep_fail INTEGER NOT NULL DEFAULT 0
+    deep_fail INTEGER NOT NULL DEFAULT 0,
+    -- CHD: czy KONTENER zgadza się z medium gry w DAT (createcd vs createdvd).
+    -- -1 = niesprawdzony, 0 = zgodny, 1 = NIEZGODNY (np. gra DVD spakowana jako
+    -- CD) => „do naprawy" (skan sam to wykrywa, nie tylko po treści).
+    bad_container INTEGER NOT NULL DEFAULT -1
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
@@ -257,6 +261,12 @@ class FileIndex:
                 "ALTER TABLE files ADD COLUMN deep_fail INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass                       # kolumna już jest
+        try:
+            self._db.execute(
+                "ALTER TABLE files ADD COLUMN bad_container "
+                "INTEGER NOT NULL DEFAULT -1")
+        except sqlite3.OperationalError:
+            pass                       # kolumna już jest
         self._db.commit()
 
     # --- cykl życia ---------------------------------------------------------
@@ -393,7 +403,8 @@ class FileIndex:
                         "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
                         "  md5=excluded.md5, sha1=excluded.sha1, "
                         "  data_sha1=excluded.data_sha1, is_link=0, missing=0, "
-                        "  scanned_at=excluded.scanned_at, deep_fail=0",
+                        "  scanned_at=excluded.scanned_at, deep_fail=0, "
+                        "  bad_container=-1",     # plik się zmienił → sprawdź od nowa
                         (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, ds, now),
                     )
                     stats.hashed += 1
@@ -824,6 +835,14 @@ class FileIndex:
         key = str(Path(os.path.abspath(path)))
         self._db.execute("UPDATE files SET data_sha1=? WHERE path=?",
                          (sha1.lower(), key))
+        self._db.commit()
+
+    def set_bad_container(self, path: Path | str, bad: int) -> None:
+        """Zapisuje wynik sprawdzenia KONTENERA CHD vs medium DAT:
+        -1 niesprawdzony, 0 zgodny, 1 NIEZGODNY (np. gra DVD zrobiona jako CD)."""
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET bad_container=? WHERE path=?",
+                         (int(bad), key))
         self._db.commit()
 
     def remove_path(self, path: Path | str) -> None:

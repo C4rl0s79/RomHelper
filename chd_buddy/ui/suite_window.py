@@ -1047,6 +1047,12 @@ class SuiteWindow(QMainWindow):
                     + (f" [{_sub.get('lang')}]" if _sub.get("lang") else "")
             elif _avail:
                 disp = f"{game.name}  🌐"
+            # ZŁY KONTENER CHD (np. gra DVD zrobiona jako CD) — wyraźna nota,
+            # żeby odróżnić od zwykłej „złej nazwy". Naprawia „Odbuduj CHD wg cue".
+            _sl = statuses.get(game.name) if statuses else None
+            if _sl and any(getattr(s, "bad_container", False) for s in _sl):
+                note = (note + " · " if note else "") + tr("zły kontener CHD")
+                disp = f"🧩 {disp}"
             shown += 1
             it = QTreeWidgetItem([disp, str(len(game.roms)), note])
             it.setData(0, Qt.ItemDataRole.UserRole, game)
@@ -2288,6 +2294,29 @@ class SuiteWindow(QMainWindow):
                                after_place=_do_convert,
                                converted_games=converted_games,
                                on_progress=progress)
+                # NAPRAWA KONTENERA CHD w ramach naprawy: skan oznaczył złe
+                # kontenery (bad_container — np. gra DVD zrobiona jako CD).
+                # Przekontenteruj CD→DVD w miejscu (i CD o złym układzie wg cue)
+                # — TA SAMA logika, co przycisk „Odbuduj CHD wg cue" (bez
+                # duplikatu). Osobny przycisk zostaje do ręcznego, poza
+                # kolejnością. Bramka na „konwertuj" (i tak wymaga chdman).
+                if convert and not cancel.is_set():
+                    try:
+                        from ..core.chdman import CHDMan
+                        from ..core.chdrebuild import rebuild_bad_chds
+                        from ..core.cuelib import CueLibrary
+                        _chd = CHDMan(settings.chdman_path or None)
+                        _lib = CueLibrary(Path(dats) / "cues", log=log)
+                        _extra = [Path(t) for t in tosorts
+                                  if t and Path(t).is_dir()]
+                        _rst = rebuild_bad_chds(
+                            entries, _lib, _chd, settings, idx,
+                            extra_roots=_extra, dry_run=dry, log=log,
+                            on_progress=progress, detail=detail, cancel=cancel)
+                        log(f"Naprawa kontenera CHD: {_rst.summary()}")
+                    except Exception as _e:      # brak chdman itp. — nie wywalaj
+                        log(f"Naprawa kontenera CHD pominięta: {_e}")
+
                 # KONIEC: dopiero teraz kasujemy oryginalne źródła gier
                 # skonwertowanych PROSTO ZE ŹRÓDŁA (współdzielone ścieżki
                 # wielopłytowe były dostępne przez cały placement/fallback).
