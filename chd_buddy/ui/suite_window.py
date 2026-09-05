@@ -2528,7 +2528,11 @@ class SuiteWindow(QMainWindow):
         row2 = QHBoxLayout()
         self.btn_icons = QPushButton(tr("🖼 Twórz ikony"))
         self.btn_icons.clicked.connect(self._art_icons)
-        self.btn_lnk = QPushButton(tr("🔗 Twórz skróty .lnk"))
+        # Etykieta zostaje kluczem tłumaczenia; na Linuksie podmieniamy tylko
+        # rozszerzenie, żeby przycisk nie obiecywał .lnk zamiast .desktop.
+        from ..core.shortcuts import SHORTCUT_EXT
+        self.btn_lnk = QPushButton(
+            tr("🔗 Twórz skróty .lnk").replace(".lnk", SHORTCUT_EXT))
         self.btn_lnk.clicked.connect(self._art_shortcuts)
         self.btn_m3u = QPushButton(tr("🎵 Generuj playlisty .m3u"))
         self.btn_m3u.clicked.connect(self._art_m3u)

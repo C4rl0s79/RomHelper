@@ -2,6 +2,63 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.5.0] — 2026-09-05
+
+### Dodane
+- **Format ClrMamePro** obsługiwany obok Logiqx XML — `parse_dat` auto-wykrywa
+  format (po pierwszym znaku) i parsuje tekstowe `game ( … rom ( … ) )`
+  (`datfile._parse_cmpro` + `_cmpro_header`; test
+  `test_discover_reads_clrmamepro_dat`). Realny przypadek: libretro
+  `BIOS\System.dat` (396 BIOS-ów) teraz się wczytuje.
+- **Sidecar-JSON RomVaulta** (opcjonalny — nie każdy DAT go ma): przy skanie
+  wczytujemy metadane obok `.dat` (dopasowanie po `datName`), zapisane w
+  `DatEntry.meta` (group/system/version/datROMsSize; `datstore._sidecar_meta`).
+- **Auto-wykrycie kolekcji tłumaczeń**: DAT z grupą/nazwą `[T-…]` (np.
+  „[T-En]Collection") staje się pulą wariantów BEZ ręcznego ustawiania roli;
+  język czytany też z grupy/systemu JSON (`translations.is_translation_collection`,
+  `build_variant_index`).
+
+### Naprawione
+- **Uszkodzony/pusty/nie-DAT plik nie wywala już skanu.** Twardy błąd parsowania
+  (`ElementTree.ParseError: line 1, column 0`) jest łapany, a plik bez gier
+  (pusty/nieczytelny) pomijany z komunikatem „POMIJAM …" — reszta kolekcji
+  wczytuje się normalnie (`datstore.discover`; test
+  `test_discover_skips_corrupt_dat`).
+- **Sprzątanie ToSort po CHD:** wspólne tory (filler GD-ROM) redukowane do 1
+  kopii w przebiegu, puste podkatalogi usuwane
+  (`convert._purge_redundant_tosort_tracks`).
+
+## [0.4.0] — 2026-09-04
+
+### Dodane — wsparcie dla Linuksa (paczka źródłowa, bez binarki)
+- **Skróty do gier `.desktop`** zamiast `.lnk`. Argumenty są cytowane wg
+  specyfikacji Desktop Entry (spacje, `"`, `` ` ``, `$`, a literalny `%` jako
+  `%%`), plik powstaje atomowo i z bitem wykonywalnym — bez `chmod +x` GNOME
+  i KDE pokazują skrót jako plik tekstowy. (`shortcuts._write_desktop_batch`)
+- **Wykrywanie emulatorów na Linuksie**: katalog emulatorów (także pliki
+  `.AppImage`), potem `PATH`, na końcu Flatpak — wtedy skrót uruchamia
+  `flatpak run <appid> …`, więc model skrótu (target + argumenty) zostaje bez
+  zmian. Rejestr `EMULATORS` dostał `nix_globs` / `nix_bins` / `nix_flatpak`.
+  Xenia świadomie bez wpisu — brak wydania natywnego.
+- **Rdzenie RetroArch** szukane też w `~/.config/retroarch/cores`, katalogu
+  Flatpaka i `/usr/lib/libretro`; w skrócie ląduje pełna ścieżka do `.so`
+  (na Windows bez zmian: `cores\<core>_libretro.dll`).
+- **Ikony gier jako `.png`** (256 px) na Linuksie — tego wymaga klucz `Icon=`
+  w `.desktop`. Na Windows dalej wielorozmiarowe `.ico`. (`icons.ICON_EXT`)
+- **Paczka `chd_buddy-<wersja>-linux.zip`**: źródła + `install.sh` (venv,
+  zależności, sprawdzenie `chdman`/7z/Qt, opcjonalny wpis w menu przez
+  `--desktop`), `run.sh`, `cli.sh`, `requirements-linux.txt` i `DEPS.md`
+  z komendami per dystrybucja (apt/dnf/pacman/zypper + Steam Deck).
+  Buduje `build_linux.ps1` — skrypty trafiają do archiwum z LF i trybem 0755.
+
+### Zmienione
+- `symlink_status()` na Linuksie nie straszy już trybem dewelopera — symlinki
+  są tam zwykłą operacją użytkownika; komunikat wskazuje realną przyczynę
+  odmowy (system plików bez symlinków, katalog tylko do odczytu).
+- `_find_7z()` zna `7zz` i `7za` (7-Zip i p7zip na Linuksie).
+- Etykiety GUI i pomoc CLI mówią `.desktop` zamiast `.lnk` tam, gdzie to
+  właściwe dla systemu.
+
 ## [0.3.2] — 2026-08-30
 
 ### Naprawione — sprzątanie ToSort po konwersji na CHD

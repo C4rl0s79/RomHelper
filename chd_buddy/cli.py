@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from pathlib import Path
 
@@ -689,16 +690,23 @@ def build_parser() -> argparse.ArgumentParser:
     pic.add_argument("--sgdb-key", help="klucz API SteamGridDB (fallback; domyślnie z ustawień)")
     pic.set_defaults(func=cmd_icons)
 
-    psh = sub.add_parser("shortcuts", help="twórz skróty .lnk z właściwą składnią emulatora")
+    from .core.shortcuts import SHORTCUT_EXT
+    _sep = "\\" if os.name == "nt" else "/"
+    psh = sub.add_parser(
+        "shortcuts",
+        help=f"twórz skróty {SHORTCUT_EXT} z właściwą składnią emulatora")
     psh.add_argument("rom_dir", help="katalog gier jednego systemu (albo RomRoot z --tree)")
-    psh.add_argument("--emus", help="katalog główny emulatorów (np. D:\\emu\\Emulatory; "
-                                    "domyślnie z ustawień)")
+    psh.add_argument("--emus", help="katalog główny emulatorów (np. D:\\emu\\Emulatory "
+                                    "albo ~/emu; domyślnie z ustawień)")
     psh.add_argument("--system", help="wymuś system (np. PS2; domyślnie z nazwy katalogu)")
     psh.add_argument("--tree", action="store_true",
                      help="traktuj podkatalogi jako systemy (RomRoot)")
-    psh.add_argument("--out", help="katalog na .lnk (domyślnie <rom_dir>\\shortcuts)")
-    psh.add_argument("--icons", help="katalog z .ico (domyślnie <rom_dir>\\icons)")
-    psh.add_argument("--overwrite", action="store_true", help="nadpisuj istniejące .lnk")
+    psh.add_argument("--out", help=f"katalog na {SHORTCUT_EXT} "
+                                   f"(domyślnie <rom_dir>{_sep}shortcuts)")
+    psh.add_argument("--icons",
+                     help=f"katalog z ikonami (domyślnie <rom_dir>{_sep}icons)")
+    psh.add_argument("--overwrite", action="store_true",
+                     help=f"nadpisuj istniejące {SHORTCUT_EXT}")
     psh.add_argument("--dry-run", action="store_true", help="tylko podgląd")
     psh.set_defaults(func=cmd_shortcuts)
     return p

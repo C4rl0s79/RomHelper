@@ -20,11 +20,17 @@ Składnie uruchamiania (zweryfikowane dla wersji Qt/aktualnych):
 Tworzenie .lnk: wsadowo przez PowerShell + WScript.Shell (COM), z manifestem
 JSON (zero problemów z cudzysłowami w tytułach) i weryfikacją po zapisie.
 Istniejące .lnk nie są nadpisywane bez overwrite.
+
+Linux: ten sam rejestr, inne binarki i inny format skrótu. Emulator szukamy
+w katalogu emulatorów (także .AppImage), potem w PATH, na końcu we Flatpaku
+(wtedy targetem jest `flatpak`, a argumenty dostają prefiks `run <appid>`).
+Skrótem jest plik .desktop (freedesktop) z bitem wykonywalnym.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -34,6 +40,10 @@ from typing import Callable, Optional, Sequence
 from .icons import GAME_EXTS, strip_disc_tag
 
 LogCB = Callable[[str], None]
+
+IS_WIN = os.name == "nt"
+# Rozszerzenie skrótu — .lnk (COM) albo .desktop (freedesktop).
+SHORTCUT_EXT = ".lnk" if IS_WIN else ".desktop"
 
 
 # --- rejestr emulatorów ---------------------------------------------------------
@@ -45,37 +55,108 @@ class EmuSpec:
     args: str                         # szablon: {rom} {romdir} {romstem} {core}
     systems: tuple[str, ...]          # kanoniczne skróty systemów
     core: str = ""                    # tylko RetroArch: core libretro
+    nix_globs: tuple[str, ...] = ()   # wzorce plików w katalogu emulatorów (Linux)
+    nix_bins: tuple[str, ...] = ()    # nazwy binarek do wyszukania w PATH
+    nix_flatpak: str = ""             # app id Flatpaka (ostatnia deska ratunku)
+    nix_args: str = ""                # szablon argumentów, gdy różny od `args`
+
+
+def spec_globs(spec: EmuSpec) -> tuple[str, ...]:
+    """Wzorce plików emulatora właściwe dla bieżącego systemu."""
+    return spec.exe_globs if IS_WIN else spec.nix_globs
+
+
+def spec_args(spec: EmuSpec) -> str:
+    """Szablon argumentów właściwy dla bieżącego systemu."""
+    if IS_WIN or not spec.nix_args:
+        return spec.args
+    return spec.nix_args
 
 
 EMULATORS: tuple[EmuSpec, ...] = (
     # -batch: zamknij emulator po wyjściu z gry; -fullscreen: od razu pełny
     # ekran; "--" kończy przełączniki (tytuły zaczynające się od "-").
     EmuSpec("DuckStation", ("duckstation*.exe",),
-            '-batch -fullscreen -- "{rom}"', ("PS1",)),
+            '-batch -fullscreen -- "{rom}"', ("PS1",),
+            nix_globs=("duckstation*.AppImage", "DuckStation*.AppImage",
+                       "duckstation-qt", "duckstation-nogui"),
+            nix_bins=("duckstation-qt", "duckstation"),
+            nix_flatpak="org.duckstation.DuckStation"),
     EmuSpec("PCSX2", ("pcsx2*.exe",),
-            '-batch -fullscreen -- "{rom}"', ("PS2",)),
-    EmuSpec("RPCS3", ("rpcs3.exe",), '"{rom}"', ("PS3",)),
+            '-batch -fullscreen -- "{rom}"', ("PS2",),
+            nix_globs=("pcsx2*.AppImage", "PCSX2*.AppImage", "pcsx2-qt"),
+            nix_bins=("pcsx2-qt", "pcsx2"),
+            nix_flatpak="net.pcsx2.PCSX2"),
+    EmuSpec("RPCS3", ("rpcs3.exe",), '"{rom}"', ("PS3",),
+            nix_globs=("rpcs3*.AppImage", "rpcs3"),
+            nix_bins=("rpcs3",),
+            nix_flatpak="net.rpcs3.RPCS3"),
     EmuSpec("PPSSPP", ("PPSSPPWindows64.exe", "PPSSPPWindows.exe"),
-            '"{rom}"', ("PSP",)),
-    EmuSpec("shadPS4", ("shadPS4.exe",), '-g "{rom}"', ("PS4",)),
-    EmuSpec("Flycast", ("flycast.exe",), '"{rom}"', ("DC", "NAOMI")),
-    EmuSpec("Dolphin", ("Dolphin.exe",), '-e "{rom}"', ("GCN", "WII")),
-    EmuSpec("Cemu", ("Cemu.exe",), '-g "{rom}"', ("WIIU",)),
-    EmuSpec("Citron", ("citron.exe",), '-g "{rom}"', ("NSW",)),
-    EmuSpec("Eden", ("eden.exe",), '-g "{rom}"', ("NSW",)),
-    EmuSpec("Azahar", ("azahar.exe",), '"{rom}"', ("3DS",)),
-    EmuSpec("melonDS", ("melonDS.exe",), '"{rom}"', ("NDS",)),
-    EmuSpec("mGBA", ("mGBA.exe",), '"{rom}"', ("GBA", "GB", "GBC")),
-    EmuSpec("Snes9x", ("snes9x-x64.exe", "snes9x.exe"), '"{rom}"', ("SNES",)),
-    EmuSpec("xemu", ("xemu.exe",), '-dvd_path "{rom}"', ("XBOX",)),
+            '"{rom}"', ("PSP",),
+            nix_globs=("PPSSPP*.AppImage", "PPSSPPQt", "PPSSPPSDL"),
+            nix_bins=("PPSSPPQt", "PPSSPPSDL", "ppsspp"),
+            nix_flatpak="org.ppsspp.PPSSPP"),
+    EmuSpec("shadPS4", ("shadPS4.exe",), '-g "{rom}"', ("PS4",),
+            nix_globs=("shadps4*.AppImage", "Shadps4*.AppImage", "shadps4"),
+            nix_bins=("shadps4",)),
+    EmuSpec("Flycast", ("flycast.exe",), '"{rom}"', ("DC", "NAOMI"),
+            nix_globs=("flycast*.AppImage", "flycast"),
+            nix_bins=("flycast",),
+            nix_flatpak="org.flycast.Flycast"),
+    EmuSpec("Dolphin", ("Dolphin.exe",), '-e "{rom}"', ("GCN", "WII"),
+            nix_globs=("Dolphin*.AppImage", "dolphin-emu"),
+            nix_bins=("dolphin-emu",),
+            nix_flatpak="org.DolphinEmu.dolphin-emu"),
+    EmuSpec("Cemu", ("Cemu.exe",), '-g "{rom}"', ("WIIU",),
+            nix_globs=("Cemu*.AppImage", "Cemu", "cemu"),
+            nix_bins=("Cemu", "cemu"),
+            nix_flatpak="info.cemu.Cemu"),
+    EmuSpec("Citron", ("citron.exe",), '-g "{rom}"', ("NSW",),
+            nix_globs=("citron*.AppImage", "Citron*.AppImage", "citron"),
+            nix_bins=("citron",)),
+    EmuSpec("Eden", ("eden.exe",), '-g "{rom}"', ("NSW",),
+            nix_globs=("eden*.AppImage", "Eden*.AppImage", "eden"),
+            nix_bins=("eden",)),
+    EmuSpec("Azahar", ("azahar.exe",), '"{rom}"', ("3DS",),
+            nix_globs=("azahar*.AppImage", "Azahar*.AppImage", "azahar"),
+            nix_bins=("azahar",),
+            nix_flatpak="io.github.azahar_emu.Azahar"),
+    EmuSpec("melonDS", ("melonDS.exe",), '"{rom}"', ("NDS",),
+            nix_globs=("melonDS*.AppImage", "melonDS", "melonds"),
+            nix_bins=("melonDS", "melonds"),
+            nix_flatpak="net.kuribo64.melonDS"),
+    EmuSpec("mGBA", ("mGBA.exe",), '"{rom}"', ("GBA", "GB", "GBC"),
+            nix_globs=("mGBA*.AppImage", "mgba-qt", "mgba"),
+            nix_bins=("mgba-qt", "mgba"),
+            nix_flatpak="io.mgba.mGBA"),
+    EmuSpec("Snes9x", ("snes9x-x64.exe", "snes9x.exe"), '"{rom}"', ("SNES",),
+            nix_globs=("snes9x*.AppImage", "snes9x-gtk", "snes9x"),
+            nix_bins=("snes9x-gtk", "snes9x"),
+            nix_flatpak="com.snes9x.Snes9x"),
+    EmuSpec("xemu", ("xemu.exe",), '-dvd_path "{rom}"', ("XBOX",),
+            nix_globs=("xemu*.AppImage", "xemu"),
+            nix_bins=("xemu",),
+            nix_flatpak="app.xemu.xemu"),
+    # Xenia: brak wydania natywnego — na Linuksie tylko przez Wine/Proton,
+    # więc świadomie bez nix_*, żeby nie obiecywać działającego skrótu.
     EmuSpec("Xenia", ("xenia_canary.exe", "xenia.exe"), '"{rom}"', ("X360",)),
     EmuSpec("MAME", ("mame.exe",), '{romstem} -rompath "{romdir}"',
-            ("ARCADE", "MAME", "NEOGEO")),
-    EmuSpec("ares", ("ares.exe",), '"{rom}"', ("N64", "NES", "MD", "SMS", "GG")),
+            ("ARCADE", "MAME", "NEOGEO"),
+            nix_globs=("mame*.AppImage", "mame"),
+            nix_bins=("mame",),
+            nix_flatpak="org.mamedev.MAME"),
+    EmuSpec("ares", ("ares.exe",), '"{rom}"', ("N64", "NES", "MD", "SMS", "GG"),
+            nix_globs=("ares*.AppImage", "ares"),
+            nix_bins=("ares",),
+            nix_flatpak="dev.ares.ares"),
     # RetroArch jako fallback z konkretnym corem
     EmuSpec("RetroArch", ("retroarch.exe",),
             '-L "cores\\{core}_libretro.dll" "{rom}"',
-            ("SATURN",), core="mednafen_saturn"),
+            ("SATURN",), core="mednafen_saturn",
+            nix_globs=("RetroArch*.AppImage", "retroarch"),
+            nix_bins=("retroarch",),
+            nix_flatpak="org.libretro.RetroArch",
+            nix_args='-L "{core}" "{rom}"'),
 )
 
 # Nazwy katalogów (DAT-y Redump/No-Intro + skróty EmulationStation) → system.
@@ -214,17 +295,34 @@ class EmuChoice:
     m3u_ok: bool
 
 
+def _core_dirs(ra: Path) -> list[Path]:
+    """Katalogi z rdzeniami libretro (obok binarki i w miejscach systemowych)."""
+    dirs = [ra.parent / "cores"]
+    if not IS_WIN:
+        home = Path.home()
+        dirs += [
+            home / ".config/retroarch/cores",
+            home / ".var/app/org.libretro.RetroArch/config/retroarch/cores",
+            Path("/usr/lib/libretro"),
+            Path("/usr/lib64/libretro"),
+            Path("/usr/local/lib/libretro"),
+        ]
+    return dirs
+
+
 def retroarch_cores(installed: dict[str, Path]) -> dict[str, Path]:
-    """Zainstalowane rdzenie libretro: stem (bez _libretro.dll) → ścieżka."""
+    """Zainstalowane rdzenie libretro: stem (bez _libretro.dll/.so) → ścieżka."""
     ra = installed.get("RetroArch")
     if ra is None:
         return {}
-    cores = ra.parent / "cores"
-    if not cores.is_dir():
-        return {}
+    suffix = "_libretro.dll" if IS_WIN else "_libretro.so"
     out: dict[str, Path] = {}
-    for dll in sorted(cores.glob("*_libretro.dll")):
-        out[dll.name[:-len("_libretro.dll")]] = dll
+    for cores in _core_dirs(ra):
+        if not cores.is_dir():
+            continue
+        for lib in sorted(cores.glob(f"*{suffix}")):
+            # pierwszy katalog wygrywa: rdzeń obok binarki przed systemowym
+            out.setdefault(lib.name[:-len(suffix)], lib)
     return out
 
 
@@ -239,17 +337,24 @@ def emulator_options(system: str, installed: dict[str, Path]) -> list[EmuChoice]
             continue
         out.append(EmuChoice(
             id=spec.name, label=f"{spec.name} (standalone)", exe=exe,
-            args=spec.args, m3u_ok=spec.name in M3U_CAPABLE))
+            args=launch_prefix(spec.name, exe) + spec_args(spec),
+            m3u_ok=spec.name in M3U_CAPABLE))
     ra = installed.get("RetroArch")
     if ra is not None:
-        for stem in sorted(retroarch_cores(installed)):
+        cores = retroarch_cores(installed)
+        prefix = launch_prefix("RetroArch", ra)
+        for stem in sorted(cores):
             if system not in RETROARCH_CORE_SYSTEMS.get(stem, ()):
                 continue
             label = RETROARCH_CORE_DISPLAY.get(stem, stem)
+            # Windows: rdzeń względem katalogu emulatora; Linux: pełna ścieżka
+            # (rdzenie bywają systemowe albo we Flatpaku, nie obok binarki).
+            core_arg = (f"cores\\{stem}_libretro.dll" if IS_WIN
+                        else str(cores[stem]))
             out.append(EmuChoice(
                 id=f"RetroArch:{stem}",
                 label=f"RetroArch — {label}", exe=ra,
-                args=f'-L "cores\\{stem}_libretro.dll" "{{rom}}"',
+                args=f'{prefix}-L "{core_arg}" "{{rom}}"',
                 m3u_ok=True))
     return out
 
@@ -273,24 +378,102 @@ def detect_system(dir_name: str) -> str:
     return SYSTEM_ALIASES.get(dir_name.strip().lower(), "")
 
 
+_FLATPAK_CACHE: Optional[frozenset[str]] = None
+
+
+def flatpak_apps(refresh: bool = False) -> frozenset[str]:
+    """Zainstalowane aplikacje Flatpaka (pusty zbiór, gdy brak flatpaka).
+
+    Wynik jest cache'owany — `flatpak list` to spawn procesu, a katalog
+    emulatorów skanujemy wielokrotnie (per system ROM-ów).
+    """
+    global _FLATPAK_CACHE
+    if refresh:
+        _FLATPAK_CACHE = None
+    if _FLATPAK_CACHE is not None:
+        return _FLATPAK_CACHE
+    apps: frozenset[str] = frozenset()
+    if not IS_WIN and shutil.which("flatpak"):
+        try:
+            proc = subprocess.run(
+                ["flatpak", "list", "--app", "--columns=application"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=15)
+            apps = frozenset(ln.strip() for ln in (proc.stdout or "").splitlines()
+                             if ln.strip())
+        except (OSError, subprocess.SubprocessError):
+            apps = frozenset()
+    _FLATPAK_CACHE = apps
+    return apps
+
+
+def launch_prefix(spec_name: str, exe: Path) -> str:
+    """Prefiks argumentów, gdy emulator jest uruchamiany przez Flatpaka.
+
+    Target skrótu to wtedy binarka `flatpak`, a właściwa aplikacja jedzie
+    w argumentach (`run <appid> …`) — dzięki temu model skrótu (target +
+    argumenty) zostaje bez zmian.
+    """
+    if IS_WIN or exe.name != "flatpak":
+        return ""
+    for spec in EMULATORS:
+        if spec.name == spec_name and spec.nix_flatpak:
+            return f"run {spec.nix_flatpak} "
+    return ""
+
+
+def _is_runnable(p: Path) -> bool:
+    """Plik, który da się uruchomić (na Linuksie z bitem wykonywalnym)."""
+    if not p.is_file():
+        return False
+    return True if IS_WIN else os.access(p, os.X_OK)
+
+
 def find_emulators(emu_root: Path) -> dict[str, Path]:
-    """Skanuje katalog emulatorów: nazwa specyfikacji → ścieżka exe."""
+    """Gdzie jest który emulator: nazwa specyfikacji → ścieżka do uruchomienia.
+
+    Kolejność: katalog emulatorów (na Linuksie także AppImage leżące płasko),
+    potem PATH, na końcu Flatpak (wtedy ścieżką jest binarka `flatpak`, a
+    appid dokłada `launch_prefix`).
+    """
     emu_root = Path(emu_root)
     found: dict[str, Path] = {}
-    if not emu_root.is_dir():
-        return found
-    subdirs = {d.name.lower(): d for d in emu_root.iterdir() if d.is_dir()}
+    subdirs: dict[str, Path] = {}
+    if emu_root.is_dir():
+        subdirs = {d.name.lower(): d for d in emu_root.iterdir() if d.is_dir()}
     for spec in EMULATORS:
+        patterns = spec_globs(spec)
+        if not patterns:
+            continue                      # brak wydania na ten system
         base = subdirs.get(spec.name.lower())
         search_dirs = [base] if base else list(subdirs.values())
+        if not IS_WIN and emu_root.is_dir():
+            # AppImage zwykle nie ma własnego katalogu — szukamy też płasko
+            search_dirs.append(emu_root)
         for d in search_dirs:
-            for pattern in spec.exe_globs:
-                hits = sorted(d.glob(pattern))
+            for pattern in patterns:
+                hits = [p for p in sorted(d.glob(pattern)) if _is_runnable(p)]
                 if hits:
                     found[spec.name] = hits[0]
                     break
             if spec.name in found:
                 break
+    if IS_WIN:
+        return found
+    flatpak = shutil.which("flatpak")
+    installed_flatpaks = flatpak_apps() if flatpak else frozenset()
+    for spec in EMULATORS:
+        if spec.name in found:
+            continue
+        for binary in spec.nix_bins:
+            hit = shutil.which(binary)
+            if hit:
+                found[spec.name] = Path(hit)
+                break
+        if spec.name in found:
+            continue
+        if spec.nix_flatpak and spec.nix_flatpak in installed_flatpaks:
+            found[spec.name] = Path(flatpak)      # type: ignore[arg-type]
     return found
 
 
@@ -379,6 +562,20 @@ def _pick_rom_files(rom_dir: Path, m3u_ok: bool) -> list[tuple[str, Path]]:
     return [picked[k] for k in sorted(picked)]
 
 
+def _pick_icon(icons_dir: Path, title: str) -> Optional[Path]:
+    """Ikona skrótu: .ico na Windows, na Linuksie najpierw .png.
+
+    Środowiska graficzne czytają .ico przez gdk-pixbuf, ale nie wszystkie —
+    gdy generator ikon zostawił obok .png, bierzemy pewniejszy format.
+    """
+    exts = (".ico",) if IS_WIN else (".png", ".ico")
+    for ext in exts:
+        p = icons_dir / f"{title}{ext}"
+        if p.is_file():
+            return p
+    return None
+
+
 def build_plan(
     rom_dir: Path,
     system: str,
@@ -404,14 +601,13 @@ def build_plan(
     for title, rom in _pick_rom_files(rom_dir, choice.m3u_ok):
         args = choice.args.format(rom=rom, romdir=rom.parent,
                                   romstem=rom.stem, core="")
-        ico = icons / f"{title}.ico"
         plan.append(ShortcutSpec(
             title=title,
-            lnk_path=dest / f"{title}.lnk",
+            lnk_path=dest / f"{title}{SHORTCUT_EXT}",
             target=choice.exe,
             arguments=args,
             workdir=choice.exe.parent,
-            icon=ico if ico.is_file() else None,
+            icon=_pick_icon(icons, title),
             rom=rom,
         ))
     return plan, None
@@ -462,11 +658,16 @@ def create_shortcuts(
         if s.lnk_path.exists() and not overwrite:
             stats.existing += 1
             continue
-        _log(f"LNK  {s.lnk_path.name}  ->  {s.target.name} {s.arguments}")
+        _log(f"{'LNK' if IS_WIN else 'DESKTOP'}  {s.lnk_path.name}"
+             f"  ->  {s.target.name} {s.arguments}")
         todo.append(s)
 
     if dry_run or not todo:
         stats.created = len(todo) if dry_run else 0
+        return stats
+
+    if not IS_WIN:
+        _write_desktop_batch(todo, stats, _log)
         return stats
 
     # katalogi docelowe + tymczasowe nazwy ASCII (w katalogu docelowym,
@@ -519,3 +720,75 @@ def create_shortcuts(
         _log(f"BŁĄD {s.lnk_path.name}: {reason}")
         tmp.unlink(missing_ok=True)
     return stats
+
+
+# --- tworzenie .desktop (Linux/freedesktop) ----------------------------------------
+
+def _desktop_quote(token: str) -> str:
+    """Jeden argument linii Exec= wg specyfikacji Desktop Entry.
+
+    Token idzie w cudzysłowach, a znaki specjalne powłoki dostają backslash —
+    inaczej gra z apostrofem, `$` albo spacją w tytule rozjeżdża polecenie.
+    Literalny procent musi być podwojony (`%%`), bo pojedynczy to pole `%f`.
+    """
+    out = token.replace("\\", "\\\\")
+    for ch in ('"', "`", "$"):
+        out = out.replace(ch, "\\" + ch)
+    return '"' + out.replace("%", "%%") + '"'
+
+
+def _desktop_value(text: str) -> str:
+    """Wartość zwykłego klucza (Name/Comment): bez znaków łamiących format."""
+    return text.replace("\\", "\\\\").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _desktop_body(spec: ShortcutSpec) -> str:
+    """Treść pliku .desktop dla jednego skrótu."""
+    import shlex
+    try:
+        args = shlex.split(spec.arguments)
+    except ValueError:
+        # niedomknięty cudzysłów w szablonie — lepiej stracić skrót niż
+        # wygenerować polecenie, które uruchomi coś innego
+        raise ValueError(f"nie da się rozbić argumentów: {spec.arguments!r}")
+    exec_line = " ".join([_desktop_quote(str(spec.target))]
+                         + [_desktop_quote(a) for a in args])
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        "Version=1.0",
+        f"Name={_desktop_value(spec.title)}",
+        f"Exec={exec_line}",
+        "Terminal=false",
+        "StartupNotify=true",
+        "Categories=Game;",
+    ]
+    if spec.workdir and spec.workdir.is_dir():
+        lines.insert(5, f"Path={_desktop_value(str(spec.workdir))}")
+    if spec.icon:
+        lines.append(f"Icon={_desktop_value(str(spec.icon))}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_desktop_batch(todo: Sequence[ShortcutSpec], stats: ShortcutStats,
+                         log: Callable[[str], None]) -> None:
+    """Zapisuje skróty .desktop — atomowo i z bitem wykonywalnym.
+
+    Bez `chmod +x` większość środowisk (GNOME, KDE, Cinnamon) pokazuje plik
+    jako tekst zamiast go uruchamiać.
+    """
+    for n, s in enumerate(todo):
+        tmp = s.lnk_path.parent / f".chdbuddy_tmp_{n}.desktop"
+        try:
+            s.lnk_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(_desktop_body(s), encoding="utf-8")
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, s.lnk_path)
+            stats.created += 1
+        except (OSError, ValueError) as e:
+            stats.failed += 1
+            log(f"BŁĄD {s.lnk_path.name}: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass

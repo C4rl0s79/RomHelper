@@ -130,6 +130,16 @@ def translation_label(name: str) -> str:
     return m.group(0) if m else ""
 
 
+def is_translation_collection(entry) -> bool:
+    """Czy DAT jest pulą tłumaczeń — wg nazwy LUB metadanych sidecar-JSON
+    (`group`/`system` z tagiem `[T-…]`, np. „[T-En]Collection"). Dzięki temu
+    kolekcje RomVaulta są wykrywane automatycznie, bez ręcznego ustawiania roli."""
+    name = getattr(entry, "name", "") or ""
+    meta = getattr(entry, "meta", {}) or {}
+    return (is_translation(name) or is_translation(meta.get("group", ""))
+            or is_translation(meta.get("system", "")))
+
+
 # --- indeks wariantów --------------------------------------------------------
 
 @dataclass
@@ -160,13 +170,21 @@ def build_variant_index(
     idx: Dict[str, List[TransVariant]] = {}
     for rep in reports:
         eff = rules_fn(rep.entry) if rules_fn else {}
-        if (eff or {}).get("role") != "translations":
+        # Pula tłumaczeń, gdy: JAWNA rola „translations" ALBO auto-wykrycie po
+        # nazwie/sidecar-JSON (np. grupa „[T-En]Collection"). Dzięki temu nie
+        # trzeba ręcznie oznaczać każdego DAT-u kolekcji tłumaczeń.
+        if ((eff or {}).get("role") != "translations"
+                and not is_translation_collection(rep.entry)):
             continue
-        # Język bywa TYLKO w nazwie DAT-u (np. „… [T-En] Collection"), a gry w
-        # środku mają czyste nazwy → dziedziczymy język/etykietę z DAT-u, gdy w
-        # nazwie gry nic nie ma. To naprawia „puste" wykrywanie języka.
-        dat_langs = parse_langs(rep.entry.name)
-        dat_label = translation_label(rep.entry.name)
+        # Język bywa TYLKO w nazwie DAT-u/grupie (np. „… [T-En] Collection"), a
+        # gry w środku mają czyste nazwy → dziedziczymy język/etykietę stąd, gdy
+        # nazwa gry nic nie ma. To naprawia „puste" wykrywanie języka.
+        _meta = getattr(rep.entry, "meta", {}) or {}
+        dat_langs = (parse_langs(rep.entry.name)
+                     or parse_langs(_meta.get("group", ""))
+                     or parse_langs(_meta.get("system", "")))
+        dat_label = (translation_label(rep.entry.name)
+                     or translation_label(_meta.get("group", "")))
         by_game: Dict[str, list] = {}
         for s in rep.statuses:
             by_game.setdefault(s.game, []).append(s)

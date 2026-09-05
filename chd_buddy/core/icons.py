@@ -20,6 +20,7 @@ domyślnie podkatalog "icons" obok ROM-ów. Istniejące .ico nie są nadpisywane
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -302,6 +303,35 @@ def make_ico_bytes(img_bytes: bytes) -> bytes:
     frames[0].save(buf, format="ICO",
                    sizes=[(s, s) for s in sizes], append_images=frames[1:])
     return buf.getvalue()
+
+
+# Format ikony właściwy dla systemu: .ico rozumie tylko Windows, pulpity
+# linuksowe (Icon= w .desktop) chcą PNG.
+ICON_EXT = ".ico" if os.name == "nt" else ".png"
+
+
+def make_png_bytes(img_bytes: bytes, size: int = 256) -> bytes:
+    """PNG/JPG → kwadratowe PNG (domyślnie 256 px) na przezroczystym tle."""
+    if not PIL_OK:
+        raise RuntimeError("Pillow wymagane do tworzenia ikon: pip install Pillow")
+    img = Image.open(BytesIO(img_bytes)).convert("RGBA")
+    w, h = img.size
+    if w != h:
+        side = max(w, h)
+        sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        sq.paste(img, ((side - w) // 2, (side - h) // 2))
+        img = sq
+    side = min(img.size[0], size)
+    buf = BytesIO()
+    img.resize((side, side), Image.LANCZOS).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def make_icon_bytes(img_bytes: bytes) -> bytes:
+    """Ikona w formacie właściwym dla bieżącego systemu (patrz ICON_EXT)."""
+    if ICON_EXT == ".ico":
+        return make_ico_bytes(img_bytes)
+    return make_png_bytes(img_bytes)
 
 
 # Pełna nazwa platformy (Redump/No-Intro) → skrót (odwrócenie LIBRETRO_SYSTEM_MAP).
@@ -681,7 +711,11 @@ def artwork_candidates(
 
 def save_icon(art: dict, ico_path: Path,
               fetch: FetchFn = _default_fetch) -> bool:
-    """Zapisuje wybranego kandydata jako .ico (dociąga pełny obraz z url)."""
+    """Zapisuje wybranego kandydata jako ikonę (dociąga pełny obraz z url).
+
+    Rozszerzenie ścieżki jest dopasowywane do systemu — okno wyboru podaje
+    nazwę z .ico, a na Linuksie i tak powstaje PNG.
+    """
     data = art.get("full")
     if not data:
         data = fetch(art["url"], None)
@@ -689,8 +723,9 @@ def save_icon(art: dict, ico_path: Path,
         data = art.get("preview")
     if not _looks_like_image(data):
         return False
+    ico_path = ico_path.with_suffix(ICON_EXT)
     ico_path.parent.mkdir(parents=True, exist_ok=True)
-    ico_path.write_bytes(make_ico_bytes(data))
+    ico_path.write_bytes(make_icon_bytes(data))
     return True
 
 
@@ -768,7 +803,7 @@ def make_icons_for_dir(
 
     for title in _iter_games(rom_dir):
         base = strip_disc_tag(title) or title
-        ico_path = dest / f"{base}.ico"
+        ico_path = dest / f"{base}{ICON_EXT}"
         if ico_path.exists() and not overwrite:
             stats.cached += 1
             continue
@@ -780,7 +815,7 @@ def make_icons_for_dir(
             _log("  brak grafiki")
             continue
         try:
-            ico = make_ico_bytes(art)
+            ico = make_icon_bytes(art)
         except (OSError, RuntimeError, ValueError) as e:
             stats.errors += 1
             _log(f"  BŁĄD konwersji: {e}")
