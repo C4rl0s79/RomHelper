@@ -218,11 +218,13 @@ def _pick(rows: Sequence, canonical: Path, target_dir: Path):
 
 
 def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
-              game_multi: bool = False) -> RomStatus:
+              game_multi: bool = False, game_single: bool = False) -> RomStatus:
     """Status pojedynczego ROM-a z DAT-a względem indeksu (bez CHD —
     dopasowanie CHD jest na poziomie GRY, patrz match_game).
 
-    game_multi — gra wieloplikowa luzem => podkatalog per gra."""
+    game_multi — gra wieloplikowa luzem => podkatalog per gra.
+    game_single — gra ma DOKŁADNIE jeden ROM (akceptujemy jej plik także w
+    podfolderze <target>/<gra>/<rom>, nie tylko płasko)."""
     # PUSTY plik-znacznik (np. .msu w MSU-1: size=0, crc="-"): brak sum, ale
     # trywialnie odtwarzalny — 0 bajtów ma zawsze tę samą treść. HAVE, gdy leży
     # na miejscu; inaczej CREATABLE (rebuilder utworzy pusty plik). CREATABLE
@@ -269,6 +271,17 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
             status.state = {"canonical": RomState.HAVE,
                             "in_dir": RomState.WRONG_NAME,
                             "other": RomState.ELSEWHERE}[kind]
+            # PODFOLDER PER GRA (gra JEDNOPLIKOWA): plik w katalogu nazwanym
+            # DOKŁADNIE jak gra (<target>/<gra>/<rom>) to POPRAWNY układ (jak w
+            # RomVaulcie) — nie „zła nazwa". Bez tego całe kolekcje trzymane w
+            # podfolderach (np. 610 RVZ GameCube w <gra>/<gra>.rvz) świeciły na
+            # WRONG_NAME i szły do konwersji, choć pliki są poprawne. Treść
+            # ważna, nie ścieżka. Gry WIELOPLIKOWE mają układ sterowany regułą
+            # subdir_per_game (płaski vs podfolder) — ich tu nie ruszamy.
+            if status.state == RomState.WRONG_NAME and game_single:
+                sub = entry.target_dir / game / rom.name
+                if _same_path(row["path"], str(sub)):
+                    status.state = RomState.HAVE
             # kanoniczna ścieżka jest już POPRAWNYM linkiem na tę kopię
             # (typowy stan DZIECKA po naprawie) => na miejscu, nie „napraw"
             if (status.state != RomState.HAVE
@@ -420,7 +433,9 @@ def match_game(entry: DatEntry, game, index: FileIndex,
     per gra (gdy entry.subdir_per_game); CHD i archiwa są płasko.
     """
     multi = len(game.roms) > 1 and getattr(entry, "subdir_per_game", True)
-    statuses = [match_rom(entry, game.name, rom, index, game_multi=multi)
+    single = len(game.roms) == 1
+    statuses = [match_rom(entry, game.name, rom, index, game_multi=multi,
+                          game_single=single)
                 for rom in game.roms]
 
     # PODMIANA na TŁUMACZENIE (translations.json = źródło prawdy): gra ma
@@ -531,7 +546,11 @@ def deep_probe_chds(
     cancel_event=None,
     on_progress: Optional[callable] = None,   # (done, total, tekst) — OGÓLNY
     detail: Optional[callable] = None,        # (done, total, tekst) — SZCZEGÓŁ
+    slot_progress: Optional[callable] = None,  # (slot, done, total, tekst) — RÓWNOLEGŁY
     scratch_fallback: Optional[str] = None,   # dedykowany temp z ustawień
+    workers: int = 1,                         # równoległość TANIEGO nagłówka (chd.info)
+    deep_workers: int = 1,                     # GÓRNY limit równoległych ekstrakcji
+    deep_budget: int = 0,                      # budżet RAM (B) na scratch — 0=bez
 ) -> int:
     """Identyfikuje pliki .chd względem DAT-ów i zapisuje wynik do indeksu.
 
@@ -612,93 +631,253 @@ def deep_probe_chds(
                 candidates.append(row)
     total_cand = len(candidates) or 1
 
-    # 2. PASS: identyfikacja z postępem OGÓLNYM (X/Y CHD)
-    for ci, row in enumerate(candidates):
-            p = row["path"]
-            path = Path(p)
-            if cancel_event is not None and cancel_event.is_set():
-                return identified
-            if on_progress is not None:
-                on_progress(ci, total_cand,
-                            f"identyfikacja CHD ({ci + 1}/{total_cand}): "
-                            f"{path.name}")
-            # JUŻ zidentyfikowany po treści, tu tylko dlatego, że KONTENER nie
-            # był sprawdzony → TANI check (nagłówek, bez ekstrakcji) i dalej.
-            dsha_known = row["data_sha1"] and row["data_sha1"] in known
+    # 2. PASS: identyfikacja RÓWNOLEGŁA. Odczyt/ekstrakcja CHD to I/O na NAS +
+    #    dekompresja (chdman) — POJEDYNCZY strumień nie wysyca ani łącza (SMB
+    #    latencja round-tripów), ani CPU (dekompresja czeka na I/O). Pula wątków
+    #    czyta/wypakowuje kilka CHD naraz → kilka strumieni wypełnia łącze, a
+    #    dekompresja nakłada się na I/O. ZAPISY DO INDEKSU (SQLite jednowątkowy)
+    #    idą WYŁĄCZNIE w wątku wołającym — wątki tylko liczą i zwracają wynik.
+    #    Dwustopniowo: (A) TANI nagłówek (chd.info) mocno równolegle (RAM≈0),
+    #    (B) GŁĘBOKA ekstrakcja mniej równolegle (każda wypakowuje pełny obraz
+    #    na scratch/RAM-dysk → limit `deep_workers` chroni przed zapchaniem).
+    import queue as _queue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from .scratch import pick_scratch_root
+
+    n_head = max(1, int(workers))
+    n_deep = max(1, int(deep_workers))
+    done = 0
+    need_deep: list = []                       # [(row, info)] — nagłówek nie trafił
+    scratch_lock = threading.Lock()            # serializuje wybór/remount scratchu
+    # BUDŻET RAM na scratch: zamiast sztywnej liczby wątków rezerwujemy tyle, ile
+    # ekstrakcja REALNIE potrzebuje (~2 GB gra CD, ~9 GB DVD). Dla małych gier
+    # zmieści się ich WIĘCEJ naraz (więcej strumieni z NAS = wyżej LAN), dla
+    # dużych zejdzie samo — bez przekraczania fizycznego RAM-u. 0 = bez budżetu
+    # (tylko limit `deep_workers`).
+    budget_total = int(deep_budget) if deep_budget and deep_budget > 0 else 0
+    budget = {"free": budget_total}
+    budget_cond = threading.Condition()
+
+    head_done = 0
+    deep_total = 0
+
+    def _head_tick(name: str) -> None:
+        # postęp FAZY NAGŁÓWKÓW (chd.info na każdym kandydacie) — bez tego przy
+        # dużej kolekcji CHD, gdy nic nie trafia nagłówkiem (np. PS2-jako-CD nie
+        # pasuje do DVD-DAT → wszystko idzie w deep), GUI „stało" minutami z
+        # dyskami NAS na maxa, choć realnie trwał odczyt nagłówków.
+        nonlocal head_done
+        head_done += 1
+        if on_progress is not None:
+            on_progress(head_done, total_cand,
+                        f"nagłówki CHD ({head_done}/{total_cand}): {name}")
+
+    def _deep_tick(name: str) -> None:
+        nonlocal done
+        done += 1
+        if on_progress is not None:
+            on_progress(done, deep_total or 1,
+                        f"głęboka identyfikacja CHD ({done}/{deep_total}): {name}")
+
+    def _aborted() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    # ---- (A) TANI nagłówek: chd.info + dopasowanie, równolegle -------------
+    def _head_job(row):
+        """W wątku roboczym: chd.info + dopasowanie nagłówka. BEZ dostępu do
+        indeksu (SQLite tylko w wątku głównym). Zwraca krotkę do zastosowania."""
+        path = Path(row["path"])
+        dsha_known = bool(row["data_sha1"]) and row["data_sha1"] in known
+        info = None
+        try:
+            info = chd.info(path)
+        except OSError as e:
             if dsha_known:
-                try:
-                    _info = chd.info(path)
-                except OSError:
-                    _info = None
-                _flag_container(path, _info, known[row["data_sha1"]].media)
-                continue
-            # 1) tani nagłówek
-            hit = ""
-            info = None
-            try:
-                info = chd.info(path)
-                for cand in (info.data_sha1, info.sha1):
-                    if cand and cand.lower() in known:
-                        hit = cand.lower()
-                        break
-            except OSError as e:
-                _log(f"CHD info: {path.name}: {e}")
-            if hit:
-                index.set_data_sha1(path, hit)
-                _flag_container(path, info, known[hit].media)
-                identified += 1
-                _log(f"CHD OK (nagłówek): {path.name} -> {known[hit].game}")
-                continue
-            # 2) głęboka identyfikacja (ekstrakcja z fail-safe'ami)
-            # Wypakowany obraz tylko HASHUJEMY (nie zostaje), więc może powstać
-            # na DOWOLNYM dysku z miejscem — wybieramy dysk z zapasem (obok
-            # pliku, jeśli ma; inaczej inny). Dzięki temu pełny dysk kolekcji
-            # nie blokuje identyfikacji.
-            from .scratch import pick_scratch_root
+                return ("known", row, None)
+            return ("head", row, None, "", str(e))
+        if dsha_known:
+            # zidentyfikowany po TREŚCI — tu tylko dokładamy tani check KONTENERA
+            return ("known", row, info)
+        hit = ""
+        for cand in (info.data_sha1, info.sha1):
+            if cand and cand.lower() in known:
+                hit = cand.lower()
+                break
+        return ("head", row, info, hit, "")
+
+    if candidates:
+        if on_progress is not None:
+            on_progress(0, total_cand,
+                        f"sprawdzam nagłówki {total_cand} CHD…")
+        ex = ThreadPoolExecutor(max_workers=n_head)
+        try:
+            futs = {ex.submit(_head_job, r): r for r in candidates}
+            for fut in as_completed(futs):
+                if _aborted():
+                    break
+                res = fut.result()
+                tag, row, info = res[0], res[1], res[2]
+                path = Path(row["path"])
+                if tag == "known":
+                    _flag_container(path, info,
+                                    known[row["data_sha1"]].media)
+                    _head_tick(path.name)
+                    continue
+                hit, err = res[3], res[4]
+                if err:
+                    _log(f"CHD info: {path.name}: {err}")
+                if hit:
+                    index.set_data_sha1(path, hit)
+                    _flag_container(path, info, known[hit].media)
+                    identified += 1
+                    _log(f"CHD OK (nagłówek): {path.name} -> {known[hit].game}")
+                else:
+                    need_deep.append((row, info))   # policzony w fazie głębokiej
+                _head_tick(path.name)
+        finally:
+            # NA PRZERWANIU też CZEKAMY (wait=True): wątki w locie widzą
+            # cancel_event, chdman jest zabijany od razu (_stream sprawdza cancel
+            # co linię), a deep_identify przerywa pętlę metod — więc kończą się w
+            # sekundy. Bez czekania `deep_probe` wracał NATYCHMIAST i pozostałe
+            # ekstrakcje jechały dalej w tle (dopasowanie startowało nad żywymi
+            # ekstrakcjami, a przy zamknięciu ramdysk był zajęty). cancel_futures
+            # porzuca tylko to, co jeszcze NIE ruszyło.
+            ex.shutdown(wait=True, cancel_futures=_aborted())
+    deep_total = len(need_deep)
+
+    # ---- (B) GŁĘBOKA ekstrakcja: równolegle wg deep_workers, pasek per slot -
+    def _acquire_budget(need: int) -> int:
+        """Rezerwuje `need` bajtów z budżetu RAM (albo cały, gdy gra > budżet →
+        idzie sama, bez zakleszczenia). Czeka, aż się zmieści. Zwraca ile
+        zarezerwowano (0 gdy budżet wyłączony)."""
+        if budget_total <= 0:
+            return 0
+        reserve = min(need, budget_total)
+        with budget_cond:
+            while budget["free"] < reserve and budget["free"] < budget_total:
+                if _aborted():
+                    return -1                      # sygnał przerwania
+                budget_cond.wait(timeout=0.5)
+            budget["free"] -= reserve
+        return reserve
+
+    def _release_budget(reserve: int) -> None:
+        if reserve and reserve > 0:
+            with budget_cond:
+                budget["free"] += reserve
+                budget_cond.notify_all()
+
+    def _deep_job(row, info):
+        """W wątku: rezerwacja budżetu RAM + pick_scratch_root + deep_identify
+        (ekstrakcja pełnego obrazu → hash). Wynik tylko zwracamy; index zapisuje
+        wątek główny."""
+        path = Path(row["path"])
+        if _aborted():
+            return ("cancel", row, info, None)
+        try:
             need = max(int(path.stat().st_size * 2.2), 2 << 30)
-            # RAM dysk MA PIERWSZEŃSTWO (jak przy konwersji); work_dir (jeśli
-            # ustawiony) to dopiero fallback, gdy RAM niedostępny/za mały.
-            wd = pick_scratch_root(
-                need, prefer=(str(work_dir) if work_dir else str(path.parent)),
-                log=_log, fallback=scratch_fallback)
+        except OSError:
+            need = 2 << 30
+        # BRAMKA BUDŻETU RAM: czeka aż zmieści się `need` (małe gry → więcej
+        # naraz). Zwolnienie w finally na KAŻDEJ ścieżce.
+        reserve = _acquire_budget(need)
+        if reserve < 0:
+            return ("cancel", row, info, None)
+        try:
+            # RAM dysk MA PIERWSZEŃSTWO; wybór/remount pod lockiem — unika
+            # wyścigu o odmontowany RAM-dysk między wątkami.
+            with scratch_lock:
+                wd = pick_scratch_root(
+                    need, prefer=(str(work_dir) if work_dir else str(path.parent)),
+                    log=_log, fallback=scratch_fallback)
             if wd is None:
-                _log(f"CHD POMIJAM (za mało miejsca na ŻADNYM dysku): "
-                     f"{path.name} — potrzeba ~{need/1024**3:.1f} GB")
-                continue
+                return ("noscratch", row, info, need)
+            slot = slot_q.get()
             _log(f"CHD głęboko: {path.name}… (scratch: {wd})")
 
-            # postęp ekstrakcji chdman (pct 0-100 albo -1=nieokreślony) → pasek
-            # szczegółowy. Bez tego długie extractcd wyglądało na zawieszone.
-            # PRIMUJEMY pasek od razu — nawet zanim chdman wypisze pierwszy %,
-            # widać że trwa wypakowanie tego CHD.
-            if detail is not None:
-                detail(0, 0, f"wypakowuję CHD: {path.name}…")
+            def _dp(pct: float, msg: str = "", _name=path.name, _slot=slot) -> None:
+                # postęp ekstrakcji chdman → OSOBNY pasek slotu (kilka naraz);
+                # gdy brak slot_progress → wspólny pasek szczegółowy (1 wątek).
+                if slot_progress is not None:
+                    if pct is not None and pct >= 0:
+                        slot_progress(_slot, int(pct), 100,
+                                      f"{_name}: {msg or f'{int(pct)}%'}")
+                    else:
+                        slot_progress(_slot, 0, 0, f"{_name}: {msg}".rstrip(": "))
+                elif detail is not None:
+                    if pct is not None and pct >= 0:
+                        detail(int(pct), 100,
+                               f"CHD {_name}: {msg or f'{int(pct)}%'}")
+                    else:
+                        detail(0, 0, f"CHD {_name}: {msg}".rstrip(": "))
 
-            def _dp(pct: float, msg: str = "", _name=path.name) -> None:
-                if detail is None:
-                    return
-                if pct is not None and pct >= 0:
-                    detail(int(pct), 100, f"CHD {_name}: {msg or f'{int(pct)}%'}")
+            try:
+                if slot_progress is not None:
+                    slot_progress(slot, 0, 0, f"wypakowuję: {path.name}…")
+                elif detail is not None:
+                    detail(0, 0, f"wypakowuję CHD: {path.name}…")
+                # PREFIKS z nazwą pliku: w trybie równoległym logi z
+                # deep_identify (Próba/✔/✗) się PRZEPLATAJĄ — bez nazwy „✔ ==
+                # DAT 'X'" wyglądałaby, jakby należała do sąsiedniego „CHD
+                # głęboko: Y". Prefiks czyni log jednoznacznym i weryfikowalnym.
+                _pfx = f"[{path.name}] " if n_deep > 1 else ""
+                r = deep_identify(chd, path, merged, wd,
+                                  log=lambda m, _p=_pfx: _log(f"  {_p}{m}"),
+                                  on_progress=_dp,
+                                  cancel_event=cancel_event, chd_info=info)
+                return ("deep", row, info, r)
+            finally:
+                if slot_progress is not None:
+                    slot_progress(slot, -1, 0, "")  # zwolnij/ukryj pasek slotu
+                slot_q.put(slot)
+        finally:
+            _release_budget(reserve)
+
+    if need_deep and not _aborted():
+        slot_q: _queue.Queue = _queue.Queue()
+        for i in range(n_deep):
+            slot_q.put(i)
+        ex = ThreadPoolExecutor(max_workers=n_deep)
+        try:
+            futs = {ex.submit(_deep_job, row, info): row
+                    for (row, info) in need_deep}
+            for fut in as_completed(futs):
+                if _aborted():
+                    break
+                tag, row, info, r = fut.result()
+                path = Path(row["path"])
+                if tag == "cancel":
+                    continue
+                if tag == "noscratch":
+                    _log(f"CHD POMIJAM (za mało miejsca na ŻADNYM dysku): "
+                         f"{path.name} — potrzeba ~{r/1024**3:.1f} GB")
+                    _deep_tick(path.name)
+                    continue
+                # tag == "deep"
+                if r.ok and r.sha1:
+                    index.set_data_sha1(path, r.sha1)
+                    _media = r.media if r.media is not None else (
+                        known[r.sha1].media if r.sha1 in known else None)
+                    _flag_container(path, info, _media)
+                    identified += 1
+                    _log(f"CHD OK ({r.method}): {path.name} -> {r.game}")
+                elif _aborted():
+                    pass                    # przerwane ręcznie — NIE zapisuj porażki
                 else:
-                    detail(0, 0, f"CHD {_name}: {msg}".rstrip(": "))
-
-            r = deep_identify(chd, path, merged, wd,
-                              log=lambda m: _log(f"  {m}"),
-                              on_progress=_dp,
-                              cancel_event=cancel_event, chd_info=info)
-            if r.ok and r.sha1:
-                index.set_data_sha1(path, r.sha1)
-                # kontener: media dopasowanej gry vs typ CHD z nagłówka (info).
-                _media = r.media if r.media is not None else (
-                    known[r.sha1].media if r.sha1 in known else None)
-                _flag_container(path, info, _media)
-                identified += 1
-                _log(f"CHD OK ({r.method}): {path.name} -> {r.game}")
-            elif cancel_event is not None and cancel_event.is_set():
-                return identified     # przerwane ręcznie — NIE zapisuj porażki
-            else:
-                index.set_deep_fail(path)   # zapamiętaj: nie próbuj ponownie
-                _log(f"CHD BRAK: {path.name} — bez dopasowania "
-                     f"(prób: {len(r.tried)}; zapamiętane — nie będzie "
-                     f"mielony przy kolejnych skanach)")
+                    index.set_deep_fail(path)   # zapamiętaj: nie próbuj ponownie
+                    _log(f"CHD BRAK: {path.name} — bez dopasowania "
+                         f"(prób: {len(r.tried)}; zapamiętane — nie będzie "
+                         f"mielony przy kolejnych skanach)")
+                _deep_tick(path.name)
+        finally:
+            # NA PRZERWANIU też CZEKAMY (wait=True): wątki w locie widzą
+            # cancel_event, chdman jest zabijany od razu (_stream sprawdza cancel
+            # co linię), a deep_identify przerywa pętlę metod — więc kończą się w
+            # sekundy. Bez czekania `deep_probe` wracał NATYCHMIAST i pozostałe
+            # ekstrakcje jechały dalej w tle (dopasowanie startowało nad żywymi
+            # ekstrakcjami, a przy zamknięciu ramdysk był zajęty). cancel_futures
+            # porzuca tylko to, co jeszcze NIE ruszyło.
+            ex.shutdown(wait=True, cancel_futures=_aborted())
     return identified

@@ -602,7 +602,6 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB) -> Optional[Path]:
     """Kopiuje/wypakowuje JEDNĄ ścieżkę gry ze źródła (ToSort) na RAM i
     weryfikuje SHA-1 z DAT-em. Zwraca ścieżkę na RAM albo None (błąd/niezgoda).
     Docelowy katalog kolekcji NIGDY nie jest dotykany."""
-    import hashlib  # noqa: F401 (spójność z resztą modułu)
     import shutil as _sh
     rom = status.rom
     dst = ram_dir / rom.name
@@ -951,8 +950,6 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     umie/nie chce ruszyć, zostawia nietknięte (obsłuży zwykły placement +
     stara konwersja) — bezpieczny fallback.
     """
-    import shutil as _sh
-    import tempfile
     from .dirrules import resolve_format
     from .matcher import RomState
     from .scratch import pick_scratch_root
@@ -1009,6 +1006,86 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     # kopii — redukujemy do JEDNEJ w całym przebiegu. Klucz sha1/crc:size, który
     # już ma zachowaną 1 kopię.
     _kept_shared: set = set()
+    # BUDŻET MIEJSCA — RAZ na cały przebieg (tylko realna naprawa; dry-run i tak
+    # nie konwertuje). Zmiana nazwy/katalogu idzie przez rebuilder i miejsca NIE
+    # potrzebuje; pyta tylko KONWERSJA. Budujemy na scratchu (RAM, gdy się
+    # mieści) i podmieniamy źródło finałem, więc zapas potrzebny „na chwilę".
+    # Reguła (wg usera): jeśli scratch ma >= NAJWIĘKSZA gra ×10 wolnego, wszystko
+    # się zmieści (nawet równolegle) → NIE pytamy o miejsce per gra (na NAS to
+    # wolne, blokujące zapytanie). Inaczej (ciasno) — sprawdzamy per gra.
+    _scratch_budget = None
+    if not dry_run:
+        biggest = 0
+        for _rep in reports:
+            _eff = rules_fn(_rep.entry)
+            if _eff.get("skip"):
+                continue
+            if resolve_format(_eff.get("format", "keep"), _rep.entry) in (
+                    "keep", "", "extract"):
+                continue
+            for _g in _rep.entry.games:
+                _s = sum(max(r.size, 0) for r in _g.roms)
+                if _s > biggest:
+                    biggest = _s
+        if biggest:
+            _prefer = str(reports[0].entry.target_dir) if reports else None
+            _sc = pick_scratch_root(
+                int(biggest * 10), prefer=_prefer, log=log,
+                fallback=getattr(tools.get("settings"), "scratch_dir", "")
+                or None)
+            if _sc is not None:
+                _scratch_budget = _sc
+                log(f"Budżet miejsca OK: największa gra "
+                    f"{biggest/1024**3:.1f} GB, scratch {_sc} mieści ×10 — "
+                    f"nie pytam o miejsce per gra.")
+            else:
+                log("Budżet miejsca ciasny — sprawdzam wolne miejsce per gra.")
+
+    # POTOK (pełne nakładanie pobierz→konwertuj→wyślij). Bezpieczny, gdy:
+    #  • jest budżet RAM (scratch) — konwersja i tak buduje na RAM,
+    #  • BRAK współdzielonych odcisków treści (żadne dziecko nie linkuje do
+    #    rodzica w tym przebiegu) → zero zależności kolejnościowych między grami.
+    # Inaczej — konwersja SERYJNA (bezpiecznie). Konwersja zawsze 1 na raz;
+    # nakładamy tylko pobieranie (I/O) i wysyłanie (I/O) na konwersję (CPU).
+    _pipe = None
+    _fed: list = []                      # (key, handle) — pogodzenie `done` przy błędzie
+    if not dry_run and _scratch_budget is not None:
+        from collections import Counter as _Counter
+        _profc: _Counter = _Counter()
+        for _rep in reports:
+            _eff = rules_fn(_rep.entry)
+            if _eff.get("skip"):
+                continue
+            if resolve_format(_eff.get("format", "keep"), _rep.entry) in (
+                    "keep", "", "extract"):
+                continue
+            for _g in _rep.entry.games:
+                pr = game_profile(_g.data_roms)
+                if pr:
+                    _profc[pr] += 1
+        if any(c > 1 for c in _profc.values()):
+            log("Potok WYŁ (współdzielone odciski → linki dziecko/rodzic) — "
+                "konwersja seryjna.")
+        else:
+            import shutil as _sh0
+
+            from .convert_pipeline import StagePipeline
+            try:
+                budget = int(_sh0.disk_usage(str(_scratch_budget)).free * 0.85)
+            except OSError:
+                budget = 0
+            _pipe = StagePipeline(
+                gather=lambda j: _conv_gather_phase(j, log),
+                build=lambda j, g: _conv_build_phase(j, tools, log, detail),
+                upload=lambda j, b: _conv_upload_phase(j, detail, log),
+                finalize=lambda j, r: _conv_finalize_phase(
+                    j, r, index, on_converted, st, shared_srcs, deferred, log),
+                release=_conv_release, ram_budget=budget, log=log, cancel=cancel)
+            _pipe.start()
+            log(f"Potok konwersji WŁ (budżet RAM {budget/1024**3:.1f} GB, "
+                f"scratch {_scratch_budget}) — pobieranie i wysyłka nakładane "
+                f"na konwersję.")
+
     for rep in reports:
         if cancel is not None and cancel.is_set():
             break
@@ -1097,24 +1174,27 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 # fizycznym CHD → skasuj błędną kopię i wstaw symlink do rodzica.
                 # „w child tylko linki".
                 if any(s.via_chd for s in sts) and index is not None:
-                    from .linker import is_link as _is_link
                     prof = game_profile(game.data_roms)
                     own = rep.entry.target_dir / f"{game.name}.chd"
                     if prof:
                         keeper = final_by_profile.get(prof)
-                        own_phys = (os.path.isfile(own)
-                                    and not _is_link(own))
+                        # STAN WŁASNEGO CHD z INDEKSU (lokalny SQLite), a NIE stat
+                        # na NAS: os.path.isfile/lstat PER GRA na dysku sieciowym
+                        # to były „przystanki" w „Znajdź naprawy" (tysiące gier
+                        # CHD = tysiące zapytań SMB). Indeks jest świeży po skanie;
+                        # realny relink i tak re-weryfikuje przed zmianą.
+                        try:
+                            orow = index.lookup(own)
+                        except Exception:
+                            orow = None
                         # zawartość WŁASNEGO pliku musi pasować do gry, inaczej
                         # to obcy plik — nie ruszamy (żadnych strat).
-                        own_ok = False
-                        if own_phys:
-                            try:
-                                orow = index.lookup(own)
-                            except Exception:
-                                orow = None
-                            own_ok = bool(orow is not None
-                                          and (orow["data_sha1"] or "").lower()
-                                          == prof.lower())
+                        own_phys = bool(orow is not None
+                                        and not orow["is_link"]
+                                        and not orow["missing"])
+                        own_ok = bool(own_phys
+                                      and (orow["data_sha1"] or "").lower()
+                                      == prof.lower())
                         cn = os.path.normcase(os.path.abspath(str(own)))
                         if keeper is None and own_ok:
                             # RODZIC — jego fizyczny CHD zostaje keeperem
@@ -1174,14 +1254,34 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                                                  index, dry_run, log)
                 continue
 
-            res = _convert_game_from_source(
-                rep.entry, game, sts, fmt, subdir, tools, index, dry_run, log,
-                st, detail, deferred, on_converted, shared_srcs)
-            if res is not None:
-                done.add(key)
-                if prof:
-                    final_by_profile[prof] = res
+            if _pipe is not None:
+                # POTOK: zleć zadanie (pobranie→konwersja→wysyłka w tle); finalize
+                # (indeks/źródła) i tak w TYM wątku (SQLite jednowątkowe).
+                pjob = _conv_prepare(rep.entry, game, sts, fmt, tools, log)
+                if pjob is not None:
+                    pjob["scratch"] = _scratch_budget
+                    cost = int(sum(max(r.size, 0) for r in pjob["roms"]) * 1.7)
+                    _fed.append((key, _pipe.feed(pjob, cost=cost)))
+                    done.add(key)
+                    if prof:
+                        final_by_profile[prof] = pjob["final"]
+                # pjob None → nie oznaczamy done → fallback placement
+            else:
+                res = _convert_game_from_source(
+                    rep.entry, game, sts, fmt, subdir, tools, index, dry_run, log,
+                    st, detail, deferred, on_converted, shared_srcs,
+                    scratch_override=_scratch_budget)
+                if res is not None:
+                    done.add(key)
+                    if prof:
+                        final_by_profile[prof] = res
 
+    if _pipe is not None:
+        _pipe.drain()                    # dokończ i zfinalizuj wszystkie (kolejno)
+        _pipe.close()
+        for k, h in _fed:                # nieudane → cofnij z done (placement dokończy)
+            if getattr(h, "failed_stage", ""):
+                done.discard(k)
     # NIE kasujemy tu — oryginalne źródła (unikalne) zwracamy, a kasuje je
     # dopiero KONIEC całej naprawy (po placemencie i fallbacku), żeby żadna
     # współdzielona ścieżka nie zniknęła zanim ktoś jej jeszcze potrzebuje.
@@ -1277,19 +1377,173 @@ def _try_disc_archive_chd(entry, game, archive, tools, index, log, st, detail,
         _sh.rmtree(work, ignore_errors=True)
 
 
-def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
-                              dry_run, log, st, detail, deferred,
-                              on_converted, shared_srcs=frozenset()) -> bool:
-    """Jedna gra: zbierz ścieżki na RAM → kompresuj → weryfikuj → finał do
-    docelowego. True gdy obsłużona (placement ją pomija).
-
-    Źródła UNIKALNE dla tej gry kasujemy OD RAZU (ToSort zwalnia się w trakcie);
-    WSPÓŁDZIELONE (`shared_srcs`) dopisujemy do `deferred` — kasowane na końcu,
-    bo potrzebuje ich inna płyta zestawu / gra idąca do fallbacku."""
-    import shutil as _sh
-    import tempfile
+def _conv_scratch_for(roms, fmt, target_dir, scratch_override, tools, base, log):
+    """Katalog scratch dla konwersji (budżet lub per gra). None = brak miejsca."""
     from .scratch import pick_scratch_root
+    if scratch_override is not None:
+        return Path(scratch_override)
+    try:
+        need = int(sum(max(r.size, 0) for r in roms)
+                   * (_FREE_FACTOR.get(fmt, 1.5) + 1.0))
+    except Exception:
+        need = 0
+    sc = pick_scratch_root(
+        need, prefer=str(target_dir), log=log,
+        fallback=getattr(tools.get("settings"), "scratch_dir", "") or None)
+    if sc is None:
+        log(f"POMIJAM (ze źródła) {base}: brak miejsca (~{need/1024**3:.1f} GB)")
+    return sc
 
+
+def _conv_gather_phase(job, log):
+    """ETAP 1 (I/O): źródła NAS→RAM w katalogu roboczym. Zwraca listę zebranych
+    plików albo None (niezgodność → fallback placement). Katalog roboczy zawsze
+    tworzony (sprząta go `_conv_release`)."""
+    import tempfile
+    from .scratch import resilient_dir
+    # ODPORNE na ZNIKNIĘCIE scratchu w trakcie (RAM-dysk odmontowany nagle):
+    # utwórz katalog tuż przed użyciem, spróbuj odtworzyć RAM-dysk, a gdy się nie
+    # da — systemowy temp (dysk fizyczny), byle konwersja szła dalej.
+    scratch = resilient_dir(job["scratch"], log=log)
+    work = Path(tempfile.mkdtemp(prefix="chdbuddy_src_", dir=str(scratch)))
+    ram_in = work / "in"
+    ram_in.mkdir()
+    job["work"] = work
+    job["ram_in"] = ram_in
+    gathered = []
+    for r in job["roms"]:
+        s = job["st_by_rom"][r.name]
+        _src = s.source_path + (f"::{s.member}" if s.member else "")
+        log(f"  źródło: {_src}")
+        g = _gather_track_to_ram(s, ram_in, log)
+        if g is None:
+            return None
+        gathered.append(g)
+    job["gathered"] = gathered
+    return gathered
+
+
+def _conv_build_phase(job, tools, log, detail):
+    """ETAP 2 (CPU): kompresja na RAM (zip/chd/rvz) + strażnik treści. Zwraca
+    ścieżkę zbudowanego pliku albo None (pominięcie — źródło zostaje)."""
+    fmt = job["fmt"]
+    base = job["base"]
+    game = job["game"]
+    gathered = job["gathered"]
+    work = job["work"]
+    ram_in = job["ram_in"]
+    final = job["final"]
+
+    def _dtl(d, t, txt):
+        if detail is not None:
+            detail(d, t, txt)
+
+    tmp_out = work / final.name
+    if fmt == "zip":
+        _dtl(0, 0, f"pakowanie ZIP: {base}")
+        r = pack_zip(gathered, tmp_out, log=log,
+                     level=getattr(tools.get("settings"), "zip_level", 6),
+                     method=getattr(tools.get("settings"), "zip_method",
+                                    "deflate"))
+        cue_synth = False
+    elif fmt == "chd":
+        main = min(gathered, key=lambda f: (_DISC_MAIN_PRIORITY.get(
+            f.suffix.lower().lstrip("."), 9), f.name.lower()))
+        chd = tools.get("chdman")
+        if chd is None:
+            log("  brak chdman — pomijam")
+            return None
+        cue_synth = False
+        if main.suffix.lower().lstrip(".") not in _CHD_SOURCE_EXTS:
+            cue = ram_in / f"{base}.cue"
+            if not _synthesize_cue(gathered, cue, log):
+                log(f"  POMIJAM CHD {base}: brak opisu ścieżek i żadnego "
+                    f".bin do syntezy cue.")
+                return None
+            main = cue
+            cue_synth = True
+        _dtl(0, 0, f"kompresja CHD: {base}")
+        r = disc_to_chd(main, tmp_out, chd, tools["settings"], log=log,
+                        on_progress=lambda pct, msg="": _dtl(
+                            int(pct), 100, f"CHD {base}: {msg or f'{int(pct)}%'}"))
+    else:  # rvz
+        iso = next((f for f in gathered if f.suffix.lower() == ".iso"), None)
+        dt = tools.get("dolphintool")
+        if iso is None or dt is None:
+            log(f"  RVZ: brak iso/DolphinTool — pomijam {base}")
+            return None
+        cue_synth = False
+        _dtl(0, 0, f"kompresja RVZ: {base}")
+        r = iso_to_rvz(iso, tmp_out, dt, log=log,
+                       level=getattr(tools.get("settings"), "rvz_level", 5),
+                       block_kb=getattr(tools.get("settings"), "rvz_block_kb", 128))
+    if not r.ok:
+        log(f"  BŁĄD konwersji {base}: {r.message}")
+        return None
+    built = r.dst if (r.dst and Path(r.dst).is_file()) else tmp_out
+    if not Path(built).is_file():
+        return None
+    # STRAŻNIK TREŚCI (CHD z syntezowanym cue): obraz MUSI zawierać TĘ grę.
+    if fmt == "chd" and cue_synth and not _content_matches_game(
+            Path(built), game, tools.get("chdman"), work, log):
+        log(f"  ODRZUCONE: zsyntetyzowany układ nie daje treści gry "
+            f"„{base}” — NIE umieszczam, źródło zostaje.")
+        return None
+    job["built"] = Path(built)
+    return job["built"]
+
+
+def _conv_upload_phase(job, detail, log):
+    """ETAP 3 (I/O): finał RAM→NAS + policz sumy pliku docelowego. Zwraca
+    (crc, md5, sha1); ("","","") gdy przeniesienie OK, ale hash się nie udał."""
+    final = job["final"]
+    built = job["built"]
+    if detail is not None:
+        detail(0, 0, f"przenoszę: {final.name}")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    log(f"  finał → {final}")
+    _place_cross(Path(built), final, detail=detail,
+                 label=f"przenoszę {final.name}")
+    try:
+        return hash_file(final)
+    except OSError:
+        return ("", "", "")
+
+
+def _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
+                         deferred, log):
+    """FINALIZACJA (WŁAŚCICIEL, jednowątkowo): zapis do indeksu, callback, licznik,
+    odroczenie/kasowanie źródeł."""
+    final = job["final"]
+    if index is not None and sums and sums[2]:
+        try:
+            index.record_file(final, sums[0], sums[1], sums[2])
+            if job["fmt"] == "chd":
+                from .datfile import game_profile
+                prof = game_profile(job["game"].data_roms)
+                if prof:
+                    index.set_data_sha1(final, prof)
+        except OSError:
+            pass
+    if on_converted is not None:
+        on_converted(final)
+    st.converted += 1
+    _defer_or_purge_game_sources(job["sts"], shared_srcs, deferred, index,
+                                 False, log)
+
+
+def _conv_release(job):
+    """ZAWSZE po zadaniu: sprzątnij katalog roboczy (zwalnia RAM/scratch)."""
+    import shutil as _sh
+    w = job.get("work")
+    if w:
+        _sh.rmtree(w, ignore_errors=True)
+
+
+def _conv_prepare(entry, game, sts, fmt, tools, log):
+    """Przygotowanie (BEZ I/O): ścieżka finalna, zbieralne tory, walidacja. Zwraca
+    słownik-zadanie albo None (gra nie do konwersji tą ścieżką). Wspólne dla skanu
+    serialnego i potoku — pozwala pętli poznać `final` przed zleceniem."""
     base = game.name
     target_dir = entry.target_dir
     if fmt == "zip":
@@ -1300,23 +1554,14 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
         final = target_dir / f"{base}.rvz"
     else:
         return None
-
-    def _dtl(d, t, txt):
-        if detail is not None:
-            detail(d, t, txt)
-
-    # status per ROM (po nazwie); pomijamy roms bez statusu
     st_by_rom = {}
     for s in sts:
         st_by_rom.setdefault(s.rom.name, s)
     roms = [r for r in game.roms if r.name in st_by_rom]
     if not roms:
         return None
-
-    # Tor jest ZBIERALNY, gdy ma źródło i nie jest MISSING/NO_HASH. Dla płyt na
-    # CHD brakujący SAM OPIS ścieżek (.cue/.gdi/.toc) NIE blokuje — zsyntetyzujemy
-    # go z torów danych (kontener≠gra, gra bywa rozproszona po plikach/archiwach).
     from .matcher import RomState
+
     def _gatherable(r) -> bool:
         s = st_by_rom[r.name]
         return (s.state not in (RomState.MISSING, RomState.NO_HASH)
@@ -1335,142 +1580,59 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
         return None                                    # kartridż musi mieć wszystko
     if not roms:
         return None
+    return {"entry": entry, "game": game, "sts": sts, "fmt": fmt, "base": base,
+            "target_dir": target_dir, "final": final, "roms": roms,
+            "st_by_rom": st_by_rom}
 
-    try:
-        need = int(sum(max(r.size, 0) for r in roms) * (_FREE_FACTOR.get(fmt, 1.5) + 1.0))
-    except Exception:
-        need = 0
-    scratch = pick_scratch_root(
-        need, prefer=str(target_dir), log=log,
-        fallback=getattr(tools.get("settings"), "scratch_dir", "") or None)
-    if scratch is None:
-        log(f"POMIJAM (ze źródła) {base}: brak miejsca (~{need/1024**3:.1f} GB)")
+
+def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
+                              dry_run, log, st, detail, deferred,
+                              on_converted, shared_srcs=frozenset(),
+                              scratch_override=None) -> bool:
+    """Jedna gra SERYJNIE: zbierz ścieżki na RAM → kompresuj → weryfikuj → finał.
+    True gdy obsłużona (placement ją pomija). Te same fazy napędza też potok."""
+    job = _conv_prepare(entry, game, sts, fmt, tools, log)
+    if job is None:
         return None
-    log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}")
+    base = job["base"]
+    final = job["final"]
+    roms = job["roms"]
+    st_by_rom = job["st_by_rom"]
+    target_dir = job["target_dir"]
+
+    # PODGLĄD (dry-run): NIE odpytujemy wolnego miejsca (na NAS to blokujące) —
+    # tylko zapowiadamy plan; miejsce sprawdzimy przy faktycznej naprawie.
     if dry_run:
+        log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}")
         st.converted += 1
         log(f"  finał → {final} (podgląd)")
-        # w dry-run tylko zapowiedz — oznacz oryginalne źródła jako „do zabrania"
         for r in roms:
             sp = st_by_rom[r.name].source_path
             if sp:
                 deferred.append(Path(sp))
         return final
 
-    work = Path(tempfile.mkdtemp(prefix="chdbuddy_src_", dir=str(scratch)))
-    ram_in = work / "in"
-    ram_in.mkdir()
+    # KONWERSJA w 3 FAZACH (te same fazy używa też potok równoległy):
+    # gather (I/O) → build (CPU) → upload (I/O), potem finalize (indeks/źródła).
+    scratch = _conv_scratch_for(roms, fmt, target_dir, scratch_override,
+                                tools, base, log)
+    if scratch is None:
+        return None
+    job["scratch"] = scratch
+    log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}")
     try:
-        # 1) ZBIERZ + WERYFIKUJ ścieżki na RAM
-        _dtl(0, 0, f"zbieram źródło: {base}")
-        gathered = []
-        for r in roms:
-            s = st_by_rom[r.name]
-            _src = s.source_path + (f"::{s.member}" if s.member else "")
-            log(f"  źródło: {_src}")
-            g = _gather_track_to_ram(s, ram_in, log)
-            if g is None:
-                return None                     # niezgodność → fallback placement
-            gathered.append(g)
-
-        # 2) KOMPRESUJ na RAM
-        tmp_out = work / final.name
-        if fmt == "zip":
-            _dtl(0, 0, f"pakowanie ZIP: {base}")
-            r = pack_zip(gathered, tmp_out, log=log,
-                         level=getattr(tools.get("settings"), "zip_level", 6),
-                         method=getattr(tools.get("settings"), "zip_method",
-                                        "deflate"))
-        elif fmt == "chd":
-            main = min(gathered, key=lambda f: (_DISC_MAIN_PRIORITY.get(
-                f.suffix.lower().lstrip("."), 9), f.name.lower()))
-            chd = tools.get("chdman")
-            if chd is None:
-                log("  brak chdman — pomijam"); return None
-            # Brak opisu ścieżek (.cue/.gdi/.iso) wśród zebranych torów →
-            # ZSYNTETYZUJ .cue z torów danych (luźne/rozproszone biny). Nigdy
-            # nie wołamy createcd na gołym binie (zawiesza się) — dajemy mu cue.
-            cue_synth = False
-            if main.suffix.lower().lstrip(".") not in _CHD_SOURCE_EXTS:
-                cue = ram_in / f"{base}.cue"
-                if not _synthesize_cue(gathered, cue, log):
-                    log(f"  POMIJAM CHD {base}: brak opisu ścieżek i żadnego "
-                        f".bin do syntezy cue.")
-                    return None
-                main = cue
-                cue_synth = True
-            _dtl(0, 0, f"kompresja CHD: {base}")
-            r = disc_to_chd(main, tmp_out, chd, tools["settings"], log=log,
-                            on_progress=lambda pct, msg="": _dtl(
-                                int(pct), 100, f"CHD {base}: {msg or f'{int(pct)}%'}"))
-        else:  # rvz
-            iso = next((f for f in gathered if f.suffix.lower() == ".iso"), None)
-            dt = tools.get("dolphintool")
-            if iso is None or dt is None:
-                log(f"  RVZ: brak iso/DolphinTool — pomijam {base}")
-                return None
-            _dtl(0, 0, f"kompresja RVZ: {base}")
-            r = iso_to_rvz(iso, tmp_out, dt, log=log,
-                           level=getattr(tools.get("settings"), "rvz_level", 5),
-                           block_kb=getattr(tools.get("settings"), "rvz_block_kb", 128))
-        if not r.ok:
-            log(f"  BŁĄD konwersji {base}: {r.message}")
+        if _conv_gather_phase(job, log) is None:
+            return None                         # niezgodność → fallback placement
+        if _conv_build_phase(job, tools, log, detail) is None:
             return None
-        built = r.dst if (r.dst and Path(r.dst).is_file()) else tmp_out
-        if not Path(built).is_file():
-            return None
-
-        # STRAŻNIK TREŚCI (CHD): przy ZSYNTETYZOWANYM cue układ jest niepewny —
-        # zbudowany obraz MUSI zawierać TĘ grę (ekstrakcja + game_profile).
-        # Przy PRAWDZIWYM cue + torach zweryfikowanych po SHA-1 treść jest już
-        # pewna (round-trip gwarantuje bajty) → nie marnujemy ekstrakcji.
-        if fmt == "chd" and cue_synth and not _content_matches_game(
-                Path(built), game, tools.get("chdman"), work, log):
-            log(f"  ODRZUCONE: zsyntetyzowany układ nie daje treści gry "
-                f"„{base}” — NIE umieszczam, źródło zostaje.")
-            return None
-
-        # 3) FINAŁ do docelowego (docelowy dostaje TYLKO ten plik)
-        _dtl(0, 0, f"przenoszę: {final.name}")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        log(f"  finał → {final}")
-        _place_cross(Path(built), final, detail=detail,
-                     label=f"przenoszę {final.name}")
-        if index is not None:
-            try:
-                crc, md5, sha1 = hash_file(final)
-                index.record_file(final, crc, md5, sha1)
-                # CHD: zapisz ODCISK ZAWARTOŚCI (game_profile) = ten sam, który
-                # liczy matcher (by_profile). Bez tego następny skan musiałby
-                # WYPAKOWAĆ CHD, żeby go zidentyfikować (kosztowne, niepotrzebne).
-                if fmt == "chd":
-                    from .datfile import game_profile
-                    prof = game_profile(game.data_roms)
-                    if prof:
-                        index.set_data_sha1(final, prof)
-            except OSError:
-                pass
-        if on_converted is not None:
-            on_converted(final)
-        st.converted += 1
-        # ORYGINALNE źródła: UNIKALNE → kasuj OD RAZU; WSPÓŁDZIELONE → odrocz.
-        _defer_or_purge_game_sources(sts, shared_srcs, deferred, index,
-                                     dry_run, log)
+        sums = _conv_upload_phase(job, detail, log)
+        _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
+                             deferred, log)
         return final
     finally:
-        _dtl(-1, 0, "")
-        _sh.rmtree(work, ignore_errors=True)
-
-
-def _free_bytes(path: Path) -> int:
-    import shutil as _sh
-    probe = path
-    while not probe.exists() and probe.parent != probe:
-        probe = probe.parent
-    try:
-        return _sh.disk_usage(str(probe)).free
-    except OSError:
-        return 0
+        if detail is not None:
+            detail(-1, 0, "")
+        _conv_release(job)
 
 
 def _place_cross(new: Path, dst: Path, detail=None, label: str = "") -> None:

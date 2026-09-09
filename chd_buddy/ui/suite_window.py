@@ -14,6 +14,7 @@ Klasyczne narzędzie CHD otwiera się z menu jako osobne okno.
 from __future__ import annotations
 
 import os
+import sys
 import traceback
 from pathlib import Path
 from typing import Callable, Optional
@@ -101,10 +102,12 @@ def _chd_prober(settings, log):
 
 def _deep_probe_gui(idx, entries, settings, chd_mode: str,
                     roots, log: Callable[[str], None], cancel=None,
-                    on_progress=None, detail=None) -> None:
+                    on_progress=None, detail=None, slot=None) -> None:
     """Identyfikacja CHD wg trybu: 'deep' = ekstrakcja (CD/DVD-jako-CD).
     ('header'/'none' są obsłużone przez prober przy samym skanie).
-    on_progress/detail — postęp ogólny i szczegółowy (ekstrakcja chdman)."""
+    on_progress/detail/slot — postęp ogólny, szczegółowy i RÓWNOLEGŁY (pasek
+    per plik). Sonda działa RÓWNOLEGLE: tani nagłówek wg nośnika (NAS/SSD),
+    głęboka ekstrakcja gated liczbą mieszczącą się na RAM-dysku."""
     if chd_mode != "deep":
         return
     from ..core.chdman import CHDMan, CHDManNotFound
@@ -114,11 +117,50 @@ def _deep_probe_gui(idx, entries, settings, chd_mode: str,
     except CHDManNotFound as e:
         log(f"CHD: pominięto identyfikację — {e}")
         return
+    clean = [r for r in roots if r]
+    # WĄTKI: tani nagłówek skaluje się z nośnikiem (NAS wiele strumieni ukrywa
+    # latencję SMB; HDD=1). Bierzemy MAKS z nośników korzeni (sonda i tak czyta
+    # głównie z NAS-a). Głęboka ekstrakcja ograniczona miejscem na RAM-dysku:
+    # każda wypakowuje pełny obraz (~9 GB DVD) → tyle ilu się MIEŚCI, min. 1.
+    from ..core.storage import storage_kind, workers_for_kind
+    _ov = settings.storage_overrides
+    head_workers = 1
+    for r in clean:
+        k = storage_kind(r, _ov)
+        head_workers = max(head_workers,
+                           workers_for_kind(k, settings.scan_workers_nas,
+                                            settings.scan_workers_ssd, 1))
+    # BUDŻET scratcha = WOLNE MIEJSCE NA RAM-DYSKU R: (do ~40 GB), a NIE wolny
+    # fizyczny RAM. RAM-dysk ma DEDYKOWANĄ pamięć — proces System trzyma jego
+    # rozmiar, więc zapis w wolne miejsce R: reużywa już przypisanego RAM-u i
+    # NIE uszczupla „Dostępnej" w Menedżerze. Pojemność ramdysku jest kontraktem
+    # na scratch. (Wcześniejszy błąd: liczyłem `avail_phys`, co PODWÓJNIE liczyło
+    # pamięć już oddaną ramdyskowi → dławiło do ~2 ekstrakcji, choć R: miał
+    # dziesiątki GB wolne.) Każda ekstrakcja rezerwuje tyle, ile REALNIE
+    # potrzebuje (~2 GB gra CD, ~9 GB DVD), więc małych mieści się WIĘCEJ naraz
+    # (więcej strumieni z NAS = wyżej LAN). Górny cap = liczba wątków nagłówka.
+    deep_cap = max(1, head_workers)
+    deep_budget = 0
+    try:
+        import shutil as _sh
+        from ..core import ramdisk as _rd
+        ram = _rd.active_root()
+        if ram:
+            free = _sh.disk_usage(str(ram)).free
+            deep_budget = max(0, free - 2 * (1 << 30))   # ~2 GB luzu na wolumenie
+        else:
+            # bez RAM-dysku scratch idzie na dysk fizyczny — wolne miejsce tam
+            deep_budget = _sh.disk_usage(settings.work_dir or ".").free
+    except Exception:
+        deep_budget = 0
+    log(f"CHD sonda: {head_workers} wątk. (nagłówek), do {deep_cap} ekstrakcji, "
+        f"budżet scratch {deep_budget / (1 << 30):.0f} GB")
     n = deep_probe_chds(
-        idx, entries, chd, roots=[r for r in roots if r],
+        idx, entries, chd, roots=clean,
         work_dir=Path(settings.work_dir) if settings.work_dir else None,
         log=log, cancel_event=cancel, on_progress=on_progress, detail=detail,
-        scratch_fallback=settings.scratch_dir or None)
+        slot_progress=slot, scratch_fallback=settings.scratch_dir or None,
+        workers=head_workers, deep_workers=deep_cap, deep_budget=deep_budget)
     if detail is not None:
         detail(-1, 0, "")                 # schowaj pasek szczegółowy po CHD
     log(f"CHD zidentyfikowane (ekstrakcja): {n}")
@@ -131,6 +173,7 @@ class _FnSignals(QObject):
     # przepuszcza Python int bez konwersji; skalowanie do paska robi UI.
     progress = Signal(object, object, str)   # OGÓLNY: done, total (0=nieokreślony)
     detail = Signal(object, object, str)     # SZCZEGÓŁOWY: bieżący plik
+    slot = Signal(object, object, object, str)  # RÓWNOLEGŁY: slot, done, total, plik
     done = Signal(object, str)               # wynik, błąd ("" gdy ok)
 
 
@@ -160,9 +203,12 @@ class _PathRow(QWidget):
     """Etykieta + pole ścieżki + przycisk wyboru katalogu."""
 
     def __init__(self, label: str, value: str = "",
-                 on_change: Optional[Callable[[str], None]] = None):
+                 on_change: Optional[Callable[[str], None]] = None,
+                 on_storage: Optional[Callable[[str], None]] = None,
+                 storage_value: str = ""):
         super().__init__()
         self._on_change = on_change
+        self._on_storage = on_storage
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(QLabel(label))
@@ -173,6 +219,23 @@ class _PathRow(QWidget):
         btn.setFixedWidth(28)
         btn.clicked.connect(self._browse)
         lay.addWidget(btn)
+        self.storage = None
+        if on_storage is not None:
+            self.storage = QComboBox()
+            self.storage.addItem(tr("Auto"), "")
+            self.storage.addItem(tr("🌐 NAS/sieć"), "nas")
+            self.storage.addItem(tr("⚡ SSD/NVMe"), "ssd")
+            self.storage.addItem(tr("💽 HDD"), "hdd")
+            self.storage.setToolTip(tr(
+                "Nośnik katalogu → liczba wątków skanu. NAS/SSD: kilka odczytów "
+                "naraz (szybciej); HDD: 1 (równoległość szkodzi). Auto wykrywa "
+                "dysk sieciowy."))
+            ix = self.storage.findData(storage_value or "")
+            self.storage.setCurrentIndex(ix if ix >= 0 else 0)
+            self.storage.currentIndexChanged.connect(
+                lambda _i: self._on_storage(self.storage.currentData())
+                if self._on_storage else None)
+            lay.addWidget(self.storage)
 
     def _browse(self) -> None:
         d = QFileDialog.getExistingDirectory(self, tr("Wybierz katalog"),
@@ -200,6 +263,7 @@ class SuiteWindow(QMainWindow):
         from .. import __version__ as _ver
         self.setWindowTitle(tr("ROM Kombajn — chd_buddy") + f"  v{_ver}")
         self.resize(1080, 720)
+        self._restore_geometry()      # pozycja/rozmiar z poprzedniej sesji
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -252,7 +316,7 @@ class SuiteWindow(QMainWindow):
                       "dysk z wolnym miejscem. (zainstaluj ImDisk, by trzymać "
                       "je w RAM)")
             return
-        size = int(self.settings.ramdisk_size_gb or 30)
+        size = int(self.settings.ramdisk_size_gb or 40)
         letter = (self.settings.ramdisk_letter or "R")[:1]
         # SYNCHRONICZNIE: jeśli RAM dysk z poprzedniej sesji już istnieje,
         # zarejestruj go OD RAZU — inaczej pierwsza naprawa/konwersja mogłaby
@@ -266,7 +330,83 @@ class SuiteWindow(QMainWindow):
         self._workers.append(worker)
         self.pool.start(worker)
 
+    def _restore_geometry(self) -> None:
+        """Przywraca pozycję/rozmiar okna z poprzedniej sesji (jeśli zapisane)."""
+        g = getattr(self.settings, "ui_geometry", "") or ""
+        if not g:
+            return
+        try:
+            from PySide6.QtCore import QByteArray
+            self.restoreGeometry(QByteArray.fromBase64(g.encode("ascii")))
+        except Exception:
+            pass
+
+    def _collapsed_group_keys(self) -> list[str]:
+        """Klucze grup-katalogów, które są ZWINIĘTE w drzewie DAT-ów."""
+        out: list[str] = []
+
+        def walk(item) -> None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if (isinstance(data, str) and item.childCount()
+                    and not item.isExpanded()):
+                out.append(data)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self.tree.topLevelItemCount()):
+            walk(self.tree.topLevelItem(i))
+        return out
+
+    def _on_group_toggle(self, item) -> None:
+        """Zapamiętuje zwinięcie/rozwinięcie grupy między sesjami."""
+        if getattr(self, "_filling", False):
+            return
+        if not isinstance(item.data(0, Qt.ItemDataRole.UserRole), str):
+            return
+        try:
+            self.settings.ui_collapsed_groups = self._collapsed_group_keys()
+            self.settings.save()
+        except Exception:
+            pass
+
     def closeEvent(self, event) -> None:
+        # zapamiętaj pozycję/rozmiar okna i zwinięte grupy
+        try:
+            self.settings.ui_geometry = bytes(
+                self.saveGeometry().toBase64()).decode("ascii")
+            self.settings.ui_collapsed_groups = self._collapsed_group_keys()
+            self.settings.save()
+        except Exception:
+            pass
+        # DOMKNIĘCIE PRACY W TLE przed wyjściem. Zamknięcie okna gdy wątek/
+        # podproces (skan/konwersja/chdman) WCIĄŻ działa = proces kończy się
+        # „nieczysto" i bootloader PyInstaller nie może skasować katalogu
+        # tymczasowego _MEI… (stąd „Failed to remove temporary directory").
+        # Prosimy o przerwanie i CZEKAMY na zakończenie zadań (z limitem).
+        try:
+            if getattr(self, "_cancel_event", None) is not None:
+                self._cancel_event.set()
+            active = self.pool.activeThreadCount()
+            if active:
+                self._log(f"Zamykanie: czekam na {active} zadań w tle "
+                          f"(do 10 s), by czysto zwolnić pliki…")
+                self.pool.waitForDone(10000)
+                still = self.pool.activeThreadCount()
+                if still:
+                    self._log(f"UWAGA: {still} zadań wciąż działa — może to "
+                              f"blokować sprzątanie katalogu _MEI.")
+            # DIAGNOSTYKA: żywe wątki i katalog _MEI (do namierzenia blokady)
+            import threading
+            alive = [t.name for t in threading.enumerate()
+                     if t.is_alive() and t is not threading.main_thread()]
+            if alive:
+                self._log(f"Zamykanie: żywe wątki: {', '.join(alive[:8])}"
+                          + (" …" if len(alive) > 8 else ""))
+            mei = getattr(sys, "_MEIPASS", "")
+            if mei:
+                self._log(f"Zamykanie: katalog tymczasowy build (_MEI): {mei}")
+        except Exception:
+            pass
         # usuń ulotny RAM dysk przy zamknięciu (dane tymczasowe znikają z nim)
         try:
             from ..core import ramdisk
@@ -301,6 +441,27 @@ class SuiteWindow(QMainWindow):
     def _save_setting(self, name: str, value: object) -> None:
         setattr(self.settings, name, value)
         self.settings.save()
+
+    def _storage_override_for(self, path: str) -> str:
+        """Zapisane ręczne nadpisanie nośnika dla katalogu ('' = auto)."""
+        ov = self.settings.storage_overrides or {}
+        return str(ov.get(os.path.normcase(os.path.abspath(str(path))), ""))
+
+    def _set_storage_override(self, path: str, kind: str) -> None:
+        """Zapisuje wybór nośnika katalogu (NAS/SSD/HDD) albo kasuje = Auto."""
+        if not path:
+            return
+        ov = dict(self.settings.storage_overrides or {})
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if kind:
+            ov[key] = kind
+        else:
+            ov.pop(key, None)
+        self.settings.storage_overrides = ov
+        self.settings.save()
+        from ..core.storage import storage_kind
+        eff = storage_kind(path, ov)
+        self._log(f"Nośnik [{path}]: {kind or 'auto'} (efektywnie: {eff}).")
 
     def _run(self, fn: Callable, on_done: Callable[[object], None],
              *, title: str = "") -> None:
@@ -337,7 +498,11 @@ class SuiteWindow(QMainWindow):
         worker = FnWorker(None)
         self._workers.append(worker)
         detail_emit = worker.signals.detail.emit
-        if nparams >= 4:      # (log, prog, cancel, detail)
+        slot_emit = worker.signals.slot.emit
+        if nparams >= 5:      # (log, prog, cancel, detail, slot)
+            worker.fn = lambda log, prog: fn(log, prog, cancel, detail_emit,
+                                             slot_emit)
+        elif nparams == 4:    # (log, prog, cancel, detail)
             worker.fn = lambda log, prog: fn(log, prog, cancel, detail_emit)
         elif nparams == 3:    # (log, prog, cancel)
             worker.fn = lambda log, prog: fn(log, prog, cancel)
@@ -368,6 +533,7 @@ class SuiteWindow(QMainWindow):
             worker.signals.log.connect(dlg.append_log)
             worker.signals.progress.connect(dlg.set_progress)
             worker.signals.detail.connect(dlg.set_detail)
+            worker.signals.slot.connect(dlg.set_slot)
         worker.signals.done.connect(_finish)
         self.pool.start(worker)
 
@@ -459,7 +625,7 @@ class SuiteWindow(QMainWindow):
         sp_size = QSpinBox()
         sp_size.setRange(2, 512)
         sp_size.setSuffix(" GB")
-        sp_size.setValue(int(self.settings.ramdisk_size_gb or 30))
+        sp_size.setValue(int(self.settings.ramdisk_size_gb or 40))
         e_letter = QLineEdit((self.settings.ramdisk_letter or "R")[:1])
         e_letter.setMaxLength(1)
         e_letter.setFixedWidth(40)
@@ -615,10 +781,16 @@ class SuiteWindow(QMainWindow):
         lay = QVBoxLayout(w)
         self.row_dats = _PathRow(tr("Katalog DAT-ów:"), self.settings.dat_root,
                                  lambda v: self._save_setting("dat_root", v))
-        self.row_roms = _PathRow(tr("Katalog ROM-ów:"), self.settings.rom_root,
-                                 lambda v: self._save_setting("rom_root", v))
-        self.row_tosort = _PathRow(tr("ToSort (nieznane):"), self.settings.tosort_dir,
-                                   lambda v: self._save_setting("tosort_dir", v))
+        self.row_roms = _PathRow(
+            tr("Katalog ROM-ów:"), self.settings.rom_root,
+            lambda v: self._save_setting("rom_root", v),
+            on_storage=lambda k: self._set_storage_override(self.row_roms.path, k),
+            storage_value=self._storage_override_for(self.settings.rom_root))
+        self.row_tosort = _PathRow(
+            tr("ToSort (nieznane):"), self.settings.tosort_dir,
+            lambda v: self._save_setting("tosort_dir", v),
+            on_storage=lambda k: self._set_storage_override(self.row_tosort.path, k),
+            storage_value=self._storage_override_for(self.settings.tosort_dir))
         lay.addWidget(self.row_dats)
         lay.addWidget(self.row_roms)
         lay.addWidget(self.row_tosort)
@@ -787,6 +959,9 @@ class SuiteWindow(QMainWindow):
         self.tree.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemExpanded.connect(self._tree_expanded)
+        # pamiętaj zwinięcie/rozwinięcie grup między sesjami
+        self.tree.itemExpanded.connect(self._on_group_toggle)
+        self.tree.itemCollapsed.connect(self._on_group_toggle)
         self.tree.currentItemChanged.connect(self._on_dat_selected)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self._filling = False
@@ -1866,19 +2041,46 @@ class SuiteWindow(QMainWindow):
             return None
         return Path(dats), Path(roms)
 
+    def _selected_platform_keys(self) -> set[str]:
+        """Klucze platform z AKTUALNEGO zaznaczenia w drzewie (DAT-y wprost albo
+        wszystkie DAT-y pod zaznaczoną grupą-katalogiem). Puste = brak wyboru →
+        skan całości bez priorytetów. Służy do priorytetowego skanu wybranej
+        platformy (jej katalogi skanowane pierwsze)."""
+        from ..core.datstore import DatEntry, effective_platform_key
+        from ..core.dirrules import DirRules
+        dats = self.row_dats.path
+        if not dats or not Path(dats).is_dir():
+            return set()
+        rules = DirRules(Path(dats))
+        keys: set[str] = set()
+
+        def collect(item) -> None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(data, DatEntry):
+                keys.add(effective_platform_key(data, rules))
+            for i in range(item.childCount()):   # grupa-katalog → zejdź do DAT-ów
+                collect(item.child(i))
+
+        for it in self.tree.selectedItems():
+            collect(it)
+        return keys
+
     def _collection_report(self) -> None:
         paths = self._collection_paths()
         if paths is None:
             return
         dats, roms = paths
         tosorts = self.settings.tosort_dirs      # główny + dodatkowe
+        # PRIORYTET SKANU: platformy zaznaczone w drzewie idą pierwsze (ich
+        # katalogi w obu konwencjach). Odczyt zaznaczenia MUSI być w wątku GUI.
+        sel_keys = self._selected_platform_keys()
         # Model automatyczny: znane pliki z cache (szybko), nowe/zmienione
         # liczone w pełni + głęboka identyfikacja CHD bez data_sha1.
         full, chd_mode = False, "deep"
         db = self.settings.index_db_path or None
         settings = self.settings
 
-        def job(log: Callable[[str], None], progress, cancel, detail):
+        def job(log: Callable[[str], None], progress, cancel, detail, slot):
             from ..core.datstore import DatStore
             from ..core.fileindex import FileIndex
             from ..core.matcher import DatReport, match_game
@@ -1897,54 +2099,103 @@ class SuiteWindow(QMainWindow):
                 disabled = len(all_entries) - len(enabled)
                 if disabled:
                     log(f"Wyłączonych DAT-ów (nie skanuję): {disabled}")
-                # SKANUJ tylko katalogi docelowe włączonych DAT-ów + ToSort
-                # (katalogi w roms nieprzypisane do DAT-a są pomijane)
-                roots = []
-                seen: set[str] = set()
-                for e in enabled:
-                    d = str(e.target_dir)
-                    if d not in seen and Path(d).is_dir():
-                        seen.add(d)
-                        roots.append(d)
-                for ts in tosorts:               # wszystkie katalogi ToSort
-                    if ts and Path(ts).is_dir() and ts not in seen:
-                        seen.add(ts)
-                        roots.append(ts)
-                # szybki PRE-COUNT (sam scandir) → mianownik „plik X z Y";
-                # bez tego pasek stoi bez liczby, a przy wielkich plikach długo.
+                # SKANUJ katalogi WŁĄCZONYCH platform (obie konwencje nazw:
+                # Redump „Sony - PlayStation 2" i ES-style „ps2"/„psx" — realny
+                # katalog rozwiązuje platform_scan_dirs) + ToSort + rom_root-y
+                # dzieci. NIE cały rom_root: skan tylko tego, co włączone, więc
+                # pliki innych platform (np. RVZ GameCube/Wii przy wybranym
+                # PS1/PS2) nie są ruszane. Dopasowanie i tak jest po TREŚCI, a
+                # pozostałe platformy mają raport z indeksu (trwały) — skanujemy
+                # je, gdy je włączysz.
+                from ..core.dirrules import platform_scan_roots
+                from ..core.datstore import effective_platform_key
+                roots = platform_scan_roots(enabled, rules, roms, tosorts)
                 from ..core.fileindex import count_files
-                progress(0, 0, tr("liczenie plików…"))
-                grand = 0
-                for r in roots:
-                    if cancel.is_set():
-                        break
-                    grand += count_files(Path(r), cancel=cancel)
-                log(f"Do przeskanowania: {grand} plików w {len(roots)} katalogach")
+
+                def _count(paths) -> int:
+                    tot = 0
+                    for r in paths:
+                        if cancel.is_set():
+                            break
+                        tot += count_files(Path(r), cancel=cancel)
+                    return tot
+
                 base = [0]
-                for ri, r in enumerate(roots):
-                    if cancel.is_set():
-                        break
-                    log(f"Skan: {r}")
-                    st = idx.scan(Path(r), full=full, chd_prober=prober,
-                                  on_file=_pulse(log, progress, total=grand,
-                                                 base=base),
-                                  detail=detail, cancel=cancel)
-                    base[0] += st.seen
-                    log(f"  {st.summary()}")
-                log(f"DAT-ów: {len(enabled)} włączonych z {len(all_entries)}")
-                # DUCHY: wpisy pod korzeniami, które ZNIKNĘŁY (np. skasowane
-                # stare roms) — bez tego matcher planuje przenosiny z
-                # nieistniejących ścieżek („plik zmienił się od skanu").
-                idx.prune_ghosts(log)
-                if not cancel.is_set():
-                    _deep_probe_gui(idx, enabled, settings, chd_mode, roots,
-                                    log, cancel=cancel, on_progress=progress,
-                                    detail=detail)
-                # DOPASOWANIE Z CACHE W PAMIĘCI: wczytujemy indeks raz do RAM
-                # (słowniki po sumach) — inaczej matching całej kolekcji to
-                # dziesiątki tysięcy SELECT-ów (minuty). Z cache: sekundy.
-                progress(0, 0, tr("wczytywanie indeksu do pamięci…"))
-                idx.build_match_cache()
+
+                # SIZE CAP PER KATALOG: dla każdego katalogu platformy limit =
+                # największy ROM DAT-ów, które w NIEGO celują (+margines). Skan
+                # katalogu kartridżowego (np. Atari 2600) odrzuca pliki surowe
+                # większe od jego ROM-ów — NAWET gdy włączona jest też platforma
+                # płytowa (PS2); globalny limit = rozmiar płyty i nic by nie
+                # odcinał. ToSort i katalogi wspólne dostają limit GLOBALNY
+                # (największy ROM w ogóle), bo mogą trzymać pliki każdej platformy.
+                # Limit dotyczy tylko NOWYCH plików surowych (archiwa i już znane
+                # zostają). Wymaga wczytania DAT-ów; i tak są potrzebne do
+                # dopasowania (cache w e).
+                from ..core.dirrules import platform_scan_dirs as _psd
+                progress(0, 0, tr("analiza rozmiarów DAT-ów…"))
+
+                def _entry_max(e) -> int:
+                    m = 0
+                    for g in e.games:
+                        for r in g.roms:
+                            if r.size and r.size > m:
+                                m = r.size
+                    return m
+
+                root_caps: dict[str, int] = {}
+                global_max = 0
+                for e in enabled:
+                    try:
+                        e.load()
+                    except Exception:
+                        continue
+                    m = _entry_max(e)
+                    if m > global_max:
+                        global_max = m
+                    cap = (int(m * 1.02) + (1 << 16)) if m else 0
+                    if cap:
+                        for d in _psd([e], rules, roms):
+                            k = os.path.normcase(d)
+                            root_caps[k] = max(root_caps.get(k, 0), cap)
+                global_cap = (int(global_max * 1.02) + (1 << 16)) if global_max else None
+                # ToSort = worek na wszystko (nie wiadomo do jakiego DAT-u trafią)
+                # → skanujemy BEZ capa, dokładnie. Reszta nie-platformowych korzeni
+                # (nadpisania rom_root) → limit globalny (bezpieczny).
+                tosort_nc = {os.path.normcase(str(Path(t)))
+                             for t in (tosorts if isinstance(tosorts, (list, tuple, set))
+                                       else [tosorts]) if t}
+
+                # nośnik per katalog → liczba wątków hashujących (NAS/SSD wiele,
+                # HDD 1). Auto-wykrywanie (dysk sieciowy) + ręczne nadpisania.
+                from ..core.storage import storage_kind, workers_for_kind
+                _ov = settings.storage_overrides
+                # ToSort docelowy dla obcych (za dużych) plików: przenosimy je
+                # OD RAZU tylko gdy leżą na TYM SAMYM woluminie (rename = darmowy);
+                # inny wolumin → zostają (kopiowanie byłoby wolne). Decyduje scan().
+                _primary_tosort = settings.tosort_dir or None
+
+                def _scan_list(paths, grand) -> None:
+                    for r in paths:
+                        if cancel.is_set():
+                            break
+                        k = os.path.normcase(str(Path(r)))
+                        cap = None if k in tosort_nc else root_caps.get(k, global_cap)
+                        kind = storage_kind(r, _ov)
+                        wk = workers_for_kind(kind, settings.scan_workers_nas,
+                                              settings.scan_workers_ssd, 1)
+                        log(f"Skan: {r}  [{kind}, {wk} wątk.]"
+                            + (f"  limit {cap / 2**20:.1f} MiB" if cap else ""))
+                        st = idx.scan(Path(r), full=full, chd_prober=prober,
+                                      max_size=cap, oversize_to=_primary_tosort,
+                                      workers=wk,
+                                      on_file=_pulse(log, progress, total=grand,
+                                                     base=base),
+                                      detail=detail, slot_progress=slot,
+                                      cancel=cancel)
+                        base[0] += st.seen
+                        log(f"  {st.summary()}")
+
                 # PODMIANY na tłumaczenia (translations.json) = źródło prawdy:
                 # gry z zapisanym wyborem są SPEŁNIONE tłumaczeniem (nie „brak").
                 try:
@@ -1953,13 +2204,128 @@ class SuiteWindow(QMainWindow):
                         Path(settings.rom_root) / TranslationStore.FILENAME).subs
                 except Exception:
                     _tsub = {}
+
+                # WYBRANA PLATFORMA: jej katalogi (obie konwencje) skanujemy
+                # PIERWSZE. Gdy platforma wyjdzie kompletna w swoich katalogach —
+                # reszty rom_root nie doskanowujemy (indeks TRWAŁY ma pozostałe
+                # platformy z wcześniejszych skanów, więc raport i tak jest pełny).
+                from ..core.dirrules import platform_scan_dirs
+                sel_entries = ([e for e in enabled
+                                if effective_platform_key(e, rules) in sel_keys]
+                               if sel_keys else [])
+                prio = (platform_scan_dirs(sel_entries, rules, roms)
+                        if sel_entries else [])
+
+                def _platform_complete(sel) -> bool:
+                    """Wszystkie gry wybranej platformy = HAVE/HAVE_CHD (znalezione
+                    w swoich katalogach)? Wtedy nie ma po co skanować reszty."""
+                    from ..core.matcher import RomState, match_game
+                    rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
+                            RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+                            RomState.CREATABLE: 2, RomState.HAVE: 1,
+                            RomState.HAVE_CHD: 1}
+                    if not sel:
+                        return False
+                    for e in sel:
+                        e.load()
+                        for g in e.games:
+                            worst = 0
+                            for s in match_game(e, g, idx, _tsub):
+                                worst = max(worst, rank.get(s.state, 3))
+                            if worst > 1:          # cokolwiek poza HAVE/HAVE_CHD
+                                return False
+                    return True
+
+                early = False
+                cache_ready = False
+                if prio:
+                    log(f"Priorytet skanu (wybrana platforma): "
+                        f"{len(prio)} katalog(ów)")
+                    for p in prio:
+                        log(f"  • {p}")
+                    progress(0, 0, tr("liczenie plików…"))
+                    g1 = _count(prio)
+                    log(f"Faza 1 (wybrana platforma): {g1} plików")
+                    _scan_list(prio, g1 or 1)
+                    if not cancel.is_set():
+                        _deep_probe_gui(idx, sel_entries, settings, chd_mode,
+                                        prio, log, cancel=cancel,
+                                        on_progress=progress, detail=detail,
+                                        slot=slot)
+                        progress(0, 0, tr("sprawdzam kompletność platformy…"))
+                        idx.build_match_cache()
+                        cache_ready = True
+                        if _platform_complete(sel_entries):
+                            early = True
+                            # kończymy TU (bez pełnego skanu) → dopiero teraz
+                            # sprzątamy duchy SPOZA wybranej platformy i ODŚWIEŻAMY
+                            # cache. Przy platformie NIEKOMPLETNEJ pełny skan
+                            # poniżej robi własny prune — tam ten byłby zbędny
+                            # (na NAS to tysiące lexists w fazie priorytetowej,
+                            # kompletność wybranej platformy zależy tylko od jej
+                            # katalogów, oznaczonych już przez skan per-katalog).
+                            idx.prune_ghosts(log, skip_roots=prio)
+                            idx.drop_match_cache()
+                            idx.build_match_cache()
+                            log("Wybrana platforma KOMPLETNA w swoich katalogach "
+                                "— pomijam skan reszty (indeks ma pozostałe).")
+                        else:
+                            log("Wybrana platforma niekompletna — doskanowuję "
+                                "resztę kolekcji.")
+
+                if not early and not cancel.is_set():
+                    if cache_ready:
+                        idx.drop_match_cache()
+                        cache_ready = False
+                    # szybki PRE-COUNT (sam scandir) → mianownik „plik X z Y";
+                    # bez tego pasek stoi bez liczby, a przy wielkich plikach długo.
+                    progress(0, 0, tr("liczenie plików…"))
+                    grand = _count(roots)
+                    log(f"Do przeskanowania: {grand} plików w {len(roots)} "
+                        f"katalogach")
+                    _scan_list(roots, grand or 1)
+                    # DUCHY: wpisy pod korzeniami, które ZNIKNĘŁY (np. skasowane
+                    # stare roms) — bez tego matcher planuje przenosiny z
+                    # nieistniejących ścieżek. Wpisy pod ŚWIEŻO przeskanowanymi
+                    # katalogami są już obsłużone (skan per-katalog) → pomijamy je
+                    # (na NAS 100k+ lexists w ciszy potrafiło „zawiesić" skan).
+                    idx.prune_ghosts(log, skip_roots=roots)
+                    if not cancel.is_set():
+                        _deep_probe_gui(idx, enabled, settings, chd_mode, roots,
+                                        log, cancel=cancel, on_progress=progress,
+                                        detail=detail, slot=slot)
+                log(f"DAT-ów: {len(enabled)} włączonych z {len(all_entries)}")
+                # PRZERWANY SKAN: dopasowanie z cache jest SZYBKIE (sekundy), więc
+                # i tak je wykonujemy — użytkownik od razu widzi, co już zebrano
+                # (inaczej przerwanie dawało pusty raport). Czyścimy flagę, by
+                # pętla dopasowania nie ubiła się na pierwszym DAT-cie; ponowne
+                # przerwanie w trakcie dopasowania nadal działa.
+                interrupted = cancel.is_set()
+                if interrupted:
+                    log("⏹ PRZERWANO SKAN — dopasowuję to, co już zebrano "
+                        "(z cache; dla wielkiej kolekcji do ~30 s). Możesz "
+                        "przerwać ponownie, by pominąć i to.")
+                    try:
+                        cancel.clear()
+                    except Exception:
+                        pass
+                # DOPASOWANIE Z CACHE W PAMIĘCI: wczytujemy indeks raz do RAM
+                # (słowniki po sumach) — inaczej matching całej kolekcji to
+                # dziesiątki tysięcy SELECT-ów (minuty). Z cache: sekundy.
+                if not cache_ready:
+                    progress(0, 0, tr("wczytywanie indeksu do pamięci…"))
+                    idx.build_match_cache()
+                # etykieta fazy — jasno, że to dopasowanie PO przerwaniu skanu
+                _mlabel = ("⏹ przerwano — dopasowuję zebrane"
+                           if interrupted else "dopasowanie")
+                progress(0, len(enabled), _mlabel)      # pasek widoczny od razu
                 reports = []
                 for i, e in enumerate(enabled):
                     if cancel.is_set():
                         log(f"PRZERWANO dopasowanie na {i}/{len(enabled)} "
                             f"DAT-ów — wyniki cząstkowe zachowane.")
                         break
-                    progress(i, len(enabled), f"dopasowanie: {e.name}")
+                    progress(i, len(enabled), f"{_mlabel}: {e.name}")
                     # dopasowanie per gra z PODPOSTĘPEM (pasek szczegółowy) —
                     # wielkie DAT-y (PS2/PSX/MSU-1) grinduje tysiące gier, bez
                     # tego pasek „stał" na jednym % i wyglądał na zawieszony.
@@ -2084,8 +2450,10 @@ class SuiteWindow(QMainWindow):
                 self.tree.addTopLevelItem(item)
             else:
                 parent.addChild(item)
-        for node in groups.values():
-            node.setExpanded(True)
+        # rozwinięte domyślnie, ZWINIĘTE gdy zapamiętane z poprzedniej sesji
+        collapsed = set(getattr(self.settings, "ui_collapsed_groups", []) or [])
+        for key, node in groups.items():
+            node.setExpanded("/".join(key) not in collapsed)
         # początkowy stan checkboxów GRUP z dzieci (pełne/częściowe/puste);
         # od tej chwili AutoTristate utrzymuje to samo przy klikaniu
         def _agg(node) -> Qt.CheckState:

@@ -297,6 +297,76 @@ def scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list[str]:
     return out
 
 
+def platform_scan_dirs(entries, rules: DirRules, rom_root) -> list[str]:
+    """Istniejące katalogi-kandydaci dla platform danych `entries`, w OBU
+    znanych konwencjach nazw, cel SKONFIGUROWANY pierwszy:
+
+      1) `entry.target_dir` — realny cel z reguł (naming/target),
+      2) Redump: ``<rom_root>/<nazwa z nagłówka DAT-a>`` (płasko),
+      3) EmulationStation: ``<rom_root>/<es-folder>`` (np. ps2, psx).
+
+    Do PRIORYTETOWEGO skanu wybranej platformy: skanujemy te katalogi jako
+    pierwsze, żeby wszystko lądowało w wybranym katalogu i — gdy platforma
+    wyjdzie kompletna — nie trzeba szukać jej gdzie indziej. Kolejność =
+    preferencja: gdy nie ma katalogu wybranej konwencji (np. „PS2"), ale jest
+    drugiej („Sony - PlayStation 2"), użyty zostanie ten istniejący.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(p) -> None:
+        if not p:
+            return
+        path = Path(p)
+        key = os.path.normcase(str(path))
+        if key in seen or not path.is_dir():
+            return
+        seen.add(key)
+        out.append(str(path))
+
+    for e in entries:
+        eff = rules.for_entry(e)
+        base = Path(eff["rom_root"]) if eff.get("rom_root") else Path(rom_root)
+        add(getattr(e, "target_dir", None))       # skonfigurowany cel (priorytet)
+        add(base / folder_name(e, "dat"))          # Redump: <nazwa DAT-a> płasko
+        add(base / folder_name(e, "es"))           # EmulationStation: es-folder
+    return out
+
+
+def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list[str]:
+    """Katalogi do skanu = katalogi WŁĄCZONYCH platform (obie konwencje,
+    istniejące) + ToSort + nadpisania rom_root. NIE cały rom_root.
+
+    Skanujemy tylko platformy, które użytkownik WŁĄCZYŁ (checkbox), więc pliki
+    innych platform (np. RVZ GameCube/Wii przy wybranym PS1/PS2) nie są ruszane.
+    Katalogi platform rozwiązuje `platform_scan_dirs` (target z reguł + Redump +
+    EmulationStation) — dawny „skan całego rom_root" był potrzebny tylko dlatego,
+    że skan używał wyłącznie nieistniejącego target=<nazwa DAT-a>; teraz realne
+    katalogi (ps2/psx itd.) są znajdowane wprost, bez przemiatania obcych.
+    """
+    out: list[str] = list(platform_scan_dirs(entries, rules, rom_root))
+    seen: set[str] = {os.path.normcase(p) for p in out}
+
+    def add(p) -> None:
+        if not p:
+            return
+        path = Path(p)
+        key = os.path.normcase(str(path))
+        if key in seen or not path.is_dir():
+            return
+        seen.add(key)
+        out.append(str(path))
+
+    for e in entries:                       # własne rom_root-y dzieci (inny dysk)
+        add(rules.for_entry(e).get("rom_root"))
+    if isinstance(tosort, (list, tuple, set)):
+        for t in tosort:
+            add(t)
+    else:
+        add(tosort)
+    return out
+
+
 def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
     """Wylicza katalog docelowy każdego DAT-a z reguł (kaskada global→
     katalog→DAT):

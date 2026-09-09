@@ -117,7 +117,7 @@ class Settings:
     # RAM dysk (ImDisk) na operacje tymczasowe: wypakowanie/przepakowanie CHD.
     # Ulotny — nie zapycha dysku kolekcji, nic nie zostaje po przerwaniu.
     ramdisk_enabled: bool = True
-    ramdisk_size_gb: int = 30
+    ramdisk_size_gb: int = 40
     ramdisk_letter: str = "R"
     # Przy starcie proś o podniesienie do administratora (UAC), by móc tworzyć
     # symlinki bez trybu dewelopera. Odmowa UAC => program działa bez admina.
@@ -128,6 +128,19 @@ class Settings:
     fix_del_tosort: bool = True      # usuń z ToSort pliki już na miejscu
     fix_convert: bool = False        # konwertuj do formatu docelowego
     fix_dedup: bool = True           # kopie potwierdzonych → symlinki
+    # Równoległe hashowanie w skanie wg nośnika katalogu (NAS/SSD; HDD=1 zawsze).
+    # Kilka odczytów naraz ukrywa latencję sieci/kolejkę SSD — duży zysk na
+    # pierwszym skanie TB; na pojedynczym HDD szkodzi (skakanie głowicy).
+    scan_workers_nas: int = 8
+    scan_workers_ssd: int = 4
+    # Ręczne nadpisanie nośnika per katalog: {ścieżka: "nas"|"ssd"|"hdd"}.
+    # Puste => auto-wykrywanie (dysk sieciowy vs lokalny). Przełącznik w GUI.
+    storage_overrides: dict = field(default_factory=dict)
+    # Stan interfejsu (pamiętany między sesjami):
+    #   ui_geometry         — pozycja/rozmiar okna (base64 saveGeometry),
+    #   ui_collapsed_groups — klucze zwiniętych grup-katalogów w drzewie DAT-ów.
+    ui_geometry: str = ""
+    ui_collapsed_groups: list = field(default_factory=list)
 
     @property
     def tosort_dirs(self) -> list:
