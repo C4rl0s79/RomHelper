@@ -829,6 +829,14 @@ def _link_child_to_parent(child_final: Path, parent_final: Path, make_links: boo
     if not make_links or links_blocked[0]:
         log(f"  SYMLINK pominięty (brak uprawnień/wyłączony): {child_final.name}")
         return False
+    # RODZIC musi realnie ISTNIEĆ. W trybie POTOKU rodzic bywa zlecony
+    # asynchronicznie i `final_by_profile` wskazuje go PRZED zbudowaniem (albo
+    # build się nie powiódł) — symlink do nieistniejącego pliku byłby WISZĄCY.
+    # Gdy rodzica (jeszcze) nie ma → nie linkujemy; wołający zbuduje dziecko
+    # normalnie (fizyczna kopia zamiast martwego linka).
+    if not Path(parent_final).exists():
+        log(f"  SYMLINK pominięty: rodzic jeszcze nie istnieje ({parent_final.name})")
+        return False
     child_final.parent.mkdir(parents=True, exist_ok=True)
     if os.path.lexists(child_final):
         if is_link(child_final):
@@ -1915,10 +1923,18 @@ def _conv_upload_phase(job, detail, log):
     log(f"  finał → {final}")
     _place_cross(Path(built), final, detail=detail,
                  label=f"przenoszę {final.name}")
-    try:
-        return hash_file(final)
-    except OSError:
-        return ("", "", "")
+    # Hash finału bywa blokowany PRZEJŚCIOWO (AV/indekser Windows otwiera świeży
+    # plik zaraz po przeniesieniu). Ponów raz po krótkiej chwili — udany hash
+    # pozwala finalize zapisać wpis w indeksie i BEZPIECZNIE skasować źródła
+    # (inaczej ("","","") → źródła zostają do ponowienia).
+    import time as _time
+    for _attempt in range(2):
+        try:
+            return hash_file(final)
+        except OSError:
+            if _attempt == 0:
+                _time.sleep(1.0)
+    return ("", "", "")
 
 
 def _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
@@ -1926,6 +1942,7 @@ def _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
     """FINALIZACJA (WŁAŚCICIEL, jednowątkowo): zapis do indeksu, callback, licznik,
     odroczenie/kasowanie źródeł."""
     final = job["final"]
+    recorded = False
     if index is not None and sums and sums[2]:
         try:
             if job["fmt"] == "chd":
@@ -1941,13 +1958,24 @@ def _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
                 index.reindex_archive(final, full=True)
             else:
                 index.record_file(final, sums[0], sums[1], sums[2])  # RVZ itp.
+            recorded = True
         except OSError:
-            pass
+            recorded = False
     if on_converted is not None:
         on_converted(final)
     st.converted += 1
-    _defer_or_purge_game_sources(job["sts"], shared_srcs, deferred, index,
-                                 False, log)
+    # KASUJ/ODRACZAJ źródła TYLKO gdy finał został ZWERYFIKOWANY i zapisany w
+    # indeksie. Gdy hash finału się NIE powiódł (sums puste — np. plik chwilowo
+    # zablokowany przez AV/indekser tuż po przeniesieniu), plik JEST na dysku, ale
+    # NIEPOTWIERDZONY i BEZ wpisu w indeksie — skasowanie jedynej kopii źródeł
+    # groziłoby utratą danych. Zostaw źródła; następny bieg (po skanie, który
+    # zaindeksuje finał) dokończy sprzątanie. Bez indeksu — zachowanie jak dotąd.
+    if index is None or recorded:
+        _defer_or_purge_game_sources(job["sts"], shared_srcs, deferred, index,
+                                     False, log)
+    else:
+        log(f"  UWAGA: finał {final.name} niepotwierdzony (hash nieudany) — "
+            f"ZOSTAWIAM źródła do ponowienia przy następnym biegu.")
 
 
 def _conv_release(job):

@@ -2,6 +2,42 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.6.31] — 2026-09-14
+
+### Naprawione (z code review — druga partia)
+- **RAM dysk mógł oddać niesformatowany wolumin RAW jako scratch.** `_ready`
+  (a więc `active_root`/`reuse_if_exists`) uznawał dysk za gotowy po samym
+  write-probe, który na świeżym RAW potrafi mylnie „przejść" — chdman pisał
+  wtedy w RAW/temp na NVMe. Teraz gotowość na Windows wymaga też realnej nazwy
+  systemu plików (`GetVolumeInformationW`).
+- **`remount` po nieudanym mkdir mógł SFORMATOWAĆ dysk w trakcie równoległych
+  ekstrakcji.** Przejściowy błąd zapisu jednego wątku (R: chwilowo zajęty)
+  uruchamiał `create()`, które formatowało istniejące urządzenie ImDisk —
+  niszcząc trwające ekstrakcje innych wątków. Teraz formatujemy TYLKO wolumin
+  naprawdę RAW (brak FS); sformatowany-ale-zajęty jest uznawany za gotowy.
+- **Symlink dziecka mógł wskazać rodzica, którego jeszcze nie ma.** W trybie
+  potoku `final_by_profile` wskazuje rodzica ustawionego PRZY ZLECENIU (async,
+  albo build padł) — dziecko dostawało wiszący symlink. `_link_child_to_parent`
+  wymaga teraz, by rodzic realnie ISTNIAŁ (inaczej dziecko budowane jest samo).
+- **Skan (odczyt) mógł po cichu przenieść ZNANE ROM-y do ToSort.** Reguła
+  „za duży dla platformy → ToSort" ruszała też pliki JUŻ zaindeksowane (np.
+  dopasowane do platformy teraz wyłączonej). Teraz auto-przenoszone są tylko
+  pliki NIEZNANE indeksowi (`row is None`).
+- **Finalizacja kasowała źródła, gdy hash finału się nie powiódł.**
+  `_conv_finalize_phase` zapisywał wpis w indeksie tylko przy udanym haszu, ale
+  źródła kasował ZAWSZE — plik na dysku bez wpisu, a źródła skasowane. Teraz
+  kasowanie/odroczenie źródeł tylko po udanym zapisie; dodatkowo `_conv_upload_phase`
+  ponawia hash raz (przejściowa blokada AV/indeksera).
+- **Skan wysypywał się na jednym błędnym pliku i porzucał pulę wątków.**
+  `_drain` łapał tylko `HashAborted`/`OSError`; inny wyjątek (np. `MemoryError`)
+  wywracał cały „Znajdź naprawy" i zostawiał wiszące wątki. Teraz błąd
+  pojedynczego pliku jest logowany i pomijany, a pula wątków jest ZAWSZE
+  domykana (`try/finally`).
+- **Szybki `rename` między udziałami UNC tego samego serwera.** `same_volume`
+  zwracał `False` dla `\\nas\a` vs `\\nas\b` (różne „dyski"), wymuszając wolne
+  kopiowanie. Teraz dopuszcza próbę `rename` w obrębie tego samego serwera
+  (bezpiecznie — `os.rename` nie kopiuje, przy różnych woluminach padnie).
+
 ## [0.6.30] — 2026-09-14
 
 ### Naprawione (z code review)

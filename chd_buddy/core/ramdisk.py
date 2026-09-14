@@ -86,9 +86,38 @@ def _writable(root: Path) -> bool:
         return False
 
 
+def _fs_name(root: Path) -> str:
+    """Nazwa systemu plików woluminu (np. 'NTFS') przez WinAPI, albo '' gdy
+    wolumin jest RAW/niesformatowany lub niedostępny.
+
+    KLUCZOWE: sam write-probe potrafi mylnie „przejść" na świeżym woluminie RAW
+    (goły imdisk.exe ignoruje `-p /fs`), który Explorer i tak pokazuje jako
+    RAW/bez pojemności (patrz komentarz w create()). Dlatego GOTOWOŚĆ dysku
+    weryfikujemy też realną nazwą FS — inaczej active_root()/reuse_if_exists()
+    mogłyby oddać RAW-dysk jako scratch. Poza Windows zwraca '' (nie używane)."""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        fsbuf = ctypes.create_unicode_buffer(261)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(str(root)), None, 0, None, None, None,
+            fsbuf, len(fsbuf))
+        return fsbuf.value if ok else ""
+    except Exception:
+        return ""
+
+
 def _ready(root: Path) -> bool:
-    """Wolumin zamontowany i zapisywalny (wydzielone dla testowalności)."""
-    return root.is_dir() and _writable(root)
+    """Wolumin zamontowany, ZE ZNANYM systemem plików i zapisywalny.
+
+    Na Windows wymagamy realnej nazwy FS (nie RAW) — write-probe sam w sobie
+    bywa zwodniczy na świeżym RAW. Poza Windows: is_dir + zapis (jak dotąd)."""
+    if not root.is_dir():
+        return False
+    if os.name == "nt" and not _fs_name(root):
+        return False
+    return _writable(root)
 
 
 def _detach(exe: str, drive: str) -> None:
@@ -174,6 +203,19 @@ def create(size_gb: int = 40, letter: str = "R", label: str = "RAMTEMP",
         #    crashu). Formatujemy — NIE próbujemy tworzyć na ZAJĘTEJ literze
         #    (to daje mylący błąd 3 „Za mało zasobów pamięci").
         if _imdisk_has_device(exe, drive):
+            # BEZPIECZEŃSTWO: formatuj TYLKO gdy wolumin naprawdę RAW (brak FS).
+            # Gdy `_ready` padło, ale FS ISTNIEJE, to write-probe zawiódł tylko
+            # PRZEJŚCIOWO — wolumin chwilowo zajęty (np. równoległe ekstrakcje
+            # chdman piszą na R:). Reformatowanie zniszczyłoby te trwające
+            # operacje innych wątków (remount po nieudanym mkdir mógł tu trafić).
+            # Więc: sformatowany-ale-zajęty → uznaj za gotowy, NIE formatuj.
+            if _fs_name(root):
+                _ACTIVE = root
+                _SIZE_GB = size_gb
+                if log:
+                    log(f"RAM dysk: {drive} zajęty, ale sformatowany "
+                        f"({_fs_name(root)}) — używam bez formatowania.")
+                return root
             if log:
                 log(f"RAM dysk: {drive} istnieje, ale niesformatowany (RAW) — "
                     f"formatuję.")

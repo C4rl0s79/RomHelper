@@ -473,158 +473,176 @@ class FileIndex:
                     if log:
                         log(f"BŁĄD odczytu: {p} ({e})")
                     continue
+                except Exception as e:       # jeden zły plik ≠ śmierć całego skanu
+                    # np. MemoryError na ogromnym pliku, nieoczekiwany błąd w
+                    # hash_file — zalicz błąd, POMIŃ ten plik i skanuj dalej,
+                    # zamiast wysypać cały „Znajdź naprawy" i porzucić pulę wątków.
+                    stats.errors += 1
+                    if log:
+                        log(f"BŁĄD hashowania: {p} ({e!r})")
+                    continue
                 delta += self._persist_hashed(cur, k, s, p, suf, crc, md5,
                                               sha1, now, stats, log, chd_prober)
             return delta
 
-        cancelled = False
-        for path, st, link in _walk(root, _skip_norm or None):
-            if cancel is not None and cancel.is_set():
-                cancelled = True
-                break                      # to, co policzone, zostaje w bazie
-            key = str(path)
-            stats.seen += 1
-            if on_file:
-                on_file(stats.seen, path)
+        try:
+            cancelled = False
+            for path, st, link in _walk(root, _skip_norm or None):
+                if cancel is not None and cancel.is_set():
+                    cancelled = True
+                    break                      # to, co policzone, zostaje w bazie
+                key = str(path)
+                stats.seen += 1
+                if on_file:
+                    on_file(stats.seen, path)
 
-            if link:
-                stats.links += 1
-                seen.append(key)
-                cur.execute(
-                    "INSERT INTO files(path, size, mtime_ns, is_link, missing, scanned_at) "
-                    "VALUES (?, 0, ?, 1, 0, ?) "
-                    "ON CONFLICT(path) DO UPDATE SET is_link=1, missing=0, "
-                    "  mtime_ns=excluded.mtime_ns, scanned_at=excluded.scanned_at",
-                    (key, st.st_mtime_ns, now),
-                )
-                pending += 1
-            else:
-                suffix = path.suffix.lower().lstrip(".")
-                if exts is not None and suffix not in exts:
-                    stats.filtered += 1
-                    continue
-                row = cur.execute(
-                    "SELECT size, mtime_ns, sha1, data_sha1, missing FROM files WHERE path=?",
-                    (key,),
-                ).fetchone()
-                # SIZE CAP: nowy plik surowy większy niż największy ROM włączonych
-                # DAT-ów → nie może być żadnym z nich; nie czytamy go. Znany plik
-                # zostaje znany (dopisz do seen, by nie oznaczyć „brak"). Archiwa
-                # pomijamy z capa (mogą mieścić wiele małych ROM-ów).
-                if (max_size is not None and st.st_size > max_size
-                        and suffix not in ARCHIVE_EXTS):
-                    # Obcy dla platformy (za duży). Gdy ToSort na TYM SAMYM
-                    # woluminie → przenieś OD RAZU (rename = darmowy, bez
-                    # czytania). Inny wolumin = kopiowanie (wolne) → nie ruszamy
-                    # podczas skanu (zostaje jak dotąd, tylko nie hashujemy).
-                    if (oversize_to and suffix != "m3u"
-                            and same_volume(path.parent, oversize_to)
-                            and self._move_to_tosort(path, oversize_to, log)):
-                        stats.oversize_moved += 1     # stara ścieżka zniknie
-                    else:
-                        if row is not None:
-                            seen.append(key)
-                        stats.filtered += 1
-                    continue
-                seen.append(key)
-                fresh = (row is not None and not full
-                         and row["size"] == st.st_size
-                         and row["mtime_ns"] == st.st_mtime_ns
-                         and row["sha1"] != "")
-                if fresh:
-                    stats.unchanged += 1
-                    if row["missing"]:
-                        cur.execute("UPDATE files SET missing=0 WHERE path=?", (key,))
-                        pending += 1
-                    # backfill zawartości CHD, jeśli teraz mamy próbnik
-                    if chd_prober and not row["data_sha1"] and path.suffix.lower() == ".chd":
-                        ds = self._probe_chd(chd_prober, path, log)
-                        if ds:
-                            cur.execute("UPDATE files SET data_sha1=? WHERE path=?", (ds, key))
-                            pending += 1
-                    # backfill/UPGRADE członków archiwum: brak członków ALBO
-                    # członkowie bez SHA-1 (stary skan szybki = tylko CRC) →
-                    # doskanuj PEŁNIE (SHA-1 zawartości). „Zawsze wiemy co
-                    # dokładnie mamy" — nie ufamy samemu CRC przy operacjach.
-                    if path.suffix.lower().lstrip(".") in ARCHIVE_EXTS:
-                        n = cur.execute("SELECT COUNT(*) FROM members WHERE archive=?",
-                                        (key,)).fetchone()[0]
-                        no_sha = cur.execute(
-                            "SELECT COUNT(*) FROM members WHERE archive=? AND "
-                            "(sha1='' OR sha1 IS NULL)", (key,)).fetchone()[0]
-                        if n == 0 or no_sha:
-                            cur.execute("DELETE FROM members WHERE archive=?", (key,))
-                            pending += self._index_members(cur, key, path, log,
-                                                           full=True)
-                    # NIE otwieramy tu ZIP-a, by wykryć metodę kompresji: na NAS
-                    # to SZEREGOWE otwarcie centralnego katalogu KAŻDEGO zipa =
-                    # jedna runda SMB na plik (sieć/CPU ~0%, sama latencja) →
-                    # skan przyrostowy „stoi" przy dużej kolekcji (regresja 0.6.16).
-                    # `bad_zip_method` ustawia `_index_members` przy indeksowaniu
-                    # członków (nowe/zmienione zipy i upgrade bez SHA-1 — wyżej),
-                    # więc flaga i tak powstaje, gdy zip jest OTWIERANY z innego
-                    # powodu. Zipy tworzone przez program są deflate; niezgodne
-                    # (zstd/lzma) z zewnątrz przychodzą jako NOWE → złapane.
+                if link:
+                    stats.links += 1
+                    seen.append(key)
+                    cur.execute(
+                        "INSERT INTO files(path, size, mtime_ns, is_link, missing, scanned_at) "
+                        "VALUES (?, 0, ?, 1, 0, ?) "
+                        "ON CONFLICT(path) DO UPDATE SET is_link=1, missing=0, "
+                        "  mtime_ns=excluded.mtime_ns, scanned_at=excluded.scanned_at",
+                        (key, st.st_mtime_ns, now),
+                    )
+                    pending += 1
                 else:
-                    # PLIK PRZENIESIONY (np. ręcznie w Eksploratorze)?
-                    # Wiedza podąża za treścią: ta sama nazwa + rozmiar +
-                    # mtime_ns, a stara ścieżka już nie istnieje => przejmij
-                    # sumy/data_sha1/deep_fail/członków BEZ czytania danych.
-                    if row is None and not full:
-                        if self._adopt_moved(cur, key, path, st, now):
-                            stats.adopted += 1
+                    suffix = path.suffix.lower().lstrip(".")
+                    if exts is not None and suffix not in exts:
+                        stats.filtered += 1
+                        continue
+                    row = cur.execute(
+                        "SELECT size, mtime_ns, sha1, data_sha1, missing FROM files WHERE path=?",
+                        (key,),
+                    ).fetchone()
+                    # SIZE CAP: nowy plik surowy większy niż największy ROM włączonych
+                    # DAT-ów → nie może być żadnym z nich; nie czytamy go. Znany plik
+                    # zostaje znany (dopisz do seen, by nie oznaczyć „brak"). Archiwa
+                    # pomijamy z capa (mogą mieścić wiele małych ROM-ów).
+                    if (max_size is not None and st.st_size > max_size
+                            and suffix not in ARCHIVE_EXTS):
+                        # Obcy dla platformy (za duży). Gdy ToSort na TYM SAMYM
+                        # woluminie → przenieś OD RAZU (rename = darmowy, bez
+                        # czytania). Inny wolumin = kopiowanie (wolne) → nie ruszamy
+                        # podczas skanu (zostaje jak dotąd, tylko nie hashujemy).
+                        # TYLKO pliki NIEZNANE indeksowi (row is None): plik już
+                        # zaindeksowany (dopasowany wcześniej, np. do platformy teraz
+                        # WYŁĄCZONEJ) NIE może zostać po cichu przeniesiony ze skanu —
+                        # to zaskoczyłoby usera i zerwało ścieżki do niego.
+                        if (oversize_to and suffix != "m3u" and row is None
+                                and same_volume(path.parent, oversize_to)
+                                and self._move_to_tosort(path, oversize_to, log)):
+                            stats.oversize_moved += 1     # stara ścieżka zniknie
+                        else:
+                            if row is not None:
+                                seen.append(key)
+                            stats.filtered += 1
+                        continue
+                    seen.append(key)
+                    fresh = (row is not None and not full
+                             and row["size"] == st.st_size
+                             and row["mtime_ns"] == st.st_mtime_ns
+                             and row["sha1"] != "")
+                    if fresh:
+                        stats.unchanged += 1
+                        if row["missing"]:
+                            cur.execute("UPDATE files SET missing=0 WHERE path=?", (key,))
                             pending += 1
-                            continue
-                    if ex is not None:
-                        # RÓWNOLEGLE: zleć hash do puli (czyta bajty — na NAS/SSD
-                        # kilka naraz ukrywa latencję), zapis do SQLite ODROCZONY
-                        # i wyłącznie w tym wątku (SQLite jednowątkowe). Postęp
-                        # bajtowy każdego pliku leci na własny pasek (slot).
-                        inflight.append(
-                            (ex.submit(_hash_job, path), key, st, path, suffix))
-                        if len(inflight) >= max_inflight:
-                            pending += _drain(keep=workers)
+                        # backfill zawartości CHD, jeśli teraz mamy próbnik
+                        if chd_prober and not row["data_sha1"] and path.suffix.lower() == ".chd":
+                            ds = self._probe_chd(chd_prober, path, log)
+                            if ds:
+                                cur.execute("UPDATE files SET data_sha1=? WHERE path=?", (ds, key))
+                                pending += 1
+                        # backfill/UPGRADE członków archiwum: brak członków ALBO
+                        # członkowie bez SHA-1 (stary skan szybki = tylko CRC) →
+                        # doskanuj PEŁNIE (SHA-1 zawartości). „Zawsze wiemy co
+                        # dokładnie mamy" — nie ufamy samemu CRC przy operacjach.
+                        if path.suffix.lower().lstrip(".") in ARCHIVE_EXTS:
+                            n = cur.execute("SELECT COUNT(*) FROM members WHERE archive=?",
+                                            (key,)).fetchone()[0]
+                            no_sha = cur.execute(
+                                "SELECT COUNT(*) FROM members WHERE archive=? AND "
+                                "(sha1='' OR sha1 IS NULL)", (key,)).fetchone()[0]
+                            if n == 0 or no_sha:
+                                cur.execute("DELETE FROM members WHERE archive=?", (key,))
+                                pending += self._index_members(cur, key, path, log,
+                                                               full=True)
+                        # NIE otwieramy tu ZIP-a, by wykryć metodę kompresji: na NAS
+                        # to SZEREGOWE otwarcie centralnego katalogu KAŻDEGO zipa =
+                        # jedna runda SMB na plik (sieć/CPU ~0%, sama latencja) →
+                        # skan przyrostowy „stoi" przy dużej kolekcji (regresja 0.6.16).
+                        # `bad_zip_method` ustawia `_index_members` przy indeksowaniu
+                        # członków (nowe/zmienione zipy i upgrade bez SHA-1 — wyżej),
+                        # więc flaga i tak powstaje, gdy zip jest OTWIERANY z innego
+                        # powodu. Zipy tworzone przez program są deflate; niezgodne
+                        # (zstd/lzma) z zewnątrz przychodzą jako NOWE → złapane.
                     else:
-                        try:
-                            _dcb = ((lambda dn, tt: detail(dn, tt, path.name))
-                                    if detail is not None else None)
-                            crc, md5, sha1 = hash_file(path, on_progress=_dcb,
-                                                       cancel=cancel)
-                        except HashAborted:
-                            cancelled = True
-                            break
-                        except OSError as e:
-                            stats.errors += 1
-                            if log:
-                                log(f"BŁĄD odczytu: {path} ({e})")
-                            continue
-                        pending += self._persist_hashed(
-                            cur, key, st, path, suffix, crc, md5, sha1, now,
-                            stats, log, chd_prober)
+                        # PLIK PRZENIESIONY (np. ręcznie w Eksploratorze)?
+                        # Wiedza podąża za treścią: ta sama nazwa + rozmiar +
+                        # mtime_ns, a stara ścieżka już nie istnieje => przejmij
+                        # sumy/data_sha1/deep_fail/członków BEZ czytania danych.
+                        if row is None and not full:
+                            if self._adopt_moved(cur, key, path, st, now):
+                                stats.adopted += 1
+                                pending += 1
+                                continue
+                        if ex is not None:
+                            # RÓWNOLEGLE: zleć hash do puli (czyta bajty — na NAS/SSD
+                            # kilka naraz ukrywa latencję), zapis do SQLite ODROCZONY
+                            # i wyłącznie w tym wątku (SQLite jednowątkowe). Postęp
+                            # bajtowy każdego pliku leci na własny pasek (slot).
+                            inflight.append(
+                                (ex.submit(_hash_job, path), key, st, path, suffix))
+                            if len(inflight) >= max_inflight:
+                                pending += _drain(keep=workers)
+                        else:
+                            try:
+                                _dcb = ((lambda dn, tt: detail(dn, tt, path.name))
+                                        if detail is not None else None)
+                                crc, md5, sha1 = hash_file(path, on_progress=_dcb,
+                                                           cancel=cancel)
+                            except HashAborted:
+                                cancelled = True
+                                break
+                            except OSError as e:
+                                stats.errors += 1
+                                if log:
+                                    log(f"BŁĄD odczytu: {path} ({e})")
+                                continue
+                            pending += self._persist_hashed(
+                                cur, key, st, path, suffix, crc, md5, sha1, now,
+                                stats, log, chd_prober)
 
-            if pending >= 200:  # commituj partiami — długi skan NAS nie przepada
+                if pending >= 200:  # commituj partiami — długi skan NAS nie przepada
+                    self._db.commit()
+                    pending = 0
+
+            if cancelled:
+                # przerwano: porzuć zadania w locie (przeliczą się przy kolejnym
+                # skanie), zapisz to, co już policzone
+                if ex is not None:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                # NIE oznaczamy brakujących — nie obeszliśmy całego drzewa
                 self._db.commit()
-                pending = 0
-
-        if cancelled:
-            # przerwano: porzuć zadania w locie (przeliczą się przy kolejnym
-            # skanie), zapisz to, co już policzone
+                stats.cancelled = True
+                if log:
+                    log(f"PRZERWANO skan {root} — zapisano {stats.hashed} "
+                        f"policzonych plików (kolejny skan dokończy resztę).")
+                return stats
+            # dokończ zaległe zadania puli (zapis w tym wątku), potem zamknij pulę
+            if ex is not None:
+                pending += _drain(keep=0)
+                ex.shutdown(wait=True)
+            stats.missing = self._mark_missing(root, seen, _skip_norm)
+            self._db.commit()
+            return stats
+        finally:
+            # ZAWSZE domknij pulę wątków, nawet gdy pętla wysypała się
+            # nieoczekiwanie — inaczej wątki-workery wiszą do końca procesu.
             if ex is not None:
                 ex.shutdown(wait=False, cancel_futures=True)
-            # NIE oznaczamy brakujących — nie obeszliśmy całego drzewa
-            self._db.commit()
-            stats.cancelled = True
-            if log:
-                log(f"PRZERWANO skan {root} — zapisano {stats.hashed} "
-                    f"policzonych plików (kolejny skan dokończy resztę).")
-            return stats
-        # dokończ zaległe zadania puli (zapis w tym wątku), potem zamknij pulę
-        if ex is not None:
-            pending += _drain(keep=0)
-            ex.shutdown(wait=True)
-        stats.missing = self._mark_missing(root, seen, _skip_norm)
-        self._db.commit()
-        return stats
 
     def prune_ghosts(self, log=None, skip_roots=None) -> int:
         """Oznacza missing=1 wpisy, których PLIK już nie istnieje.

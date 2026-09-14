@@ -56,11 +56,26 @@ def storage_kind(path, overrides: dict | None = None) -> str:
     return _auto_kind(str(path))
 
 
+def _unc_server(path: str) -> str:
+    """Host udziału UNC (`\\\\nas\\share\\x` → `nas`), albo '' gdy to nie UNC."""
+    q = str(path).replace("/", "\\")
+    if not q.startswith("\\\\"):
+        return ""
+    parts = q.lstrip("\\").split("\\")
+    return parts[0].lower() if parts and parts[0] else ""
+
+
 def same_volume(a, b) -> bool:
-    """Czy `a` i `b` leżą na TYM SAMYM woluminie (systemie plików) — wtedy
-    przeniesienie to `os.rename` (natychmiastowe, bez kopiowania bajtów). Różny
-    wolumin = kopiowanie (wolne). Najpierw `st_dev` (numer woluminu), fallback:
-    litera dysku / UNC share."""
+    """Czy `os.rename(a→b)` ma szansę zadziałać BEZ kopiowania bajtów (ten sam
+    wolumin). Najpierw `st_dev` (numer woluminu — pewny, gdy dostępny), potem
+    litera dysku / udział UNC.
+
+    UNC na tym samym serwerze (`\\\\nas\\a` vs `\\\\nas\\b`): `st_dev` bywa 0 dla
+    SMB, a `splitdrive` daje różne „dyski" (całe udziały) — mimo że serwerowy
+    rename między nimi bywa możliwy (ten sam wolumin po stronie NAS). Zwracamy
+    wtedy True i pozwalamy wołającemu SPRÓBOWAĆ rename: `os.rename` NIE kopiuje
+    bajtów — przy różnych woluminach zwróci błąd (ERROR_NOT_SAME_DEVICE), a
+    wołający bezpiecznie się wycofa (żadnych strat ani wolnej kopii)."""
     try:
         sa = os.stat(a).st_dev
         sb = os.stat(b).st_dev
@@ -68,9 +83,14 @@ def same_volume(a, b) -> bool:
             return sa == sb
     except OSError:
         pass
-    da = os.path.splitdrive(os.path.abspath(str(a)))[0].lower()
-    db = os.path.splitdrive(os.path.abspath(str(b)))[0].lower()
-    return bool(da) and da == db
+    pa = os.path.abspath(str(a))
+    pb = os.path.abspath(str(b))
+    da = os.path.splitdrive(pa)[0].lower()
+    db = os.path.splitdrive(pb)[0].lower()
+    if da and da == db:
+        return True
+    sva, svb = _unc_server(pa), _unc_server(pb)
+    return bool(sva) and sva == svb
 
 
 def workers_for_kind(kind: str, nas: int, ssd: int, hdd: int) -> int:
