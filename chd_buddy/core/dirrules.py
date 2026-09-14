@@ -175,15 +175,46 @@ def folder_name(entry, naming: str) -> str:
     return entry.name          # domyślnie nazwa z <header><name>
 
 
+# Jednoznaczne markery PŁYTY w nazwach ROM-ów DAT-a (obraz/opis ścieżek).
+# `.bin`/`.img` celowo POMINIĘTE — bywają i w kartridżach, i w torach CD.
+_DISC_MARKERS = {"iso", "cue", "gdi", "toc", "chd"}
+
+
+def _dat_is_cartridge(entry) -> bool:
+    """True, gdy DAT NIE zawiera plików PŁYTOWYCH (cue/iso/gdi/toc/chd) — czyli
+    to kartridż/HuCard (np. PC Engine `.pce`), mimo że system bywa sklasyfikowany
+    jako „płytowy". PC Engine ma OBA media (HuCard i CD) pod tym samym skrótem,
+    więc o formacie musi decydować TREŚĆ DAT-u, nie sam system. Wtedy CHD nie ma
+    sensu (goły ROM bez cue → i tak pomijany) → ZIP."""
+    try:
+        games = entry.load().games
+    except Exception:
+        return False
+    checked = 0
+    for g in games:
+        for r in g.roms:
+            name = getattr(r, "name", "") or ""
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext in _DISC_MARKERS:
+                return False          # jest płyta → nie kartridż
+        checked += 1
+        if checked >= 30:             # próbka wystarczy (spójny DAT)
+            break
+    return checked > 0
+
+
 def resolve_format(fmt: str, entry) -> str:
-    """Rozwiązuje format 'auto' na konkret wg typu systemu."""
+    """Rozwiązuje format 'auto' na konkret wg typu systemu (i TREŚCI DAT-u dla
+    systemów dwumedialnych jak PC Engine)."""
     if fmt != "auto":
         return fmt
     short = _system_short(entry)
     if short in ("GCN", "WII"):
         return "rvz"
     if short in DISC_SYSTEMS:
-        return "chd"
+        # system „płytowy", ale DAT może być kartridżowy (PC Engine HuCard) —
+        # sprawdź treść: brak plików płytowych → ZIP, nie CHD.
+        return "zip" if _dat_is_cartridge(entry) else "chd"
     return "zip"               # kartridż → ZIP
 
 

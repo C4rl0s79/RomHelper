@@ -55,7 +55,7 @@ class StagePipeline:
     def __init__(self, *, gather: Callable, build: Callable, upload: Callable,
                  finalize: Callable, release: Optional[Callable] = None,
                  ram_budget: int = 0, log: Optional[Callable] = None,
-                 cancel=None):
+                 cancel=None, build_workers: int = 1, ordered: bool = True):
         self._gather = gather
         self._build = build
         self._upload = upload
@@ -64,14 +64,22 @@ class StagePipeline:
         self._ram_budget = max(0, int(ram_budget))
         self._log = log or (lambda _m: None)
         self._cancel = cancel
+        # RÓWNOLEGŁA KONWERSJA: N wątków build (chdman/DolphinTool). Dla MAŁYCH
+        # gier (CD: 3DO/PS1/Saturn) jeden chdman nie wysyca CPU/NAS — 8 naraz
+        # wypełnia zasoby. Ile realnie biegnie ogranicza BUDŻET RAM (feed rezerwuje
+        # `cost`). Bezpieczne, bo potok włącza się TYLKO bez współdzielonych
+        # odcisków (ordered=False) → brak zależności rodzic→dziecko.
+        self._build_workers = max(1, int(build_workers))
+        self._ordered = bool(ordered)
+        self._build_live = self._build_workers
 
         self._q_in: "Queue" = Queue()      # feed → gather
-        self._q_gb: "Queue" = Queue()      # gather → build
+        self._q_gb: "Queue" = Queue()      # gather → build (N konsumentów)
         self._q_bu: "Queue" = Queue()      # build → upload
 
         self._cv = threading.Condition()   # budżet RAM + sygnał ukończenia
         self._used = 0
-        self._pending: list[_Job] = []     # w kolejności zgłoszeń, do finalizacji
+        self._pending: list[_Job] = []     # zgłoszone, do finalizacji
         self._seq = 0
         self._started = False
         self._closed = False
@@ -83,7 +91,13 @@ class StagePipeline:
         if self._started:
             return
         self._started = True
-        for target in (self._gather_loop, self._build_loop, self._upload_loop):
+        # gather (1) + N × build (każdy z własnym SLOTEM 0..N-1 na osobny pasek
+        # postępu) + upload (1)
+        targets = [self._gather_loop]
+        targets += [lambda i=i: self._build_loop(i)
+                    for i in range(self._build_workers)]
+        targets.append(self._upload_loop)
+        for target in targets:
             t = threading.Thread(target=target, daemon=True)
             t.start()
             self._threads.append(t)
@@ -118,13 +132,29 @@ class StagePipeline:
     def _is_cancelled(self) -> bool:
         return self._cancel is not None and self._cancel.is_set()
 
+    def _next_ready_locked(self) -> Optional[_Job]:
+        """Zwraca (i usuwa z _pending) następne zadanie do finalizacji. W trybie
+        ordered — tylko GŁOWĘ, gdy gotowa (rodzic→dziecko). W trybie ordered=False
+        — DOWOLNE gotowe (potok bez zależności → finalizacja poza kolejnością)."""
+        if not self._pending:
+            return None
+        if self._ordered:
+            if self._pending[0].done.is_set():
+                return self._pending.pop(0)
+            return None
+        for i, job in enumerate(self._pending):
+            if job.done.is_set():
+                return self._pending.pop(i)
+        return None
+
     def _drain_ready_locked(self) -> bool:
-        """Finalizuje prefiks gotowych zadań (kolejność zgłoszeń). Wywoływane z
-        trzymanym `self._cv`; zwalnia go na czas finalize/release. Zwraca True,
-        gdy coś sfinalizowano."""
+        """Finalizuje gotowe zadania. Wywoływane z trzymanym `self._cv`; zwalnia
+        go na czas finalize/release. Zwraca True, gdy coś sfinalizowano."""
         did = False
-        while self._pending and self._pending[0].done.is_set():
-            job = self._pending.pop(0)
+        while True:
+            job = self._next_ready_locked()
+            if job is None:
+                break
             self._cv.release()
             try:
                 if not job.failed_stage and not self._is_cancelled():
@@ -171,11 +201,13 @@ class StagePipeline:
     # --- wątki etapów (FIFO, STOP propaguje łańcuchem) ---------------------
 
     def _run_stage(self, in_q: "Queue", out_q: Optional["Queue"], fn,
-                   stage: str) -> None:
+                   stage: str, on_stop: Optional[Callable] = None) -> None:
         while True:
             item = in_q.get()
             if item is _STOP:
-                if out_q is not None:
+                if on_stop is not None:
+                    on_stop()
+                elif out_q is not None:
                     out_q.put(_STOP)
                 return
             job = item
@@ -201,13 +233,28 @@ class StagePipeline:
         def _do(job):
             job.gathered = self._gather(job.payload)
             return job.gathered
-        self._run_stage(self._q_in, self._q_gb, _do, "gather")
+        # jeden STOP z feed() → po jednym dla KAŻDEGO wątku build
+        def _on_stop():
+            for _ in range(self._build_workers):
+                self._q_gb.put(_STOP)
+        self._run_stage(self._q_in, self._q_gb, _do, "gather", on_stop=_on_stop)
 
-    def _build_loop(self) -> None:
+    def _build_loop(self, slot_idx: int = 0) -> None:
         def _do(job):
+            # przekaż numer SLOTU (pasek postępu) do fazy build przez payload,
+            # nie zmieniając generycznego kontraktu build(payload, gathered)
+            if isinstance(job.payload, dict):
+                job.payload["_pipe_slot"] = slot_idx
             job.built = self._build(job.payload, job.gathered)
             return job.built
-        self._run_stage(self._q_gb, self._q_bu, _do, "build")
+        # ostatni żywy wątek build przekazuje STOP do uploadu (tylko raz)
+        def _on_stop():
+            with self._cv:
+                self._build_live -= 1
+                last = self._build_live == 0
+            if last:
+                self._q_bu.put(_STOP)
+        self._run_stage(self._q_gb, self._q_bu, _do, "build", on_stop=_on_stop)
 
     def _upload_loop(self) -> None:
         def _do(job):

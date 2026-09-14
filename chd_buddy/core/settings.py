@@ -62,6 +62,10 @@ class Settings:
     rvz_level: int = 5
     rvz_block_kb: int = 128
     threads: int = 0                 # 0 => auto (chdman)
+    # Ile konwersji RÓWNOLEGLE w potoku naprawy (każda 1 wątek chdman → tyle
+    # rdzeni). 0 => auto (min(8, rdzenie_logiczne//2)). Mniej = mniej strumieni
+    # I/O na NAS i mniej RAM-dysku naraz. Domyślnie 4.
+    convert_workers: int = 4
     verify_after_create: bool = True
     # Round-trip: po createdvd wypakuj obraz i porównaj SHA-1 ze źródłem.
     # Silniejsze niż verify (dowód danych, nie tylko kontenera) — domyślnie ON,

@@ -140,62 +140,106 @@ def apply_update(plan: UpdatePlan, *, index=None, tosort: Optional[Path],
                  log: LogCB = lambda m: None) -> bool:
     """Wykonuje plan: stara wersja → ToSort (albo kasuj), nowe pliki → docelowy
     (gdy format się zgadza), edycja DAT. Zwraca True gdy OK."""
-    # 1) STARA wersja z docelowego → ToSort (bezpiecznie) albo kasuj
+    # PODGLĄD: tylko zapowiedz, bez ruszania plików.
+    if dry_run:
+        for old in plan.old_files:
+            log(f"{'KASUJ starą' if delete_old else 'STARA → ToSort'}: {old}")
+        if plan.same_format:
+            for nf in plan.new_files:
+                log(f"NOWA → docelowy: {nf} -> {_canonical_dest(plan, Path(nf))}")
+        else:
+            log("UWAGA: nowe pliki w innym formacie — zostają w źródle; "
+                "uruchom Napraw, by skonwertować.")
+        return update_dat_file(plan.dat_path, plan.game_name, plan.new_roms,
+                               dry_run=True, log=log)
+
+    # 1) NAJPIERW przygotuj i ZWERYFIKUJ nowe pliki na tymczasowych nazwach OBOK
+    #    celu — ZANIM ruszymy stare. Dawniej stare szło do ToSort przed kopią
+    #    nowych: gdy kopia padła, gra zostawała BEZ PLIKÓW (brak rollbacku).
+    #    Kopiujemy do <cel>.updtmp, a zatwierdzamy dopiero po usunięciu starych.
+    import tempfile as _tf
+    staged: list = []                       # (staged_tmp, final_dest)
+    if plan.same_format:
+        for nf in plan.new_files:
+            nf = Path(nf)
+            if not nf.is_file():
+                log(f"  BŁĄD: brak pliku źródłowego {nf} — przerywam (nic nie "
+                    f"ruszono)")
+                for t, _d in staged:
+                    Path(t).unlink(missing_ok=True)
+                return False
+            dest = _canonical_dest(plan, nf)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fd, tmp = _tf.mkstemp(prefix=dest.stem + ".", suffix=".updtmp",
+                                      dir=str(dest.parent))
+                os.close(fd)
+                shutil.copy2(nf, tmp)        # KOPIA — źródło nietknięte
+            except OSError as e:
+                log(f"  BŁĄD kopiowania {nf}: {e} — przerywam (nic nie ruszono)")
+                for t, _d in staged:
+                    Path(t).unlink(missing_ok=True)
+                return False
+            staged.append((Path(tmp), dest))
+    else:
+        log("UWAGA: nowe pliki są w innym formacie niż docelowy — zostają w "
+            "źródle; uruchom Napraw, by skonwertować do formatu docelowego.")
+
+    # 2) STARA wersja z docelowego → ToSort (bezpiecznie) albo kasuj. Nieudane
+    #    ruchy PROPAGUJEMY (dawniej tylko logowane → funkcja zgłaszała sukces,
+    #    choć stara i nowa współistniały, a DAT opisywał już tylko nową).
+    move_failed = False
     for old in plan.old_files:
         old = Path(old)
         if not old.is_file():
             continue
         if delete_old:
             log(f"KASUJ starą: {old}")
-            if not dry_run:
-                try:
-                    old.unlink()
-                    if index is not None:
-                        index.remove_path(old)
-                except OSError as e:
-                    log(f"  nie skasowano {old}: {e}")
+            try:
+                old.unlink()
+                if index is not None:
+                    index.remove_path(old)
+            except OSError as e:
+                log(f"  nie skasowano {old}: {e}")
+                move_failed = True
         else:
             if tosort is None:
                 log("UWAGA: brak ToSort — starej wersji nie ruszam")
+                move_failed = True
                 continue
             dst = Path(tosort) / plan.target_dir.name / old.name
             n = 1
-            while (not dry_run) and os.path.lexists(dst):
+            while os.path.lexists(dst):
                 dst = dst.with_name(f"{dst.stem}_{n}{dst.suffix}")
                 n += 1
             log(f"STARA → ToSort: {old} -> {dst}")
-            if not dry_run:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.move(str(old), str(dst))
-                    if index is not None:
-                        index.remove_path(old)
-                except OSError as e:
-                    log(f"  nie przeniesiono {old}: {e}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(old), str(dst))
+                if index is not None:
+                    index.remove_path(old)
+            except OSError as e:
+                log(f"  nie przeniesiono {old}: {e}")
+                move_failed = True
 
-    # 2) NOWE pliki → katalog docelowy (tylko gdy format się zgadza; inaczej
-    #    zostają w źródle i user uruchomi Napraw, który je skonwertuje)
-    if plan.same_format:
-        for nf in plan.new_files:
-            nf = Path(nf)
-            dest = _canonical_dest(plan, nf)
-            log(f"NOWA → docelowy: {nf} -> {dest}")
-            if not dry_run:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.copy2(nf, dest)   # KOPIA — źródło zostaje nietknięte
-                    if index is not None:
-                        r = next((r for r in plan.new_roms
-                                  if r.name == nf.name), None)
-                        if r is not None:
-                            index.record_file(dest, r.crc, r.md5, r.sha1)
-                except OSError as e:
-                    log(f"  BŁĄD kopiowania {nf}: {e}")
-                    return False
-    else:
-        log("UWAGA: nowe pliki są w innym formacie niż docelowy — zostają w "
-            "źródle; uruchom Napraw, by skonwertować do formatu docelowego.")
+    # 3) ZATWIERDŹ nowe pliki (rename staged → cel; atomowo, ten sam wolumin).
+    for tmp, dest in staged:
+        try:
+            os.replace(str(tmp), str(dest))
+            if index is not None:
+                r = next((r for r in plan.new_roms
+                          if r.name == dest.name), None)
+                if r is not None:
+                    index.record_file(dest, r.crc, r.md5, r.sha1)
+        except OSError as e:
+            log(f"  BŁĄD umieszczania {dest}: {e}")
+            Path(tmp).unlink(missing_ok=True)
+            move_failed = True
 
-    # 3) DAT — podmień wpis gry na nowe sumy
-    return update_dat_file(plan.dat_path, plan.game_name, plan.new_roms,
-                           dry_run=dry_run, log=log)
+    # 4) DAT — podmień wpis gry na nowe sumy
+    ok_dat = update_dat_file(plan.dat_path, plan.game_name, plan.new_roms,
+                             dry_run=False, log=log)
+    if move_failed:
+        log("UWAGA: aktualizacja NIEPEŁNA — część plików nie została "
+            "przeniesiona/umieszczona (patrz wyżej). Wymaga ręcznego sprawdzenia.")
+    return bool(ok_dat) and not move_failed

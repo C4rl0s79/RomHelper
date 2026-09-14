@@ -67,6 +67,9 @@ class RomStatus:
     bad_container: bool = False     # CHD ma ZŁY kontener vs medium DAT (np. gra
                                     # DVD zrobiona jako CD) — „do naprawy",
                                     # naprawia „Odbuduj CHD wg cue"
+    bad_zip_method: bool = False    # ZIP użył metody != store/deflate (zstd/lzma)
+                                    # — niezgodne z emulatorami → „do naprawy"
+                                    # (naprawa przepakuje na deflate)
 
     @property
     def canonical_path(self) -> Path:
@@ -155,11 +158,21 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(a) == os.path.normcase(b)
 
 
-def _link_satisfies(canonical, src: str) -> bool:
+def _link_satisfies(canonical, src: str, index: "FileIndex | None" = None) -> bool:
     """Czy ścieżka kanoniczna to POPRAWNY symlink na znalezioną kopię
     fizyczną `src`? Wtedy gra DZIECKA jest na miejscu (HAVE), a nie „do
-    naprawy" — dokładnie tak dzieci mają wyglądać po naprawie."""
+    naprawy" — dokładnie tak dzieci mają wyglądać po naprawie.
+
+    `index` (świeżo po skanie) pozwala UNIKNĄĆ rundy SMB: jeśli indeks nie zna
+    ścieżki kanonicznej jako ISTNIEJĄCEGO LINKU, nie może ona być spełniającym
+    linkiem → False bez dotykania dysku. Przy przenoszeniu z ToSort kanoniczny
+    plik zwykle jeszcze nie istnieje, więc tu kończymy — to zdejmuje ~jedną
+    rundę SMB z KAŻDEJ gry w podglądzie naprawy (na NAS = z minut na sekundy)."""
     c = str(canonical)
+    if index is not None:
+        row = index.lookup(c)
+        if row is None or row["missing"] or not row["is_link"]:
+            return False
     try:
         if not os.path.islink(c):
             return False
@@ -285,7 +298,7 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
             # kanoniczna ścieżka jest już POPRAWNYM linkiem na tę kopię
             # (typowy stan DZIECKA po naprawie) => na miejscu, nie „napraw"
             if (status.state != RomState.HAVE
-                    and _link_satisfies(status.canonical_path, row["path"])):
+                    and _link_satisfies(status.canonical_path, row["path"], index)):
                 status.state = RomState.HAVE
             return status
 
@@ -361,12 +374,25 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
             return False
         return n > len(game.roms)
 
-    def _mk(archive, members, state, canonical, names_ok, superset=False):
+    def _mk(archive, members, state, canonical, names_ok, superset=False,
+            bad_zip=False):
         return [RomStatus(entry, game.name, rom, state, source_path=archive,
                           member=members.get(i, ""), via_archive=True,
                           canonical_override=canonical, archive_names_ok=names_ok,
-                          archive_superset=superset)
+                          archive_superset=superset, bad_zip_method=bad_zip)
                 for i, rom in enumerate(game.roms)]
+
+    def _bad_zip(archive: str) -> bool:
+        # ZŁA metoda kompresji ZIP (zstd/lzma) — skan zapisał to w indeksie
+        # (tanio, z centralnego katalogu). Emulatory takich nie czytają → repack.
+        if not archive.lower().endswith(".zip"):
+            return False
+        try:
+            r = index.lookup(archive)
+            return bool(r is not None and "bad_zip_method" in r.keys()
+                        and r["bad_zip_method"] == 1)
+        except Exception:
+            return False
 
     in_dir = [(a, m) for a, m in full if _under(a, entry.target_dir)]
     if in_dir:
@@ -374,7 +400,12 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
         archive, members = in_dir[0]
         sup = _superset(archive)
         if _names_ok(members) and not sup:
-            # w katalogu docelowym + poprawne nazwy + DOKŁADNY zestaw => zielone
+            # w katalogu docelowym + poprawne nazwy + DOKŁADNY zestaw => zielone,
+            # CHYBA że ZIP ma złą metodę kompresji (zstd/lzma) → „do naprawy"
+            # (repack na deflate w miejscu; treść OK, tylko kontener niezgodny).
+            if _bad_zip(archive):
+                return _mk(archive, members, RomState.WRONG_NAME, archive,
+                           True, bad_zip=True)
             return _mk(archive, members, RomState.HAVE, archive, True)
         # złe nazwy ALBO nadzbiór (merged) => PRZEPAKUJ tylko ROM-y gry (naprawa)
         ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
@@ -389,7 +420,7 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
     ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
     canonical = str(entry.target_dir / f"{game.name}.{ext}")
     # kanoniczny zip DZIECKA jest już poprawnym linkiem na archiwum rodzica
-    if _link_satisfies(canonical, archive):
+    if _link_satisfies(canonical, archive, index):
         return _mk(archive, members, RomState.HAVE, canonical,
                    _names_ok(members), superset=sup)
     return _mk(archive, members, RomState.ELSEWHERE, canonical,
@@ -450,7 +481,30 @@ def match_game(entry: DatEntry, game, index: FileIndex,
                         if not s.rom.name.lower().endswith((".cue", ".gdi"))]
             if len(data_sts) == 1:
                 canonical = data_sts[0].canonical_path
-                if os.path.lexists(canonical):
+                # NIE ufaj samemu istnieniu wpisu: WISZĄCY symlink (skasowany
+                # cel tłumaczenia) albo OBCY plik pod kanoniczną nazwą dawałyby
+                # fałszywe „komplet". Wymagamy, by CEL istniał (os.path.exists
+                # podąża za linkiem → False dla wiszącego), a gdy indeks zna
+                # treść — by zgadzała się z zapisanym wyborem (rec["sha1"]).
+                want = (rec.get("sha1") or "").lower()
+                have_sha = ""
+                if index is not None:
+                    try:
+                        orow = index.lookup(canonical)
+                    except Exception:
+                        orow = None
+                    if orow is not None and not orow["missing"]:
+                        have_sha = (orow["sha1"] or "").lower()
+                        if not have_sha and orow["is_link"]:
+                            try:
+                                trow = index.lookup(
+                                    Path(os.path.realpath(canonical)))
+                                have_sha = ((trow["sha1"] or "").lower()
+                                            if trow else "")
+                            except Exception:
+                                have_sha = ""
+                if (os.path.exists(canonical)
+                        and not (want and have_sha and have_sha != want)):
                     for s in statuses:
                         s.state = RomState.HAVE
                         s.is_translation = True
@@ -485,7 +539,7 @@ def match_game(entry: DatEntry, game, index: FileIndex,
             return statuses
     canonical = entry.target_dir / f"{game.name}.chd"
     src = chd_row["path"]
-    if _same_path(src, str(canonical)) or _link_satisfies(canonical, src):
+    if _same_path(src, str(canonical)) or _link_satisfies(canonical, src, index):
         state = RomState.HAVE_CHD
     elif os.path.normcase(src).startswith(
             os.path.normcase(str(entry.target_dir)).rstrip("\\/") + os.sep):

@@ -1228,6 +1228,11 @@ class SuiteWindow(QMainWindow):
             if _sl and any(getattr(s, "bad_container", False) for s in _sl):
                 note = (note + " · " if note else "") + tr("zły kontener CHD")
                 disp = f"🧩 {disp}"
+            # ZŁA METODA ZIP (zstd/lzma — niezgodne z emulatorami): odróżnij od
+            # zwykłej „złej nazwy". Naprawa przepakowuje na deflate.
+            if _sl and any(getattr(s, "bad_zip_method", False) for s in _sl):
+                note = (note + " · " if note else "") + tr("zła metoda ZIP")
+                disp = f"🗜 {disp}"
             shown += 1
             it = QTreeWidgetItem([disp, str(len(game.roms)), note])
             it.setData(0, Qt.ItemDataRole.UserRole, game)
@@ -2112,12 +2117,13 @@ class SuiteWindow(QMainWindow):
                 roots = platform_scan_roots(enabled, rules, roms, tosorts)
                 from ..core.fileindex import count_files
 
-                def _count(paths) -> int:
+                def _count(paths, skip_nc=None) -> int:
                     tot = 0
                     for r in paths:
                         if cancel.is_set():
                             break
-                        tot += count_files(Path(r), cancel=cancel)
+                        tot += count_files(Path(r), cancel=cancel,
+                                           skip_dirs=skip_nc)
                     return tot
 
                 base = [0]
@@ -2175,7 +2181,13 @@ class SuiteWindow(QMainWindow):
                 # inny wolumin → zostają (kopiowanie byłoby wolne). Decyduje scan().
                 _primary_tosort = settings.tosort_dir or None
 
-                def _scan_list(paths, grand) -> None:
+                def _scan_list(paths, grand, skip=None) -> None:
+                    # licznik paska liczony jest WZGLĘDEM `grand` tego wywołania
+                    # (Faza 1 = wybrana platforma, Faza 2 = reszta) — a `grand`
+                    # dla każdej fazy jest OSOBNY. Dlatego zerujemy akumulator na
+                    # wejściu: bez tego numerator z Fazy 2 startował od liczby
+                    # plików Fazy 1 i przebijał mianownik (np. 128159/90143).
+                    base[0] = 0
                     for r in paths:
                         if cancel.is_set():
                             break
@@ -2192,7 +2204,7 @@ class SuiteWindow(QMainWindow):
                                       on_file=_pulse(log, progress, total=grand,
                                                      base=base),
                                       detail=detail, slot_progress=slot,
-                                      cancel=cancel)
+                                      cancel=cancel, skip_dirs=skip)
                         base[0] += st.seen
                         log(f"  {st.summary()}")
 
@@ -2277,13 +2289,33 @@ class SuiteWindow(QMainWindow):
                     if cache_ready:
                         idx.drop_match_cache()
                         cache_ready = False
+                    # Faza 2 POMIJA katalogi JUŻ przeskanowane w Fazie 1 (prio):
+                    # od Fazy 1 minęły sekundy, nic się nie zmieniło, więc ponowny
+                    # OBCHÓD + skan tych samych katalogów to czysta strata. Na NAS
+                    # ciche `_count` całej kolekcji (dziesiątki tysięcy plików)
+                    # wyglądało jak ZAWIESZENIE. Doskanowujemy TYLKO to, czego
+                    # priorytet nie objął (zwykle ToSort / nadpisania rom_root).
+                    _prio_nc = {os.path.normcase(str(Path(p))) for p in prio}
+                    remaining = [r for r in roots
+                                 if os.path.normcase(str(Path(r))) not in _prio_nc]
+                    # Poza katalogami POKRYWAJĄCYMI SIĘ 1:1 z Fazą 1 (wyżej), w
+                    # `remaining` bywa też KORZEŃ-RODZIC zawierający katalogi
+                    # Fazy 1 jako PODkatalogi (np. `Z:\No-Intro` = rom_root reguły
+                    # No-Intro, a Faza 1 skanowała już `Z:\No-Intro\<platforma>`).
+                    # Bez pomijania skan gołego rodzica przemiatałby całe No-Intro
+                    # DRUGI raz (dziesiątki tys. plików po NAS). Pomijamy zejście w
+                    # poddrzewa Fazy 1 (pełne pokrycie zostaje — reszta rodzica i
+                    # tak jest skanowana; linkowanie ROMS/1G1R→No-Intro nienaruszone,
+                    # bo pliki Fazy 1 już SĄ w indeksie i NIE są oznaczane jako brak).
+                    _prio_skip = {os.path.normcase(os.path.abspath(str(p)))
+                                  for p in prio}
                     # szybki PRE-COUNT (sam scandir) → mianownik „plik X z Y";
                     # bez tego pasek stoi bez liczby, a przy wielkich plikach długo.
                     progress(0, 0, tr("liczenie plików…"))
-                    grand = _count(roots)
-                    log(f"Do przeskanowania: {grand} plików w {len(roots)} "
-                        f"katalogach")
-                    _scan_list(roots, grand or 1)
+                    grand = _count(remaining, _prio_skip)
+                    log(f"Do przeskanowania (reszta poza priorytetem): {grand} "
+                        f"plików w {len(remaining)} katalogach")
+                    _scan_list(remaining, grand or 1, skip=prio)
                     # DUCHY: wpisy pod korzeniami, które ZNIKNĘŁY (np. skasowane
                     # stare roms) — bez tego matcher planuje przenosiny z
                     # nieistniejących ścieżek. Wpisy pod ŚWIEŻO przeskanowanymi
@@ -2567,7 +2599,7 @@ class SuiteWindow(QMainWindow):
                 return
         db = self.settings.index_db_path or None
 
-        def job(log: Callable[[str], None], progress, cancel, detail):
+        def job(log: Callable[[str], None], progress, cancel, detail, slot):
             from ..core.fileindex import FileIndex
             from ..core.rebuilder import Rebuilder
             from ..core.dirrules import DirRules, missing_roots, scan_roots
@@ -2587,13 +2619,32 @@ class SuiteWindow(QMainWindow):
                 if not dry:
                     from ..core.convert import purge_temp_artifacts
                     from ..core.linker import remove_broken_links
-                    n_t, sz_t = purge_temp_artifacts(sroots, log=log)
-                    if n_t:
-                        log(f"Sprzątnięto {n_t} śmieci po przerwanych "
-                            f"konwersjach ({sz_t/1024**3:.2f} GB odzyskane).")
-                    # zerwane symlinki (cel przeniesiony/skonwertowany) —
-                    # psują konwersje; usuwamy, odtworzą się przy naprawie
-                    n_b = remove_broken_links(sroots, index=idx, log=log)
+                    # ŚMIECI po przerwanych konwersjach: DUŻE temp żyją na
+                    # SCRATCHU (RAM-dysk / scratch_dir / work_dir), NIE w
+                    # kolekcji — więc zamiatamy TYLKO scratch. Pełny os.walk po
+                    # NAS-owej kolekcji przy KAŻDEJ Naprawie to były minuty ciszy
+                    # w „Start…" (i wiszący proces, bo brak cancel). Drobne
+                    # resztki w katalogach docelowych i tak nadpisze ponowna
+                    # konwersja / wyłapie skan.
+                    from ..core import ramdisk as _rd
+                    _scratch_roots: list = []
+                    _ram = _rd.active_root()
+                    if _ram:
+                        _scratch_roots.append(str(_ram))
+                    for _sd in (settings.scratch_dir, settings.work_dir):
+                        if _sd and Path(_sd).is_dir():
+                            _scratch_roots.append(_sd)
+                    if _scratch_roots:
+                        n_t, sz_t = purge_temp_artifacts(
+                            _scratch_roots, log=log, cancel=cancel)
+                        if n_t:
+                            log(f"Sprzątnięto {n_t} śmieci po przerwanych "
+                                f"konwersjach ({sz_t/1024**3:.2f} GB odzyskane).")
+                    # zerwane symlinki (cel przeniesiony/skonwertowany) — psują
+                    # konwersje; usuwamy, odtworzą się przy naprawie. Po INDEKSIE
+                    # (tylko linki, nie cały NAS) + responsywny cancel.
+                    n_b = remove_broken_links(sroots, index=idx, log=log,
+                                              cancel=cancel)
                     if n_b:
                         log(f"Usunięto {n_b} zerwanych symlinków.")
                 log(f"{'PODGLĄD' if dry else 'NAPRAWA'} z przepisu: "
@@ -2622,77 +2673,139 @@ class SuiteWindow(QMainWindow):
                                             if emu and Path(emu).is_dir() else None)
                     return tools
 
-                # KONWERSJA PROSTO ZE ŹRÓDŁA (najpierw): dla gier, których
-                # źródłem są luźne pliki/członki archiwum — zbiera je na RAM,
-                # kompresuje na RAM, do docelowego trafia TYLKO finał; źródła
-                # kasowane po WSZYSTKICH grach. Placement pomija te gry.
-                converted_games: set = set()
-                src_to_purge: list = []
-                if convert and not cancel.is_set():
-                    from ..core.convert import convert_from_source
-                    cst0, converted_games, src_to_purge = convert_from_source(
-                        reports, rules.for_entry, _make_tools(), index=idx,
-                        dry_run=dry, log=log, cancel=cancel, detail=detail,
-                        on_progress=progress, on_converted=rb.add_canonical,
-                        delete_roots=del_from, make_links=make_links)
-                    log(f"Konwersja ze źródła: {cst0.summary()} "
-                        f"({len(converted_games)} gier na RAM, docelowy dostał "
-                        f"tylko finał).")
-
-                # KONWERSJA „w miejscu" (fallback) — dla gier, których nie dało
-                # się zrobić prosto ze źródła (placement ułożył je luźno);
-                # PO placemencie, PRZED dedupem/sprzątaniem.
-                def _do_convert():
-                    if not (convert and not cancel.is_set()):
-                        return
-                    from ..core.convert import convert_reports
-                    cst = convert_reports(reports, rules.for_entry, _make_tools(),
-                                          index=idx, log=log, cancel=cancel,
-                                          on_progress=lambda i, n, t:
-                                              progress(i, n, f"konwersja: {t}"),
-                                          detail=detail,
-                                          on_converted=rb.add_canonical)
-                    log(f"Konwersja w miejscu: {cst.summary()}")
-
-                # rebuilder sam etykietuje fazy (naprawa/sprzątanie/dedup) —
-                # przekazujemy postęp 1:1, bez doklejania własnego prefiksu
-                stats = rb.run(reports, clean=clean, only_complete=only_complete,
-                               rules=rules.for_entry, dedup_roots=dedup_roots,
-                               delete_placed_from=del_from, cancel=cancel,
-                               after_place=_do_convert,
-                               converted_games=converted_games,
-                               on_progress=progress)
-                # NAPRAWA KONTENERA CHD w ramach naprawy: skan oznaczył złe
-                # kontenery (bad_container — np. gra DVD zrobiona jako CD).
-                # Przekontenteruj CD→DVD w miejscu (i CD o złym układzie wg cue)
-                # — TA SAMA logika, co przycisk „Odbuduj CHD wg cue" (bez
-                # duplikatu). Osobny przycisk zostaje do ręcznego, poza
-                # kolejnością. Bramka na „konwertuj" (i tak wymaga chdman).
-                if convert and not cancel.is_set():
+                # ── NAPRAWA KATALOG PO KATALOGU (z góry na dół) ──────────────
+                # Każdy katalog DOMYKAMY w całości ZANIM ruszymy dalej:
+                #   1) sprzątnięcie pozostałości obok gotowych CHD,
+                #   2) IN-PLACE — konwersja ze źródła (luźne→CHD/RVZ) + placement
+                #      (rename/repack) + fallback-konwersja + złe kontenery CHD,
+                #   3) z ToSort — uzupełnienie braków (placement ciągnie do celu),
+                #   4) sprzątanie tego katalogu (zmiecenie nie-kanonicznych do
+                #      ToSort, kasowanie źródeł skonwertowanych, puste katalogi).
+                # Dzięki temu przerwanie zostawia GÓRNE katalogi w pełni gotowe,
+                # a nie „Saturn w toku, gdy Jaguar/FBN mają jeszcze zaległości".
+                # DEDUP (kopie→symlinki dziecko→rodzic MIĘDZY platformami) jest z
+                # natury globalny (dziecko linkuje dopiero gdy rodzic zrobiony;
+                # pełny rodzic dedupu nie potrzebuje) — leci RAZ na końcu
+                # (`finalize_global`), po domknięciu wszystkich katalogów.
+                from ..core.convert import (purge_loose_on_verified_chd,
+                                            convert_from_source, convert_reports,
+                                            purge_source_files)
+                _tools = _make_tools()
+                # zależności naprawy kontenera CHD budujemy RAZ (nie per katalog:
+                # CueLibrary czyta katalog cues) i wołamy per katalog.
+                _bad_chd_ctx = None
+                if convert:
                     try:
                         from ..core.chdman import CHDMan
                         from ..core.chdrebuild import rebuild_bad_chds
                         from ..core.cuelib import CueLibrary
-                        _chd = CHDMan(settings.chdman_path or None)
-                        _lib = CueLibrary(Path(dats) / "cues", log=log)
-                        _extra = [Path(t) for t in tosorts
-                                  if t and Path(t).is_dir()]
-                        _rst = rebuild_bad_chds(
-                            entries, _lib, _chd, settings, idx,
-                            extra_roots=_extra, dry_run=dry, log=log,
-                            on_progress=progress, detail=detail, cancel=cancel)
-                        log(f"Naprawa kontenera CHD: {_rst.summary()}")
-                    except Exception as _e:      # brak chdman itp. — nie wywalaj
-                        log(f"Naprawa kontenera CHD pominięta: {_e}")
+                        _bad_chd_ctx = (
+                            CHDMan(settings.chdman_path or None),
+                            CueLibrary(Path(dats) / "cues", log=log),
+                            [Path(t) for t in tosorts
+                             if t and Path(t).is_dir()])
+                    except Exception as _e:
+                        log(f"Naprawa kontenera CHD niedostępna: {_e}")
+                        _bad_chd_ctx = None
 
-                # KONIEC: dopiero teraz kasujemy oryginalne źródła gier
-                # skonwertowanych PROSTO ZE ŹRÓDŁA (współdzielone ścieżki
-                # wielopłytowe były dostępne przez cały placement/fallback).
-                if src_to_purge and not dry and not rb.cancelled:
-                    from ..core.convert import purge_source_files
-                    purge_source_files(src_to_purge, index=idx, log=log,
-                                       dry_run=dry)
-                return stats
+                done_reports: list = []
+                ntot = len(reports)
+                for rep_i, rep in enumerate(reports):
+                    if cancel.is_set():
+                        log(f"PRZERWANO naprawę na katalogu {rep_i}/{ntot} — "
+                            f"katalogi WYŻEJ są w pełni domknięte (in-place → "
+                            f"ToSort → sprzątanie).")
+                        break
+                    eff = rules.for_entry(rep.entry)
+                    name = rep.entry.name
+                    progress(rep_i, ntot, f"katalog {rep_i + 1}/{ntot}: {name}")
+                    if eff and eff.get("skip"):
+                        log(f"══ {name}: POMINIĘTY (reguła skip)")
+                        continue
+                    log(f"══ KATALOG {rep_i + 1}/{ntot}: {name}")
+
+                    # 1) pozostałości obok gotowych CHD (przerywalne, samodzielne)
+                    _npre = purge_loose_on_verified_chd(
+                        [rep], rules.for_entry, idx, log=log, dry_run=dry,
+                        cancel=cancel)
+                    if _npre:
+                        log(f"   sprzątnięto {_npre} pozostałości obok CHD.")
+
+                    # 2) IN-PLACE: konwersja prosto ze źródła (luźne/archiwum →
+                    #    CHD/RVZ na RAM, do celu trafia tylko finał).
+                    converted_games: set = set()
+                    src_to_purge: list = []
+                    if convert and not cancel.is_set():
+                        cst0, converted_games, src_to_purge = \
+                            convert_from_source(
+                                [rep], rules.for_entry, _tools, index=idx,
+                                dry_run=dry, log=log, cancel=cancel,
+                                detail=detail, on_progress=progress,
+                                on_converted=rb.add_canonical,
+                                delete_roots=del_from, make_links=make_links,
+                                slot=slot)
+                        if converted_games:
+                            log(f"   konwersja ze źródła: {cst0.summary()} "
+                                f"({len(converted_games)} gier).")
+
+                    # fallback-konwersja „w miejscu" PO placemencie (dla gier,
+                    # których nie dało się zrobić prosto ze źródła).
+                    def _do_convert_one(_r=rep):
+                        if not (convert and not cancel.is_set()):
+                            return
+                        cst = convert_reports(
+                            [_r], rules.for_entry, _tools, index=idx, log=log,
+                            cancel=cancel, detail=detail,
+                            on_converted=rb.add_canonical,
+                            on_progress=lambda i, n, t:
+                                progress(i, n, f"konwersja: {t}"))
+                        if cst.converted:
+                            log(f"   konwersja w miejscu: {cst.summary()}")
+
+                    # 2+3) placement (in-place rename/repack + uzupełnienie z
+                    #      ToSort) + fallback-konwersja + sprzątanie TEGO katalogu
+                    #      (clean → ToSort, puste podkatalogi). DEDUP odroczony.
+                    rb.run([rep], clean=clean, only_complete=only_complete,
+                           rules=rules.for_entry, dedup_roots=dedup_roots,
+                           delete_placed_from=del_from, cancel=cancel,
+                           after_place=_do_convert_one,
+                           converted_games=converted_games,
+                           on_progress=progress, defer_global=True)
+
+                    # złe kontenery CHD (in-place) — DVD zrobione jako CD itp.
+                    if _bad_chd_ctx and convert and not cancel.is_set():
+                        _chd, _lib, _extra = _bad_chd_ctx
+                        try:
+                            _rst = rebuild_bad_chds(
+                                [rep.entry], _lib, _chd, settings, idx,
+                                extra_roots=_extra, dry_run=dry, log=log,
+                                on_progress=progress, detail=detail,
+                                cancel=cancel)
+                            if _rst.rebuilt or _rst.verify_failed or _rst.errors:
+                                log(f"   naprawa kontenera CHD: {_rst.summary()}")
+                        except Exception as _e:
+                            log(f"   naprawa kontenera CHD pominięta: {_e}")
+
+                    # 4) kasowanie źródeł gier skonwertowanych ze źródła — dopiero
+                    #    po DOMKNIĘCIU katalogu (współdzielone tory wielopłytowe
+                    #    były dostępne przez cały placement/fallback tego katalogu).
+                    if src_to_purge and not dry and not rb.cancelled:
+                        purge_source_files(src_to_purge, index=idx, log=log,
+                                           dry_run=dry)
+
+                    if not rb.cancelled:
+                        done_reports.append(rep)
+
+                # ── FINAŁ GLOBALNY: dedup (dziecko→rodzic MIĘDZY platformami) +
+                #    sprzątanie zbędnych archiwów i pustych katalogów w ToSort.
+                #    Wymaga PEŁNEGO obrazu (rodzice zrobieni), więc PO pętli i
+                #    pomijany przy przerwaniu.
+                if not rb.cancelled and (dedup_roots or del_from):
+                    progress(0, 0, tr("finał: dedup i porządki w ToSort…"))
+                    rb.finalize_global(done_reports, dedup_roots=dedup_roots,
+                                       delete_placed_from=del_from,
+                                       rules=rules.for_entry, cancel=cancel)
+                return rb.stats
 
         def done(stats) -> None:
             if stats is None:           # bezpiecznik przerwał — nic nie ruszono

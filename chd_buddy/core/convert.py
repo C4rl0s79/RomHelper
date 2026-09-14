@@ -168,7 +168,16 @@ def repack_zip(zip_path: Path, *, method: str = "deflate", level: int = 6,
         log(f"  (podgląd) PRZEPAKUJ ZIP {zip_path.name} → {target_name}")
         return ConvertResult(True, dst=zip_path)
     lvl = max(0, min(int(level), 9))
-    tmp = zip_path.with_name(zip_path.name + ".chdbuddy_repack.zip")
+    # UNIKALNY, WYŁĄCZNIE utworzony plik tymczasowy (mkstemp = O_EXCL) obok
+    # archiwum — nie przewidywalna nazwa. Przewidywalna `.chdbuddy_repack.zip`
+    # mogłaby zostać podstawiona przez inny proces jako symlink, a ZipFile("w")
+    # podążyłby za nim i nadpisał/zterował cel. mkstemp tworzy świeży, zwykły
+    # plik pod losową nazwą → nie ma za czym podążać.
+    import tempfile as _tf
+    _fd, _tmp = _tf.mkstemp(prefix=zip_path.stem + ".", suffix=".chdbuddy_repack.zip",
+                            dir=str(zip_path.parent))
+    os.close(_fd)
+    tmp = Path(_tmp)
     try:
         with zipfile.ZipFile(zip_path) as zin:
             infos = [i for i in zin.infolist() if not i.is_dir()]
@@ -559,17 +568,29 @@ def _is_temp_artifact(name: str) -> bool:
 
 
 def purge_temp_artifacts(roots, *, dry_run: bool = False,
-                         log: LogCB = lambda m: None) -> tuple[int, int]:
+                         log: LogCB = lambda m: None,
+                         cancel=None) -> tuple[int, int]:
     """Kasuje śmieci po PRZERWANYCH konwersjach/weryfikacjach (chdbuddy_*,
     chddeep_*, *.rtcheck.*). Skaner je ignoruje, więc same z siebie nigdy nie
-    znikały i zajmowały dysk. Zwraca (ile_pozycji, ile_bajtów)."""
+    znikały i zajmowały dysk. Zwraca (ile_pozycji, ile_bajtów).
+
+    `cancel` — Event: przeszukiwanie CAŁYCH korzeni to na NAS 100k+ zapytań;
+    sprawdzamy cancel co katalog (Przerwij działa) i logujemy heartbeat, żeby
+    faza „Start…" nie wyglądała na zawieszoną."""
     import shutil as _sh
     n = size = 0
+    scanned = 0
     for root in roots:
         p = Path(root)
         if not p.is_dir():
             continue
+        log(f"Sprzątanie śmieci po konwersjach: {p}…")
         for dirpath, dirnames, filenames in os.walk(p, topdown=False):
+            if cancel is not None and cancel.is_set():
+                return n, size
+            scanned += 1
+            if scanned % 5000 == 0:
+                log(f"  …przeszukano {scanned} katalogów (śmieci: {n})")
             for fn in filenames:
                 if not _is_temp_artifact(fn):
                     continue
@@ -756,45 +777,43 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
     return n
 
 
-def _purge_child_loose_duplicates(game, target_dir, index, needed_sha1,
+def _purge_child_loose_duplicates(game, loose_by_sha1, needed_sha1, index,
                                   log: LogCB, dry_run: bool) -> int:
     """DZIECKO jest/będzie zaspokojone przez CHD (rodzica) — z jego KATALOGU
     DOCELOWEGO kasuje LUŹNE fizyczne pliki torów tej gry (błędnie wypakowane we
     wcześniejszym przebiegu). Ich zawartość żyje w CHD, więc to bezpieczne.
     Nie rusza plików .chd, symlinków ani sha1 potrzebnych niezaspokojonym grom
-    (`needed_sha1`). Zwraca ile skasowano (w dry_run: ile BY skasowano)."""
-    if index is None:
-        return 0
+    (`needed_sha1`). Zwraca ile skasowano (w dry_run: ile BY skasowano).
+
+    `loose_by_sha1` — mapa sha1→[ścieżki] LUŹNYCH fizycznych plików (bez .chd,
+    bez missing) w katalogu docelowym, zbudowana RAZ per katalog przez wołającego.
+    Dawniej robiliśmy `index.all_under(target_dir)` PER GRA — dla katalogu z
+    tysiącami CHD to O(gry²) zapytań: „Znajdź naprawy" stało minutami zanim
+    pokazało pierwszą pozycję."""
     game_sha1 = {(r.sha1 or "").lower() for r in game.roms if r.sha1}
     if not game_sha1:
         return 0
     n = 0
-    try:
-        rows = index.all_under(target_dir, physical_only=True)
-    except Exception:
-        return 0
-    for row in rows:
-        p = row["path"]
-        if p.lower().endswith(".chd"):
-            continue                          # nie kasuj samego CHD
-        sha1 = (row["sha1"] or "").lower()
-        if not sha1 or sha1 not in game_sha1:
-            continue                          # nie należy do tej gry
-        if sha1 in needed_sha1:
+    parents: dict = {}
+    for sha1 in game_sha1:
+        if not sha1 or sha1 in needed_sha1:
             continue                          # potrzebne niezaspokojonej grze
-        if row["missing"]:
-            continue
-        if dry_run:
-            log(f"  (podgląd) KASUJ luźny w dziecku: {p}")
-            n += 1
-            continue
-        try:
-            os.unlink(p)
-            index.remove_path(p)
-            n += 1
-            log(f"KASUJ luźny w dziecku (gra na CHD): {p}")
-        except OSError as e:
-            log(f"  nie skasowano {p}: {e}")
+        for p in list(loose_by_sha1.get(sha1, ())):
+            if dry_run:
+                log(f"  (podgląd) KASUJ luźny w dziecku: {p}")
+                n += 1
+                continue
+            try:
+                os.unlink(p)
+                index.remove_path(p)
+                n += 1
+                log(f"KASUJ luźny w dziecku (gra na CHD): {p}")
+                pd = Path(p).parent
+                parents[os.path.normcase(str(pd))] = pd
+            except OSError as e:
+                log(f"  nie skasowano {p}: {e}")
+    for pd in parents.values():           # opustoszały podkatalog `<gra>\` → precz
+        _rmdir_if_empty(pd, log)
     return n
 
 
@@ -901,16 +920,31 @@ def _relink_verified_duplicate(child: Path, parent: Path, prof, index,
     return True
 
 
+def _rmdir_if_empty(d: Path, log: LogCB = lambda m: None) -> None:
+    """Usuwa katalog TYLKO gdy jest pusty (po zabraniu z niego plików). Katalog
+    platformy nigdy nie jest pusty (jest w nim świeży .chd + inne gry), więc to
+    bezpieczne — kasuje wyłącznie opustoszały podfolder `<gra>\\`. Ciche błędy
+    (nie pusty / nie istnieje / brak praw) = zostawiamy."""
+    try:
+        d.rmdir()
+        log(f"  KASUJ pusty katalog gry: {d}")
+    except OSError:
+        pass
+
+
 def _defer_or_purge_game_sources(sts, shared_srcs, deferred, index, dry_run,
                                  log: LogCB) -> None:
     """Źródła gry: UNIKALNE → kasuj OD RAZU (log); WSPÓŁDZIELONE → odrocz do
-    końca (inna płyta/fallback/dziecko jeszcze ich potrzebuje)."""
+    końca (inna płyta/fallback/dziecko jeszcze ich potrzebuje). Po skasowaniu
+    torów usuwa opustoszały podkatalog `<gra>\\` (bin/cue leżały w podfolderze
+    pod katalogiem platformy — po konwersji na CHD zostawał pusty katalog)."""
     if dry_run:
         for s in sts:
             if s.source_path:
                 deferred.append(Path(s.source_path))
         return
     seen: set = set()
+    parents: dict = {}                        # katalogi do sprzątnięcia (jeśli puste)
     for s in sts:
         sp = s.source_path
         if not sp:
@@ -928,14 +962,22 @@ def _defer_or_purge_game_sources(sts, shared_srcs, deferred, index, dry_run,
                 if index is not None:
                     index.remove_path(sp)
                 log(f"  KASUJ źródło: {sp}")
+                pd = Path(sp).parent
+                parents[os.path.normcase(str(pd))] = pd
             except OSError as e:
                 log(f"  nie skasowano źródła {sp}: {e}")
+    # opustoszałe podkatalogi gry (jeśli część torów była współdzielona i poszła
+    # do `deferred`, katalog jeszcze nie jest pusty → rmdir cicho odpada, a
+    # sprzątnie go końcowy flush odroczonych)
+    for pd in parents.values():
+        _rmdir_if_empty(pd, log)
 
 
 def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         dry_run: bool = False, log: LogCB = lambda m: None,
                         cancel=None, on_progress=None, detail=None,
-                        on_converted=None, delete_roots=None, make_links=True):
+                        on_converted=None, delete_roots=None, make_links=True,
+                        slot=None):
     """Konwersja PROSTO ZE ŹRÓDŁA na RAM → w docelowym ląduje TYLKO finał.
 
     Dla gier, których źródłem są luźne pliki albo ścieżki w archiwum (ToSort),
@@ -952,7 +994,6 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     """
     from .dirrules import resolve_format
     from .matcher import RomState
-    from .scratch import pick_scratch_root
 
     from .datfile import game_profile
     st = ConvertStats()
@@ -1001,6 +1042,31 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                     + os.sep for r in (delete_roots or []) if r]
     n_total = sum(len(r.entry.games) for r in reports) or 1
     gi = 0
+    # CACHE luźnych plików per KATALOG DOCELOWY (sha1 → [ścieżki]): budowany RAZ
+    # z `index.all_under` przy pierwszej grze via_chd danego katalogu, reużywany
+    # przez wszystkie kolejne gry tego katalogu. Bez tego `_purge_child_loose_
+    # duplicates` robił all_under PER GRA → O(gry²) → „Znajdź naprawy" stało
+    # minutami na katalogach z tysiącami CHD.
+    _loose_cache: dict = {}
+
+    def _loose_by_sha1(target_dir) -> dict:
+        k = os.path.normcase(str(target_dir))
+        m = _loose_cache.get(k)
+        if m is None:
+            m = {}
+            if index is not None:
+                try:
+                    for row in index.all_under(target_dir, physical_only=True):
+                        p = row["path"]
+                        if p.lower().endswith(".chd") or row["missing"]:
+                            continue
+                        s = (row["sha1"] or "").lower()
+                        if s:
+                            m.setdefault(s, []).append(p)
+                except Exception:
+                    m = {}
+            _loose_cache[k] = m
+        return m
     # WSPÓLNE tory (np. filler GD-ROM „Track 2", identyczny w setkach gier):
     # chronione przez needed_sha1 nieposiadanych gier. Zamiast trzymać dziesiątki
     # kopii — redukujemy do JEDNEJ w całym przebiegu. Klucz sha1/crc:size, który
@@ -1013,43 +1079,49 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     # Reguła (wg usera): jeśli scratch ma >= NAJWIĘKSZA gra ×10 wolnego, wszystko
     # się zmieści (nawet równolegle) → NIE pytamy o miejsce per gra (na NAS to
     # wolne, blokujące zapytanie). Inaczej (ciasno) — sprawdzamy per gra.
-    _scratch_budget = None
-    if not dry_run:
-        biggest = 0
-        for _rep in reports:
-            _eff = rules_fn(_rep.entry)
-            if _eff.get("skip"):
-                continue
-            if resolve_format(_eff.get("format", "keep"), _rep.entry) in (
-                    "keep", "", "extract"):
-                continue
-            for _g in _rep.entry.games:
-                _s = sum(max(r.size, 0) for r in _g.roms)
-                if _s > biggest:
-                    biggest = _s
-        if biggest:
-            _prefer = str(reports[0].entry.target_dir) if reports else None
-            _sc = pick_scratch_root(
-                int(biggest * 10), prefer=_prefer, log=log,
-                fallback=getattr(tools.get("settings"), "scratch_dir", "")
-                or None)
-            if _sc is not None:
-                _scratch_budget = _sc
-                log(f"Budżet miejsca OK: największa gra "
-                    f"{biggest/1024**3:.1f} GB, scratch {_sc} mieści ×10 — "
-                    f"nie pytam o miejsce per gra.")
-            else:
-                log("Budżet miejsca ciasny — sprawdzam wolne miejsce per gra.")
-
-    # POTOK (pełne nakładanie pobierz→konwertuj→wyślij). Bezpieczny, gdy:
-    #  • jest budżet RAM (scratch) — konwersja i tak buduje na RAM,
-    #  • BRAK współdzielonych odcisków treści (żadne dziecko nie linkuje do
-    #    rodzica w tym przebiegu) → zero zależności kolejnościowych między grami.
-    # Inaczej — konwersja SERYJNA (bezpiecznie). Konwersja zawsze 1 na raz;
-    # nakładamy tylko pobieranie (I/O) i wysyłanie (I/O) na konwersję (CPU).
+    # POTOK (nakładanie pobierz‖konwertuj‖wyślij). Scratch dobierany PER GRA
+    # (RAM-dysk gdy gra się mieści, inaczej dysk fizyczny) — NIE zależy już od
+    # „największa×10" (to blokowało potok globalnie, gdy jest choćby jedna wielka
+    # gra jak PS2 34.8 GB → 348 GB, choć małe gry 3DO/PS1 spokojnie by się
+    # nakładały). Budżet potoku = wolne na RAM-dysku (tam trafiają małe,
+    # nakładane gry); StagePipeline rezerwuje per-zadanie, więc gra większa niż
+    # budżet idzie sama (bez zakleszczenia), a duże scratch i tak dostają dysk
+    # fizyczny per gra. Kompresja zawsze 1 na raz (CPU); nakładamy tylko I/O.
+    # Potok bezpieczny gdy: jest RAM-dysk (budżet) i BRAK współdzielonych odcisków
+    # (żadne dziecko nie linkuje do rodzica → zero zależności kolejnościowych).
     _pipe = None
     _fed: list = []                      # (key, handle) — pogodzenie `done` przy błędzie
-    if not dry_run and _scratch_budget is not None:
+    _pipe_ram_budget = 0
+    if not dry_run:
+        try:
+            import shutil as _sh0
+
+            from . import ramdisk as _rd
+            _ram = _rd.active_root()
+            if _ram is not None:
+                _pipe_ram_budget = int(_sh0.disk_usage(str(_ram)).free * 0.85)
+        except Exception:
+            _pipe_ram_budget = 0
+    # WSPÓŁDZIELONE odciski (ten sam `game_profile` w >1 grze — np. 1G1R dziecko
+    # linkujące do rodzica, albo klony arcade dzielące ROM-y). TE gry wymagają
+    # kolejności rodzic→dziecko (dziecko linkuje do FIZYCZNIE gotowego rodzica),
+    # więc idą ŚCIEŻKĄ SERYJNĄ. Reszta (UNIKATOWE odciski: dyski CD 3DO/PS1/Saturn)
+    # nie ma zależności → leci POTOKIEM RÓWNOLEGŁYM. Dawniej pojedynczy współdzielony
+    # odcisk GDZIEKOLWIEK wyłączał potok dla CAŁEGO przebiegu (all-or-nothing), więc
+    # 3DO nigdy nie zrównoleglone. Teraz gate jest PER GRA.
+    # KLUCZ DEDUP = (platforma, odcisk). Dedup (link dziecko→rodzic) działa TYLKO
+    # w OBRĘBIE PLATFORMY. Dwie gry o identycznej treści na RÓŻNYCH platformach
+    # (np. ten sam dump na MSX i Master System) to DWA legalne pliki fizyczne —
+    # NIE rodzic/dziecko, żadnych cross-platformowych symlinków. Globalny dedug
+    # po samym odcisku robił „wojnę między katalogami" i błędnie linkował.
+    from .datstore import platform_key as _pk
+
+    def _plat_key(entry) -> str:
+        alias = rules_fn(entry).get("platform", "")
+        return _pk(str(alias)) if alias else _pk(entry.name)
+
+    _shared_profiles: set = set()
+    if not dry_run and _pipe_ram_budget > 0:
         from collections import Counter as _Counter
         _profc: _Counter = _Counter()
         for _rep in reports:
@@ -1059,32 +1131,51 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             if resolve_format(_eff.get("format", "keep"), _rep.entry) in (
                     "keep", "", "extract"):
                 continue
+            _pl = _plat_key(_rep.entry)
             for _g in _rep.entry.games:
                 pr = game_profile(_g.data_roms)
                 if pr:
-                    _profc[pr] += 1
-        if any(c > 1 for c in _profc.values()):
-            log("Potok WYŁ (współdzielone odciski → linki dziecko/rodzic) — "
-                "konwersja seryjna.")
-        else:
-            import shutil as _sh0
+                    _profc[(_pl, pr)] += 1
+        _shared_profiles = {k for k, c in _profc.items() if c > 1}
+        import dataclasses as _dc
 
-            from .convert_pipeline import StagePipeline
+        from .convert_pipeline import StagePipeline
+        # RÓWNOLEGŁA KONWERSJA: N chdman/DolphinTool naraz. Cel — obłożyć
+        # 8 rdzeni WYDAJNYCH (bez HT) po JEDNEJ konwersji, zamiast jednej
+        # gry ciągnącej wszystkie rdzenie (małe CD 3DO/PS1/Saturn tak nie
+        # sycą CPU/NAS). Ile: ~połowa logicznych, ale nie więcej niż 8
+        # (na tej maszynie 20 log. → 8). Każda konwersja dostaje 1 wątek
+        # chdman (-np 1), więc 8 konwersji ≈ 8 P-rdzeni (bez przeciążenia).
+        _logical = os.cpu_count() or 4
+        _cw = getattr(tools.get("settings"), "convert_workers", 0) or 0
+        if _cw and int(_cw) > 0:
+            _build_workers = max(1, min(int(_cw), _logical))   # z ustawień
+        else:
+            _build_workers = max(1, min(8, _logical // 2))     # auto
+        _tools_pipe = tools
+        if _build_workers > 1:
+            _s = tools.get("settings")
             try:
-                budget = int(_sh0.disk_usage(str(_scratch_budget)).free * 0.85)
-            except OSError:
-                budget = 0
-            _pipe = StagePipeline(
-                gather=lambda j: _conv_gather_phase(j, log),
-                build=lambda j, g: _conv_build_phase(j, tools, log, detail),
-                upload=lambda j, b: _conv_upload_phase(j, detail, log),
-                finalize=lambda j, r: _conv_finalize_phase(
-                    j, r, index, on_converted, st, shared_srcs, deferred, log),
-                release=_conv_release, ram_budget=budget, log=log, cancel=cancel)
-            _pipe.start()
-            log(f"Potok konwersji WŁ (budżet RAM {budget/1024**3:.1f} GB, "
-                f"scratch {_scratch_budget}) — pobieranie i wysyłka nakładane "
-                f"na konwersję.")
+                _s2 = _dc.replace(_s, threads=1)   # 1 wątek chdman / zadanie
+                _tools_pipe = dict(tools)
+                _tools_pipe["settings"] = _s2
+            except Exception:
+                _tools_pipe = tools
+        _pipe = StagePipeline(
+            gather=lambda j: _conv_gather_phase(j, log),
+            build=lambda j, g: _conv_build_phase(j, _tools_pipe, log, detail,
+                                                 slot=slot),
+            upload=lambda j, b: _conv_upload_phase(j, detail, log),
+            finalize=lambda j, r: _conv_finalize_phase(
+                j, r, index, on_converted, st, shared_srcs, deferred, log),
+            release=_conv_release, ram_budget=_pipe_ram_budget, log=log,
+            cancel=cancel, build_workers=_build_workers, ordered=False)
+        _pipe.start()
+        _shared_note = (f"; {len(_shared_profiles)} współdzielonych odcisków "
+                        f"seryjnie" if _shared_profiles else "")
+        log(f"Potok konwersji WŁ ({_build_workers} równoległych, budżet RAM "
+            f"{_pipe_ram_budget/1024**3:.1f} GB){_shared_note} — pobieranie i "
+            f"wysyłka nakładane na kompresję.")
 
     for rep in reports:
         if cancel is not None and cancel.is_set():
@@ -1095,11 +1186,32 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
         fmt = resolve_format(eff.get("format", "keep"), rep.entry)
         if fmt in ("keep", "", "extract"):
             continue
+        # KATALOG-RODZIC („wszystkie rodzicami", parent_priority): jego DAT-y
+        # ZAWSZE dostają plik FIZYCZNY — nigdy nie linkują się (nawet identyczna
+        # treść między platformami/DAT-ami w rodzicu). Tylko DAT-y spoza rodzica
+        # (dzieci) mogą linkować do fizycznego pliku rodzica.
+        is_parent = bool(eff.get("parent_priority"))
         subdir = bool(eff.get("subdir_per_game", True))
         by_game: dict = {}
         for s in rep.statuses:
             by_game.setdefault(s.game, []).append(s)
-        for game in rep.entry.games:
+        # KOLEJNOŚĆ: NAJPIERW gry, których źródło jest JUŻ w katalogu docelowym
+        # (naprawa W MIEJSCU: zła nazwa/format/opakowanie po zmianie ustawień
+        # DAT), DOPIERO POTEM te z ToSort (uzupełnianie braków). Bez tego kopia
+        # z ToSort mogła zostać keeperem (odciskiem) przed własną kopią kolekcji,
+        # a to kolekcja jest źródłem prawdy. `sorted` jest stabilne → w obrębie
+        # każdej grupy kolejność DAT-u zachowana. Nie rusza rodzic-przed-dzieckiem
+        # (to kolejność MIĘDZY raportami, tu zmieniamy tylko wewnątrz jednego).
+        _tprefix = os.path.normcase(str(rep.entry.target_dir)).rstrip("\\/") + os.sep
+
+        def _in_place_first(g, _bg=by_game, _tp=_tprefix) -> int:
+            for s in _bg.get(g.name, ()):
+                sp = s.source_path
+                if sp and os.path.normcase(sp).startswith(_tp):
+                    return 0            # źródło w kolekcji → w miejscu (pierwsze)
+            return 1                    # ToSort / gdzie indziej / brak → później
+
+        for game in sorted(rep.entry.games, key=_in_place_first):
             if cancel is not None and cancel.is_set():
                 break
             gi += 1
@@ -1136,9 +1248,13 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         and Path(next(iter(arch_srcs))).suffix.lower()
                         in (".zip", ".7z")):
                     arch = Path(next(iter(arch_srcs)))
+                    _pr0 = game_profile(game.data_roms)
+                    # rejestracja keepera (platforma, odcisk) — także dla RODZICA,
+                    # by DZIECI mogły linkować; is_parter blokuje tylko linkowanie
+                    _pk0 = (_plat_key(rep.entry), _pr0) if _pr0 else None
                     if arch.is_file() and _try_disc_archive_chd(
                             rep.entry, game, arch, tools, index, log, st,
-                            detail, on_converted, final_by_profile):
+                            detail, on_converted, final_by_profile, pkey=_pk0):
                         done.add(f"{id(rep.entry)}::{game.name}")
                         _defer_or_purge_game_sources(sts, shared_srcs, deferred,
                                                      index, dry_run, log)
@@ -1175,9 +1291,11 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 # „w child tylko linki".
                 if any(s.via_chd for s in sts) and index is not None:
                     prof = game_profile(game.data_roms)
+                    # dedup CHD też w OBRĘBIE PLATFORMY (cross-platform = oba fizyczne)
+                    pkey = (_plat_key(rep.entry), prof) if prof else None
                     own = rep.entry.target_dir / f"{game.name}.chd"
                     if prof:
-                        keeper = final_by_profile.get(prof)
+                        keeper = final_by_profile.get(pkey)
                         # STAN WŁASNEGO CHD z INDEKSU (lokalny SQLite), a NIE stat
                         # na NAS: os.path.isfile/lstat PER GRA na dysku sieciowym
                         # to były „przystanki" w „Znajdź naprawy" (tysiące gier
@@ -1198,11 +1316,12 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         cn = os.path.normcase(os.path.abspath(str(own)))
                         if keeper is None and own_ok:
                             # RODZIC — jego fizyczny CHD zostaje keeperem
-                            final_by_profile[prof] = own
-                        elif (keeper is not None and own_ok
+                            final_by_profile[pkey] = own
+                        elif (not is_parent and keeper is not None and own_ok
                               and os.path.normcase(os.path.abspath(
                                   str(keeper))) != cn):
                             # DZIECKO z redundantnym fizycznym CHD → relink
+                            # (gra z katalogu-RODZICA nigdy: zostaje fizyczna)
                             if _relink_verified_duplicate(
                                     own, keeper, prof, index,
                                     make_links, _links_blocked, dry_run, log):
@@ -1213,8 +1332,8 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 # wypakowane wcześniej) — gra jest na CHD, więc je sprzątamy.
                 if index is not None:
                     st.tosort_purged += _purge_child_loose_duplicates(
-                        game, rep.entry.target_dir, index, _needed_sha1,
-                        log, dry_run)
+                        game, _loose_by_sha1(rep.entry.target_dir),
+                        _needed_sha1, index, log, dry_run)
                 # ALE gdy CHD jest JUŻ w docelowym (HAVE_CHD), a luźne ścieżki
                 # tej gry wciąż leżą w ToSort — posprzątaj je (redundantne).
                 if (del_prefixes and index is not None and not dry_run
@@ -1224,24 +1343,40 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         needed_crc=_needed_crc, kept_shared=_kept_shared)
                 continue
             if all(s.state in (RomState.HAVE, RomState.HAVE_CHD) for s in sts):
-                # zaspokojona bez konwersji (np. już luźna w docelowym) — jeśli
-                # przez CHD i luźne kopie leżą w ToSort, też posprzątaj
-                if (del_prefixes and index is not None and not dry_run
-                        and any(s.state == RomState.HAVE_CHD for s in sts)):
-                    st.tosort_purged += _purge_redundant_tosort_tracks(
-                        game, index, del_prefixes, _needed_sha1, log,
-                        needed_crc=_needed_crc, kept_shared=_kept_shared)
-                continue
+                # NAPRAWA W MIEJSCU: platforma dyskowa (fmt=chd), a KOMPLET gry
+                # leży LUŹNO w katalogu docelowym (bin/cue/iso). Ustawienie DAT
+                # „płyty jako CHD" wymaga konwersji, mimo że pliki są „na
+                # miejscu" (HAVE) — bo to zły FORMAT, nie brak. NIE pomijamy:
+                # spadamy niżej do konwersji ze źródła (źródłem są luźne pliki z
+                # kolekcji; po zweryfikowanym CHD luźne tory sprząta blok na
+                # końcu). Pozostałe formaty (rvz-jednoplikowy już jako .rvz,
+                # zip/keep) są FAKTYCZNIE zaspokojone → pomijamy jak dotąd.
+                _loose_disc_in_place = (
+                    fmt == "chd"
+                    and not any(s.state == RomState.HAVE_CHD for s in sts))
+                if not _loose_disc_in_place:
+                    # zaspokojona bez konwersji — jeśli przez CHD i luźne kopie
+                    # leżą w ToSort, też posprzątaj
+                    if (del_prefixes and index is not None and not dry_run
+                            and any(s.state == RomState.HAVE_CHD for s in sts)):
+                        st.tosort_purged += _purge_redundant_tosort_tracks(
+                            game, index, del_prefixes, _needed_sha1, log,
+                            needed_crc=_needed_crc, kept_shared=_kept_shared)
+                    continue
             if on_progress:
                 on_progress(gi, n_total, f"konwersja (ze źródła): {game.name}")
             key = f"{id(rep.entry)}::{game.name}"
             prof = game_profile(game.data_roms)
+            # KLUCZ DEDUP zawężony do PLATFORMY — cross-platformowe duble treści
+            # zostają OBA fizyczne (patrz komentarz przy _shared_profiles).
+            pkey = (_plat_key(rep.entry), prof) if prof else None
 
             # DUPLIKAT (dziecko, np. 1G1R): ten sam odcisk zawartości już
             # zrobiony przez rodzica → SYMLINK z WŁASNĄ nazwą do pliku rodzica,
-            # NIE druga kopia. Nazwa dziecka może się różnić (inny DAT).
-            if prof and prof in final_by_profile:
-                parent_final = final_by_profile[prof]
+            # NIE druga kopia. Nazwa dziecka może się różnić (inny DAT). Gra z
+            # katalogu-RODZICA NIE linkuje (zawsze fizyczna) — patrz is_parent.
+            if not is_parent and pkey is not None and pkey in final_by_profile:
+                parent_final = final_by_profile[pkey]
                 ext = parent_final.suffix
                 child_final = rep.entry.target_dir / f"{game.name}{ext}"
                 if _link_child_to_parent(child_final, parent_final, make_links,
@@ -1254,27 +1389,41 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                                                  index, dry_run, log)
                 continue
 
-            if _pipe is not None:
+            # Gra ze WSPÓŁDZIELONYM odciskiem (rodzic grupy rodzic→dziecko) NIE
+            # idzie potokiem: dziecko (dalej w pętli) linkuje do FIZYCZNIE gotowego
+            # rodzica, a potok finalizuje poza kolejnością i ustawia `final` PRZED
+            # sukcesem — link mógłby wisieć. Taki rodzic → konwersja SERYJNA
+            # (blokująca), `final_by_profile` ustawiane dopiero po sukcesie.
+            _pipe_ok = _pipe is not None and (
+                pkey is None or pkey not in _shared_profiles)
+            if _pipe_ok:
                 # POTOK: zleć zadanie (pobranie→konwersja→wysyłka w tle); finalize
                 # (indeks/źródła) i tak w TYM wątku (SQLite jednowątkowe).
                 pjob = _conv_prepare(rep.entry, game, sts, fmt, tools, log)
                 if pjob is not None:
-                    pjob["scratch"] = _scratch_budget
-                    cost = int(sum(max(r.size, 0) for r in pjob["roms"]) * 1.7)
-                    _fed.append((key, _pipe.feed(pjob, cost=cost)))
-                    done.add(key)
-                    if prof:
-                        final_by_profile[prof] = pjob["final"]
-                # pjob None → nie oznaczamy done → fallback placement
+                    # scratch PER GRA: RAM-dysk gdy się mieści, inaczej fizyczny
+                    # (duże PS2 nie przepełnią R:). None → brak miejsca nigdzie →
+                    # nie zlecamy, fallback placement dokończy.
+                    sc = _conv_scratch_for(pjob["roms"], fmt, pjob["target_dir"],
+                                           None, tools, pjob["base"], log)
+                    if sc is not None:
+                        pjob["scratch"] = sc
+                        cost = int(sum(max(r.size, 0)
+                                       for r in pjob["roms"]) * 1.7)
+                        _fed.append((key, _pipe.feed(pjob, cost=cost)))
+                        done.add(key)
+                        if pkey is not None:
+                            final_by_profile[pkey] = pjob["final"]
+                # pjob None / brak scratcha → nie oznaczamy done → fallback
             else:
                 res = _convert_game_from_source(
                     rep.entry, game, sts, fmt, subdir, tools, index, dry_run, log,
                     st, detail, deferred, on_converted, shared_srcs,
-                    scratch_override=_scratch_budget)
+                    scratch_override=None)
                 if res is not None:
                     done.add(key)
-                    if prof:
-                        final_by_profile[prof] = res
+                    if pkey is not None:
+                        final_by_profile[pkey] = res
 
     if _pipe is not None:
         _pipe.drain()                    # dokończ i zfinalizuj wszystkie (kolejno)
@@ -1282,11 +1431,237 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
         for k, h in _fed:                # nieudane → cofnij z done (placement dokończy)
             if getattr(h, "failed_stage", ""):
                 done.discard(k)
+    # SPRZĄTANIE PO KONWERSJI NA CHD: gdy gra jest na (ZWERYFIKOWANYM) CHD, a OBOK
+    # leżą pozostałości tej samej treści — REDUNDANTNE archiwum `<gra>.zip/.7z`
+    # (zły format / import) ORAZ LUŹNE tory `.bin/.cue/.gdi` (np. Dreamcast po
+    # konwersji) → kasujemy (treść żyje w CHD). Robione TU (per gra, ODPORNE na
+    # Przerwij), a nie w globalnym „clean" na końcu naprawy, który przy przerwaniu
+    # jest pomijany — stąd user widział zip+chd (3DO) i bin/cue+chd (Dreamcast).
+    if index is not None:
+        for rep in reports:
+            if cancel is not None and cancel.is_set():
+                break
+            eff = rules_fn(rep.entry)
+            if eff.get("skip"):
+                continue
+            if resolve_format(eff.get("format", "keep"), rep.entry) != "chd":
+                continue                 # tylko platformy dyskowe (kanoniczny CHD)
+            tdir = rep.entry.target_dir
+            _lmap = None                 # mapa luźnych sha1→ścieżki (leniwie, raz)
+            for game in rep.entry.games:
+                st.tosort_purged += _purge_redundant_target_archives(
+                    game, tdir, index, log, dry_run, needed_sha1=_needed_sha1)
+                # LUŹNE tory (Dreamcast bin/cue/gdi itp.): tylko gdy gra na CHD
+                gsha = {(r.sha1 or "").lower() for r in game.roms if r.sha1}
+                if not gsha:
+                    continue
+                if _lmap is None:
+                    _lmap = _loose_by_sha1(tdir)
+                if not any(s in _lmap for s in gsha):
+                    continue             # brak luźnych kandydatów → 0 I/O NAS
+                if not _disc_on_verified_chd(game, tdir, index, dry_run):
+                    continue             # CHD niezweryfikowany → NIE kasujemy
+                st.tosort_purged += _purge_child_loose_duplicates(
+                    game, _lmap, _needed_sha1, index, log, dry_run)
     # NIE kasujemy tu — oryginalne źródła (unikalne) zwracamy, a kasuje je
     # dopiero KONIEC całej naprawy (po placemencie i fallbacku), żeby żadna
     # współdzielona ścieżka nie zniknęła zanim ktoś jej jeszcze potrzebuje.
     uniq = list({os.path.normcase(str(p)): p for p in deferred}.values())
     return st, done, uniq
+
+
+def purge_loose_on_verified_chd(reports, rules_fn, index, *,
+                                log: LogCB = lambda m: None, dry_run: bool = False,
+                                cancel=None) -> int:
+    """BEZPIECZNY, PRZERYWALNY przebieg czyszczący pozostałości gier JUŻ na CHD.
+
+    Dla każdej gry, która jest na ZWERYFIKOWANYM CHD w katalogu docelowym
+    (`data_sha1 == game_profile`), kasuje redundantną tę samą treść leżącą obok:
+    luźne tory `.bin/.cue/.gdi` ORAZ archiwum `<gra>.zip/.7z` — treść żyje w CHD.
+    Usuwa też opustoszały podkatalog `<gra>\\`.
+
+    W ODRÓŻNIENIU od zmiatania do ToSort i dedupu (które przy niepełnym dopasowaniu
+    mogą uznać znany plik za śmieć i dlatego są POMIJANE po Przerwaniu) — to jest
+    kasowanie per-gra o UDOWODNIONEJ redundancji (zweryfikowany CHD tej samej
+    treści), więc NIE wymaga pełnego obrazu kolekcji i jest bezpieczne nawet po
+    przerwaniu. Dzięki temu można je puścić NA POCZĄTKU naprawy i sprząta
+    pozostałości po wcześniejszych przebiegach (CHD z ToSort, a docelowe bin/cue
+    nietknięte), niezależnie od tego, jak wcześnie użytkownik przerwie."""
+    if index is None:
+        return 0
+    from collections import defaultdict
+    from .matcher import RomState
+    from .dirrules import resolve_format
+    # OCHRONA `needed_sha1`: NIE kasuj luźnego toru, jeśli potrzebuje go inna gra,
+    # która NAPRAWDĘ powstanie w tej naprawie. KLUCZOWE zawężenie: tylko gry
+    # BUDOWALNE — takie, które mają WSZYSTKIE tory DANYCH obecne (choćby pod złą
+    # nazwą / w ToSort). Gra BRAKUJĄCA (brak toru danych, np. 6800 płyt z DAT-a,
+    # których user nie ma) NIGDY nie powstanie, więc nie ma sensu chronić dla niej
+    # współdzielonych torów audio — a to właśnie one blokowały całe sprzątanie
+    # (każdy tor „potrzebny" jakiejś brakującej grze). Współdzielony tor i tak
+    # potrzebny jest tylko w JEDNYM miejscu, a jego treść żyje w zweryfikowanym CHD.
+    _DESC = (".cue", ".gdi", ".toc")
+    needed_sha1: set = set()
+    for rep in reports:
+        bg: dict = defaultdict(list)
+        for s in rep.statuses:
+            bg[s.game].append(s)
+        for sts in bg.values():
+            unsat = any(s.state in (RomState.ELSEWHERE, RomState.WRONG_NAME,
+                                    RomState.MISSING, RomState.NO_HASH)
+                        for s in sts)
+            if not unsat:
+                continue
+            data = [s for s in sts
+                    if not s.rom.name.lower().endswith(_DESC)]
+            buildable = bool(data) and all(
+                s.state not in (RomState.MISSING, RomState.NO_HASH) for s in data)
+            if not buildable:
+                continue                      # gra brakująca → nie chroni torów
+            for s in sts:
+                if s.rom.sha1:
+                    needed_sha1.add(s.rom.sha1.lower())
+    loose_cache: dict = {}
+
+    def _loose(td) -> dict:
+        k = os.path.normcase(str(td))
+        m = loose_cache.get(k)
+        if m is None:
+            m = {}
+            try:
+                for row in index.all_under(td, physical_only=True):
+                    p = row["path"]
+                    if p.lower().endswith(".chd") or row["missing"]:
+                        continue
+                    s = (row["sha1"] or "").lower()
+                    if s:
+                        m.setdefault(s, []).append(p)
+            except Exception:
+                m = {}
+            loose_cache[k] = m
+        return m
+
+    n = 0
+    for rep in reports:
+        if cancel is not None and cancel.is_set():
+            break
+        eff = rules_fn(rep.entry)
+        if eff.get("skip"):
+            continue
+        if resolve_format(eff.get("format", "keep"), rep.entry) != "chd":
+            continue                          # tylko platformy dyskowe (CHD)
+        tdir = rep.entry.target_dir
+        lmap = None
+        for game in rep.entry.games:
+            if cancel is not None and cancel.is_set():
+                break
+            n += _purge_redundant_target_archives(
+                game, tdir, index, log, dry_run, needed_sha1=needed_sha1)
+            gsha = {(r.sha1 or "").lower() for r in game.roms if r.sha1}
+            if not gsha:
+                continue
+            if lmap is None:
+                lmap = _loose(tdir)
+            if not any(s in lmap for s in gsha):
+                continue                      # brak luźnych kandydatów → 0 I/O
+            if not _disc_on_verified_chd(game, tdir, index, dry_run):
+                continue                      # CHD niezweryfikowany → NIE kasujemy
+            n += _purge_child_loose_duplicates(
+                game, lmap, needed_sha1, index, log, dry_run)
+    return n
+
+
+def _disc_on_verified_chd(game, target_dir, index, dry_run) -> bool:
+    """Czy gra JEST na kanonicznym, ZWERYFIKOWANYM CHD w katalogu docelowym:
+    `<gra>.chd` w indeksie fizyczny (nie link/missing) i `data_sha1 == game_profile`
+    (to NA PEWNO treść tej gry). W realnym biegu dokładamy FIZYCZNY dowód
+    (os.path) — indeks bywa nieaktualny, a kasujemy po tym luźne tory/archiwa."""
+    if index is None:
+        return False
+    from .datfile import game_profile
+    prof = game_profile(game.data_roms)
+    if not prof:
+        return False
+    chd = Path(target_dir) / f"{game.name}.chd"
+    crow = index.lookup(chd)
+    if (crow is None or crow["is_link"] or crow["missing"]
+            or (crow["data_sha1"] or "").lower() != prof.lower()):
+        return False
+    if not dry_run and not chd.is_file():
+        return False
+    return True
+
+
+def _purge_redundant_target_archives(game, target_dir, index, log, dry_run,
+                                     needed_sha1=None) -> int:
+    """Gra jest już na CHD → archiwum `<gra>.zip/.7z` LEŻĄCE OBOK niej w katalogu
+    docelowym jest REDUNDANTNE (ta sama treść jest w CHD) → kasujemy.
+
+    Bezpieczniki (nic nie kasujemy, jeśli którykolwiek nie spełniony):
+    - kanoniczny `<gra>.chd` jest w indeksie FIZYCZNIE (nie link/missing) i ma
+      `data_sha1 == game_profile` (CHD to ZWERYFIKOWANA treść tej gry),
+    - archiwum jest FIZYCZNE, a jego CZŁONKOWIE to WYŁĄCZNIE ścieżki tej gry
+      (sumy ⊆ sum ROM-ów gry) — nie kasujemy nadzbioru/cudzego archiwum,
+    - żadna suma nie jest jeszcze POTRZEBNA innej niezaspokojonej grze
+      (needed_sha1),
+    - FIZYCZNY dowód istnienia (os.path) tuż przed usunięciem (indeks bywa
+      nieaktualny). NAS-owe staty robimy DOPIERO, gdy w indeksie jest kandydat.
+    dry_run → tylko „(podgląd)". Zwraca liczbę skasowanych archiwów."""
+    if index is None:
+        return 0
+    from .datfile import game_profile
+    from .linker import is_link
+    prof = game_profile(game.data_roms)
+    if not prof:
+        return 0
+    target_dir = Path(target_dir)
+    chd = target_dir / f"{game.name}.chd"
+    crow = index.lookup(chd)
+    if (crow is None or crow["is_link"] or crow["missing"]
+            or (crow["data_sha1"] or "").lower() != prof.lower()):
+        return 0
+    game_sha = {r.sha1.lower() for r in game.data_roms if r.sha1}
+    if not game_sha:
+        return 0
+    n = 0
+    for ext in (".zip", ".7z"):
+        arch = target_dir / f"{game.name}{ext}"
+        arow = index.lookup(arch)
+        if arow is None or arow["is_link"] or arow["missing"]:
+            continue                       # brak kandydata w indeksie → 0 I/O NAS
+        # Porównujemy tylko TORY DANYCH (bez .cue/.gdi/.toc — cue bywa inaczej
+        # wygenerowany, ale to nie zmienia tożsamości gry). Każdy tor danych
+        # archiwum MUSI być torem tej gry; brak sumy = nie ruszamy (bezpiecznik).
+        _desc = (".cue", ".gdi", ".toc")
+        mdata: set = set()
+        _bad = False
+        for m in index.members_of(arch):
+            if os.path.splitext(m["name"])[1].lower() in _desc:
+                continue
+            sh = (m["sha1"] or "").lower()
+            if not sh:
+                _bad = True
+                break
+            mdata.add(sh)
+        if _bad or not mdata or not mdata.issubset(game_sha):
+            continue                       # archiwum ma tor spoza tej gry
+        if needed_sha1 and (mdata & needed_sha1):
+            continue                       # jeszcze potrzebne gdzie indziej
+        # FIZYCZNY dowód (dopiero teraz staty NAS — tylko dla realnych dubli)
+        if not dry_run and not (chd.is_file() and arch.is_file()
+                                and not is_link(arch)):
+            continue
+        log(("(podgląd) " if dry_run else "")
+            + f"KASUJ redundantne archiwum (gra jest na CHD): {arch}")
+        if not dry_run:
+            try:
+                os.unlink(arch)
+                index.remove_path(arch)
+            except OSError as e:
+                log(f"  nie skasowano {arch}: {e}")
+                continue
+        n += 1
+    return n
 
 
 def purge_source_files(paths, index=None, log: LogCB = lambda m: None,
@@ -1297,14 +1672,21 @@ def purge_source_files(paths, index=None, log: LogCB = lambda m: None,
     if not paths or dry_run:
         return 0
     n = 0
+    parents: dict = {}
     for p in paths:
         try:
             os.unlink(p)
             if index is not None:
                 index.remove_path(p)
             n += 1
+            pd = Path(p).parent
+            parents[os.path.normcase(str(pd))] = pd
         except OSError:
             pass
+    # opustoszałe podkatalogi `<gra>\` po zabraniu wszystkich (także współdzielonych)
+    # torów — teraz mogą być już puste; rmdir cicho odpada gdy coś zostało.
+    for pd in parents.values():
+        _rmdir_if_empty(pd, log)
     if n:
         log(f"Skasowano {n} plików źródłowych po konwersji ze źródła "
             f"(współdzielone ścieżki były dostępne do końca).")
@@ -1312,7 +1694,7 @@ def purge_source_files(paths, index=None, log: LogCB = lambda m: None,
 
 
 def _try_disc_archive_chd(entry, game, archive, tools, index, log, st, detail,
-                          on_converted, final_by_profile) -> bool:
+                          on_converted, final_by_profile, pkey=None) -> bool:
     """Buduje CHD gry-płyty WPROST z jej archiwum (cue/gdi w środku), umieszcza
     finał w docelowym, wpisuje odcisk (game_profile) do indeksu. True gdy OK.
     Używane, gdy DAT-owy cue nie pasuje nazwą, ale cue jest w archiwum."""
@@ -1365,7 +1747,8 @@ def _try_disc_archive_chd(entry, game, archive, tools, index, log, st, detail,
             prof = game_profile(game.data_roms)
             if prof:
                 index.set_data_sha1(final, prof)
-                final_by_profile[prof] = final
+                if pkey is not None:
+                    final_by_profile[pkey] = final
         except OSError:
             pass
         if on_converted is not None:
@@ -1378,18 +1761,24 @@ def _try_disc_archive_chd(entry, game, archive, tools, index, log, st, detail,
 
 
 def _conv_scratch_for(roms, fmt, target_dir, scratch_override, tools, base, log):
-    """Katalog scratch dla konwersji (budżet lub per gra). None = brak miejsca."""
+    """Katalog scratch dla konwersji — PER GRA (RAM-dysk gdy gra się mieści),
+    a `scratch_override` (dysk z budżetu ×10) to tylko FALLBACK dla gier ZA
+    DUŻYCH na RAM. Dawniej override był zwracany OD RAZU → nawet mała gra szła na
+    dysk z budżetu (np. NAS Z:), bo ×10 największej gry (348 GB) nie mieści się na
+    RAM-dysku — a przecież pojedyncza gra i owszem. None = brak miejsca nigdzie."""
     from .scratch import pick_scratch_root
-    if scratch_override is not None:
-        return Path(scratch_override)
     try:
         need = int(sum(max(r.size, 0) for r in roms)
                    * (_FREE_FACTOR.get(fmt, 1.5) + 1.0))
     except Exception:
         need = 0
-    sc = pick_scratch_root(
-        need, prefer=str(target_dir), log=log,
-        fallback=getattr(tools.get("settings"), "scratch_dir", "") or None)
+    # RAM-dysk najpierw (pick_scratch_root ma go w priorytecie, gdy `need` się
+    # mieści); override i scratch_dir z ustawień to fallback dla dużych gier.
+    fb = (str(scratch_override) if scratch_override
+          else getattr(tools.get("settings"), "scratch_dir", "") or None)
+    sc = pick_scratch_root(need, prefer=str(target_dir), log=log, fallback=fb)
+    if sc is None and scratch_override is not None:
+        sc = Path(scratch_override)          # ostatnia deska: dysk z budżetu
     if sc is None:
         log(f"POMIJAM (ze źródła) {base}: brak miejsca (~{need/1024**3:.1f} GB)")
     return sc
@@ -1423,9 +1812,13 @@ def _conv_gather_phase(job, log):
     return gathered
 
 
-def _conv_build_phase(job, tools, log, detail):
+def _conv_build_phase(job, tools, log, detail, slot=None):
     """ETAP 2 (CPU): kompresja na RAM (zip/chd/rvz) + strażnik treści. Zwraca
-    ścieżkę zbudowanego pliku albo None (pominięcie — źródło zostaje)."""
+    ścieżkę zbudowanego pliku albo None (pominięcie — źródło zostaje).
+
+    Gdy potok działa RÓWNOLEGLE, każde zadanie ma swój numer slotu w
+    `job["_pipe_slot"]` — postęp idzie wtedy na WŁASNY pasek (`slot(idx,…)`),
+    nie na wspólny `detail`. Slot zwalniamy na końcu (chowamy pasek)."""
     fmt = job["fmt"]
     base = job["base"]
     game = job["game"]
@@ -1434,10 +1827,28 @@ def _conv_build_phase(job, tools, log, detail):
     ram_in = job["ram_in"]
     final = job["final"]
 
-    def _dtl(d, t, txt):
-        if detail is not None:
-            detail(d, t, txt)
+    _sidx = job.get("_pipe_slot") if isinstance(job, dict) else None
+    _use_slot = slot is not None and _sidx is not None
+    if _use_slot:
+        def _dtl(d, t, txt):
+            slot(_sidx, d, t, txt)
+    else:
+        def _dtl(d, t, txt):
+            if detail is not None:
+                detail(d, t, txt)
 
+    try:
+        return _conv_build_run(job, tools, log, _dtl, fmt, base, game,
+                               gathered, work, ram_in, final)
+    finally:
+        if _use_slot:
+            slot(_sidx, -1, 0, "")            # zwolnij pasek slotu
+
+
+def _conv_build_run(job, tools, log, _dtl, fmt, base, game, gathered, work,
+                    ram_in, final):
+    """Właściwa kompresja (patrz _conv_build_phase); `_dtl` kieruje postęp na
+    slot równoległy albo wspólny pasek `detail`."""
     tmp_out = work / final.name
     if fmt == "zip":
         _dtl(0, 0, f"pakowanie ZIP: {base}")
@@ -1517,12 +1928,19 @@ def _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
     final = job["final"]
     if index is not None and sums and sums[2]:
         try:
-            index.record_file(final, sums[0], sums[1], sums[2])
             if job["fmt"] == "chd":
+                index.record_file(final, sums[0], sums[1], sums[2])
                 from .datfile import game_profile
                 prof = game_profile(job["game"].data_roms)
                 if prof:
                     index.set_data_sha1(final, prof)
+            elif str(final).lower().endswith((".zip", ".7z")):
+                # ARCHIWUM: zaindeksuj plik ORAZ jego członków, inaczej NASTĘPNY
+                # skan wypakowywałby świeżo spakowane archiwum, by policzyć
+                # członków (wolny skan „po fix", choć plik stworzył sam program).
+                index.reindex_archive(final, full=True)
+            else:
+                index.record_file(final, sums[0], sums[1], sums[2])  # RVZ itp.
         except OSError:
             pass
     if on_converted is not None:

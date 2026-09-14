@@ -318,7 +318,14 @@ def apply_substitution(
     if not variant_file.exists():
         log(f"TŁUMACZENIE: brak pliku wariantu {variant_file} — pomijam")
         return False
-    # 1) zabezpiecz oryginał / usuń stary link
+    # make_links=False → NIE ruszaj oryginału. Dawniej sprawdzaliśmy to DOPIERO
+    # po przeniesieniu oryginału do preserve → kanoniczna ścieżka zostawała
+    # PUSTA (link i tak nie powstawał). Fail-fast, zanim cokolwiek ruszymy.
+    if not make_links and not dry_run:
+        log("  linki wyłączone — podmiana pominięta (oryginał nietknięty)")
+        return False
+    # 1) zabezpiecz oryginał / usuń stary link (z możliwością COFNIĘCIA)
+    _rollback = None                 # ("move"|"copy", dest) — jak przywrócić
     if os.path.lexists(canonical):
         if is_link(canonical):
             log(f"  usuwam poprzedni link: {canonical.name}")
@@ -336,6 +343,7 @@ def apply_substitution(
                             index.remove_path(canonical)
                         except Exception:
                             pass
+                    _rollback = ("copy", dest)   # odtwórz z zachowanej kopii
                 else:
                     os.replace(canonical, dest)
                     if index is not None:
@@ -343,20 +351,35 @@ def apply_substitution(
                             index.rename(canonical, dest)
                         except Exception:
                             pass
+                    _rollback = ("move", dest)
     # 2) symlink kanoniczny → wariant
     log(f"TŁUMACZENIE: {canonical.name} -> {variant_file}")
     if dry_run:
         return True
-    if not make_links:
-        log("  linki wyłączone — podmiana pominięta (nic nie kopiuję)")
-        return False
     try:
         create_link(canonical, variant_file, is_dir=False)
-    except LinkPrivilegeError as e:
-        log(f"  UWAGA: {e} — uruchom jako administrator.")
-        return False
-    except OSError as e:
-        log(f"  BŁĄD symlinku: {e}")
+    except (LinkPrivilegeError, OSError) as e:
+        if isinstance(e, LinkPrivilegeError):
+            log(f"  UWAGA: {e} — uruchom jako administrator.")
+        else:
+            log(f"  BŁĄD symlinku: {e}")
+        # ROLLBACK: nie zostawiaj kanonicznej ścieżki PUSTEJ — przywróć oryginał.
+        if _rollback is not None:
+            kind, dsrc = _rollback
+            try:
+                if kind == "move":
+                    os.replace(dsrc, canonical)
+                    if index is not None:
+                        try:
+                            index.rename(dsrc, canonical)
+                        except Exception:
+                            pass
+                else:                            # "copy" — oryginał był duplikatem
+                    import shutil as _sh
+                    _sh.copy2(dsrc, canonical)
+                log(f"  przywrócono oryginał: {canonical.name}")
+            except OSError as re:
+                log(f"  NIE udało się przywrócić oryginału {canonical}: {re}")
         return False
     if index is not None:
         try:

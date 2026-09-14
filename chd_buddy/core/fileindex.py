@@ -62,7 +62,12 @@ CREATE TABLE IF NOT EXISTS files (
     -- CHD: czy KONTENER zgadza się z medium gry w DAT (createcd vs createdvd).
     -- -1 = niesprawdzony, 0 = zgodny, 1 = NIEZGODNY (np. gra DVD spakowana jako
     -- CD) => „do naprawy" (skan sam to wykrywa, nie tylko po treści).
-    bad_container INTEGER NOT NULL DEFAULT -1
+    bad_container INTEGER NOT NULL DEFAULT -1,
+    -- ZIP: czy metoda kompresji jest NIEZGODNA z emulatorami (inne niż store/
+    -- deflate — np. ZSTD/LZMA/bzip2). -1 = niesprawdzony, 0 = OK, 1 = ZŁA metoda
+    -- => „do naprawy" (przepakowanie na deflate). Skan zapisuje to z centralnego
+    -- katalogu ZIP-a (tanio), żeby naprawa NIE otwierała wszystkich zipów.
+    bad_zip_method INTEGER NOT NULL DEFAULT -1
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
@@ -96,10 +101,14 @@ def default_db_path() -> Path:
     return app_base_dir() / INDEX_DB_FILENAME
 
 
-def count_files(root: Path, cancel=None) -> int:
+def count_files(root: Path, cancel=None, skip_dirs: Optional[set] = None) -> int:
     """Szybko liczy pliki pod `root` (sam scandir, bez stat/hashowania) — daje
     MIANOWNIK do paska „plik X z Y". Pomija artefakty tymczasowe i NIE wchodzi
-    w dowiązane katalogi (jak `_walk`)."""
+    w dowiązane katalogi (jak `_walk`).
+
+    `skip_dirs` — normcase-owe ścieżki poddrzew liczonych OSOBNO (nie schodzimy
+    w nie), by mianownik zgadzał się z faktycznym zakresem skanu (ten sam wyjątek
+    co w `scan`), inaczej pasek nie dobija do 100%."""
     n = 0
     stack = [Path(root)]
     while stack:
@@ -124,6 +133,8 @@ def count_files(root: Path, cancel=None) -> int:
                             continue          # link do katalogu — nie wchodzimy
                     except OSError:
                         continue
+                    if skip_dirs and os.path.normcase(e.path) in skip_dirs:
+                        continue              # liczone osobno (Faza 1)
                     stack.append(Path(e.path))
                 else:
                     n += 1
@@ -191,12 +202,19 @@ def _is_temp_artifact(name: str, is_dir: bool) -> bool:
             or any(m in low for m in _TEMP_FILE_MARKERS))
 
 
-def _walk(root: Path) -> Iterator[tuple[Path, os.stat_result, bool]]:
+def _walk(root: Path, skip_dirs: Optional[set] = None
+          ) -> Iterator[tuple[Path, os.stat_result, bool]]:
     """Rekurencyjny scandir; yielduje (ścieżka, lstat, czy_link).
 
     W linkowane katalogi NIE wchodzi (yielduje je jako linki) — inaczej
     zdeduplikowana kolekcja byłaby liczona wielokrotnie. Katalogi i pliki
     tymczasowe kombajnu są pomijane w całości.
+
+    `skip_dirs` — zbiór ścieżek (normcase, absolutne) katalogów, w które NIE
+    schodzimy (np. już przeskanowane w tej samej rundzie z innego korzenia).
+    Sam pokrywający korzeń zostaje przeskanowany, tylko te podkatalogi pomijamy
+    — bez utraty pokrycia reszty drzewa (ważne: pominięte pliki NIE są liczone
+    jako widziane, więc nie stają się „duchami").
     """
     stack = [root]
     while stack:
@@ -217,6 +235,8 @@ def _walk(root: Path) -> Iterator[tuple[Path, os.stat_result, bool]]:
                 if e.is_dir(follow_symlinks=False):
                     if link:
                         yield Path(e.path), st, True
+                    elif skip_dirs and os.path.normcase(e.path) in skip_dirs:
+                        continue                   # już przeskanowany osobno
                     else:
                         stack.append(Path(e.path))
                 else:
@@ -277,6 +297,12 @@ class FileIndex:
         try:
             self._db.execute(
                 "ALTER TABLE files ADD COLUMN bad_container "
+                "INTEGER NOT NULL DEFAULT -1")
+        except sqlite3.OperationalError:
+            pass                       # kolumna już jest
+        try:
+            self._db.execute(
+                "ALTER TABLE files ADD COLUMN bad_zip_method "
                 "INTEGER NOT NULL DEFAULT -1")
         except sqlite3.OperationalError:
             pass                       # kolumna już jest
@@ -360,6 +386,7 @@ class FileIndex:
         log: Optional[Callable[[str], None]] = None,
         cancel=None,
         workers: int = 1,
+        skip_dirs: Optional[Iterable[Path | str]] = None,
     ) -> ScanStats:
         """Skanuje drzewo `root` przyrostowo do bazy.
 
@@ -390,6 +417,11 @@ class FileIndex:
         root = Path(os.path.abspath(root))
         if not root.is_dir():
             raise NotADirectoryError(f"'{root}' nie jest katalogiem")
+        # katalogi już przeskanowane osobno w tej rundzie (np. priorytetowa
+        # platforma leżąca POD tym korzeniem): NIE schodzimy w nie ponownie i NIE
+        # oznaczamy ich plików jako brakujące (obsłużone przy własnym skanie).
+        _skip_norm = {os.path.normcase(os.path.abspath(str(d)))
+                      for d in (skip_dirs or [])}
         stats = ScanStats()
         now = datetime.now().isoformat(timespec="seconds")
         cur = self._db.cursor()
@@ -446,7 +478,7 @@ class FileIndex:
             return delta
 
         cancelled = False
-        for path, st, link in _walk(root):
+        for path, st, link in _walk(root, _skip_norm or None):
             if cancel is not None and cancel.is_set():
                 cancelled = True
                 break                      # to, co policzone, zostaje w bazie
@@ -524,6 +556,15 @@ class FileIndex:
                             cur.execute("DELETE FROM members WHERE archive=?", (key,))
                             pending += self._index_members(cur, key, path, log,
                                                            full=True)
+                    # NIE otwieramy tu ZIP-a, by wykryć metodę kompresji: na NAS
+                    # to SZEREGOWE otwarcie centralnego katalogu KAŻDEGO zipa =
+                    # jedna runda SMB na plik (sieć/CPU ~0%, sama latencja) →
+                    # skan przyrostowy „stoi" przy dużej kolekcji (regresja 0.6.16).
+                    # `bad_zip_method` ustawia `_index_members` przy indeksowaniu
+                    # członków (nowe/zmienione zipy i upgrade bez SHA-1 — wyżej),
+                    # więc flaga i tak powstaje, gdy zip jest OTWIERANY z innego
+                    # powodu. Zipy tworzone przez program są deflate; niezgodne
+                    # (zstd/lzma) z zewnątrz przychodzą jako NOWE → złapane.
                 else:
                     # PLIK PRZENIESIONY (np. ręcznie w Eksploratorze)?
                     # Wiedza podąża za treścią: ta sama nazwa + rozmiar +
@@ -581,7 +622,7 @@ class FileIndex:
         if ex is not None:
             pending += _drain(keep=0)
             ex.shutdown(wait=True)
-        stats.missing = self._mark_missing(root, seen)
+        stats.missing = self._mark_missing(root, seen, _skip_norm)
         self._db.commit()
         return stats
 
@@ -705,6 +746,7 @@ class FileIndex:
         """
         # (name -> (size, crc, md5, sha1)); md5/sha1 puste przy skanie szybkim
         meta: dict[str, tuple[int, str, str, str]] = {}
+        bad_method = 0        # ZIP: 1 gdy któryś człon używa metody != store/deflate
         try:
             if path.suffix.lower() == ".7z":
                 try:
@@ -727,6 +769,10 @@ class FileIndex:
                     for i in zf.infolist():
                         if i.is_dir():
                             continue
+                        # metoda kompresji z centralnego katalogu (bez dekompresji)
+                        # store=0, deflate=8 → OK; reszta (zstd=93/lzma=14/…) ZŁA
+                        if i.compress_type not in (0, 8):
+                            bad_method = 1
                         meta[i.filename] = (i.file_size,
                                             f"{i.CRC & 0xFFFFFFFF:08x}", "", "")
                     if full:
@@ -742,7 +788,26 @@ class FileIndex:
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(archive, name) DO UPDATE SET size=excluded.size, "
             "  crc32=excluded.crc32, md5=excluded.md5, sha1=excluded.sha1", rows)
+        # ZAPISZ metodę tylko dla .zip (dla .7z pojęcie nie ma sensu → 0)
+        if path.suffix.lower() == ".zip":
+            cur.execute("UPDATE files SET bad_zip_method=? WHERE path=?",
+                        (bad_method, key))
         return len(rows)
+
+    @staticmethod
+    def _zip_method_flag(path) -> int:
+        """1 gdy ZIP używa metody != store/deflate (niezgodne z emulatorami),
+        0 gdy OK, -1 gdy nieczytelne. TANIO — tylko centralny katalog (bez
+        dekompresji, jeden odczyt)."""
+        import zipfile
+        try:
+            with zipfile.ZipFile(path) as zf:
+                for i in zf.infolist():
+                    if not i.is_dir() and i.compress_type not in (0, 8):
+                        return 1
+            return 0
+        except Exception:
+            return -1
 
     @staticmethod
     def _hash_zip_members(zf, meta: dict, log, path: Path) -> None:
@@ -800,19 +865,36 @@ class FileIndex:
                 log(f"CHD prober: {path.name}: {e}")
             return ""
 
-    def _mark_missing(self, root: Path, seen: Iterable[str]) -> int:
-        """Oznacza missing=1 wpisy pod `root`, których skan nie zobaczył."""
+    def _mark_missing(self, root: Path, seen: Iterable[str],
+                      skip_norm: Optional[set] = None) -> int:
+        """Oznacza missing=1 wpisy pod `root`, których skan nie zobaczył.
+
+        `skip_norm` — normcase-owe ścieżki poddrzew przeskanowanych OSOBNO w tej
+        rundzie: ich wpisów NIE oznaczamy jako brakujące (skan gołego rodzica w
+        nie nie schodził, więc ich plików nie ma w `seen` — bez tego wyjątku
+        zostałyby błędnie zdegradowane do „brak"). Porównanie po normcase, by
+        różnica wielkości liter na Windows nie ominęła wyjątku."""
         prefix = str(root).rstrip("\\/") + os.sep
         cur = self._db.cursor()
         cur.execute("CREATE TEMP TABLE IF NOT EXISTS _seen(path TEXT PRIMARY KEY)")
         cur.execute("DELETE FROM _seen")
         cur.executemany("INSERT OR IGNORE INTO _seen(path) VALUES (?)",
                         ((s,) for s in seen))
-        cur.execute(
-            "UPDATE files SET missing=1 WHERE missing=0 AND substr(path, 1, ?) = ? "
-            "AND path NOT IN (SELECT path FROM _seen)",
-            (len(prefix), prefix),
-        )
+        sql = ("UPDATE files SET missing=1 WHERE missing=0 "
+               "AND substr(path, 1, ?) = ? "
+               "AND path NOT IN (SELECT path FROM _seen)")
+        params: list = [len(prefix), prefix]
+        skips = [str(s).rstrip("\\/") + os.sep for s in (skip_norm or set())]
+        if skips:
+            try:
+                self._db.create_function("ncase", 1, os.path.normcase,
+                                         deterministic=True)
+            except TypeError:                      # starszy Python bez kw-argu
+                self._db.create_function("ncase", 1, os.path.normcase)
+            for sp in skips:
+                sql += " AND ncase(substr(path, 1, ?)) <> ?"
+                params += [len(sp), sp]
+        cur.execute(sql, params)
         return cur.rowcount
 
     # --- zapytania ------------------------------------------------------------
@@ -820,6 +902,12 @@ class FileIndex:
     def lookup(self, path: Path | str) -> Optional[sqlite3.Row]:
         key = str(Path(os.path.abspath(path)))
         return self._db.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone()
+
+    def members_of(self, archive: Path | str) -> list[sqlite3.Row]:
+        """Członkowie (pliki wewnątrz) danego archiwum z indeksu (name, sha1…)."""
+        key = str(Path(os.path.abspath(archive)))
+        return list(self._db.execute(
+            "SELECT * FROM members WHERE archive=?", (key,)).fetchall())
 
     def build_match_cache(self) -> None:
         """Wczytuje CAŁY indeks (obecne pliki + członków archiwów) do słowników
@@ -994,11 +1082,23 @@ class FileIndex:
         return self._db.execute(q, (len(prefix), prefix)).fetchall()
 
     def rename(self, old: Path | str, new: Path | str) -> None:
-        """Aktualizuje ścieżkę wpisu po przeniesieniu/zmianie nazwy pliku."""
+        """Aktualizuje ścieżkę wpisu po przeniesieniu/zmianie nazwy pliku.
+
+        WAŻNE: przenosi też CZŁONKÓW archiwum (members.archive), inaczej po
+        przeniesieniu ZIP-a z ToSort do kolekcji indeks nie miałby dla nowej
+        ścieżki żadnych członków → NASTĘPNY skan wypakowywałby i hashował całą
+        zawartość od nowa (drogi „wolny skan po fix", choć plik ruszył sam
+        program). mtime pliku po `os.replace`/`copystat` jest zachowany, więc
+        wpis pliku pozostaje AKTUALNY (skan uzna go za świeży)."""
         old_key = str(Path(os.path.abspath(old)))
         new_key = str(Path(os.path.abspath(new)))
         self._db.execute("DELETE FROM files WHERE path=?", (new_key,))
         self._db.execute("UPDATE files SET path=? WHERE path=?", (new_key, old_key))
+        # osieroceni członkowie pod nową ścieżką (gdyby coś było) → precz, potem
+        # przenieś członków starego archiwum na nową ścieżkę
+        self._db.execute("DELETE FROM members WHERE archive=?", (new_key,))
+        self._db.execute("UPDATE members SET archive=? WHERE archive=?",
+                         (new_key, old_key))
         self._db.commit()
 
     def set_deep_fail(self, path: Path | str) -> None:
@@ -1026,6 +1126,14 @@ class FileIndex:
         -1 niesprawdzony, 0 zgodny, 1 NIEZGODNY (np. gra DVD zrobiona jako CD)."""
         key = str(Path(os.path.abspath(path)))
         self._db.execute("UPDATE files SET bad_container=? WHERE path=?",
+                         (int(bad), key))
+        self._db.commit()
+
+    def set_bad_zip_method(self, path: Path | str, bad: int) -> None:
+        """Zapisuje wynik sprawdzenia METODY kompresji ZIP:
+        -1 niesprawdzony, 0 OK (store/deflate), 1 ZŁA (zstd/lzma/… — do repacku)."""
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET bad_zip_method=? WHERE path=?",
                          (int(bad), key))
         self._db.commit()
 
