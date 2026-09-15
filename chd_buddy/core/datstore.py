@@ -23,6 +23,7 @@ Priorytet w obrębie platformy (od najważniejszego):
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -57,6 +58,9 @@ class DatEntry:
     # jego plików, więc muszą mieć ten sam kontener).
     store_format: str = "keep"
     games: List[DatGame] = field(default_factory=list, repr=False)
+    # Metadane z sidecar-JSON RomVaulta (opcjonalne — nie każdy DAT je ma):
+    # group / system / version / datName / datROMsSize. Puste, gdy brak.
+    meta: dict = field(default_factory=dict, repr=False)
 
     @property
     def rom_count(self) -> int:
@@ -73,6 +77,28 @@ def _safe_dirname(name: str) -> str:
     bad = '<>:"/\\|?*'
     out = "".join((c if c not in bad else "-") for c in name).strip(" .")
     return out or "unnamed"
+
+
+def _sidecar_meta(dat: Path, cache: dict) -> dict:
+    """Metadane z sidecar-JSON RomVaulta dla danego `.dat` (dopasowanie po polu
+    `datName`). NIE każdy DAT ma JSON — wtedy zwraca {}. JSON-y z katalogu są
+    czytane RAZ (cache per katalog)."""
+    d = dat.parent
+    key = str(d)
+    if key not in cache:
+        by_name: dict = {}
+        try:
+            for j in d.glob("*.json"):
+                try:
+                    data = json.loads(j.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(data, dict) and data.get("datName"):
+                    by_name[data["datName"]] = data
+        except OSError:
+            pass
+        cache[key] = by_name
+    return cache[key].get(dat.name, {})
 
 
 PRIORITY_FILENAME = "_priorytet.txt"
@@ -204,22 +230,39 @@ class DatStore:
             cache = DatParseCache()
 
         entries: list[DatEntry] = []
+        skipped = 0
+        _json_cache: dict = {}                      # katalog -> {datName: meta}
         for i, dat in enumerate(files):
             if on_progress:
                 on_progress(i, len(files), dat.name)
-            if cache is not None:
-                had = cache.get(dat) is not None
-                raw_name, games = cache.parse(dat)     # z cache albo parsuje
-                cached += 1 if had else 0
-                reparsed += 0 if had else 1
-            else:
-                raw_name = parse_dat_header(dat).get("name") or dat.stem
-                games = list(parse_dat(dat))
+            # Uszkodzony/pusty/nie-XML DAT NIE może wywalić całego skanu —
+            # pomijamy go z komunikatem, reszta kolekcji wczytuje się normalnie.
+            try:
+                if cache is not None:
+                    had = cache.get(dat) is not None
+                    raw_name, games = cache.parse(dat)  # z cache albo parsuje
+                    cached += 1 if had else 0
+                    reparsed += 0 if had else 1
+                else:
+                    raw_name = parse_dat_header(dat).get("name") or dat.stem
+                    games = list(parse_dat(dat))
+            except Exception as e:                      # noqa: BLE001
+                skipped += 1
+                if log:
+                    log(f"POMIJAM uszkodzony DAT (nie sparsowano): {dat} — "
+                        f"{type(e).__name__}: {e}")
+                continue
+            if not games:                               # pusty / nie-DAT / śmieci
+                skipped += 1
+                if log:
+                    log(f"POMIJAM DAT bez gier (pusty/nieczytelny): {dat}")
+                continue
             name = _safe_dirname(raw_name)
             rel = dat.parent.relative_to(self.dat_root)
             e = DatEntry(dat_path=dat, name=name,
                          target_dir=self.rom_root / rel / name)
             e.games = games                            # już sparsowane
+            e.meta = _sidecar_meta(dat, _json_cache)   # opcjonalny JSON RomVaulta
             entries.append(e)
 
         if cache is not None:
@@ -228,7 +271,18 @@ class DatStore:
             if log:
                 log(f"Cache DAT-ów: z cache {cached}, sparsowano od nowa "
                     f"{reparsed} (plik: {cache.path}).")
+        if skipped and log:
+            log(f"UWAGA: pominięto {skipped} uszkodzonych DAT-ów "
+                f"(puste/nie-XML) — patrz komunikaty wyżej.")
 
+        return self.sort_entries(entries)
+
+    def sort_entries(self, entries: list) -> list:
+        """Porządek przetwarzania DAT-ów (= priorytet rodzic → dzieci), w miejscu.
+
+        Kolejność katalogów z drzewa (_kolejnosc.json) → reguła parent_priority
+        → platforma → ręczny _priorytet.txt → większy DAT. Wołane przez
+        `discover` i przez GUI po przesunięciu katalogu (bez ponownego skanu)."""
         manual = self._manual_priority()
 
         def _manual_rank(e: DatEntry) -> int:
@@ -241,10 +295,22 @@ class DatStore:
 
         # reguła parent_priority (folder oznaczony „wszystkie rodzicami")
         from .dirrules import DirRules
+        from .folder_order import folder_rank, load_order
         rules = DirRules(self.dat_root)
+        order = load_order(self.dat_root)
 
         def _parent_rank(e: DatEntry) -> int:
             return 0 if rules.for_entry(e).get("parent_priority") else 1
+
+        def _folder_is_parent(path: str) -> bool:
+            return bool(rules.for_key(path).get("parent_priority"))
+
+        def _folder_rank(e: DatEntry) -> tuple:
+            # KOLEJNOŚĆ KATALOGÓW z drzewa (_kolejnosc.json): katalog wyżej =
+            # pierwszeństwo nad niższymi (ROMS → No-intro → 1G1R). Bez pliku
+            # zwraca stałą krotkę dla rodzeństwa — wtedy decyduje parent_rank.
+            return folder_rank(e.dat_path, self.dat_root, order,
+                               _folder_is_parent) if order else ()
 
         # RODZICE ZAWSZE PIERWSI — GLOBALNIE, nie tylko w obrębie platformy.
         # Fizyczną kopię pliku dostaje DAT przetworzony jako pierwszy, więc
@@ -256,7 +322,7 @@ class DatStore:
         # child→parent) → ręczny _priorytet.txt → większy DAT. W obrębie
         # platformy rodzic nadal wypada przed dziećmi (ranga 0 < 1), więc
         # grupowanie i dziedziczenie formatu działają jak dotąd.
-        entries.sort(key=lambda e: (_parent_rank(e),
+        entries.sort(key=lambda e: (_folder_rank(e), _parent_rank(e),
                                     effective_platform_key(e, rules),
                                     _manual_rank(e), -e.rom_count,
                                     str(e.target_dir).lower()))

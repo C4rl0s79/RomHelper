@@ -66,39 +66,80 @@ def remove_link(path: Path) -> bool:
     return True
 
 
-def remove_broken_links(roots, index=None, log: Optional[LogCB] = None) -> int:
+def remove_broken_links(roots, index=None, log: Optional[LogCB] = None,
+                        cancel=None) -> int:
     """Usuwa ZERWANE symlinki (cel nie istnieje) w podanych korzeniach.
 
     Powstają, gdy plik-cel zostaje przeniesiony/skonwertowany/skasowany po
     utworzeniu linku (np. luźna ścieżka rodzica zjedzona przez konwersję do
     CHD). Zerwany link nic nie wskazuje i psuje konwersje/skróty — kasujemy
-    go; poprawny link zostanie odtworzony przy naprawie, gdy cel wróci."""
+    go; poprawny link zostanie odtworzony przy naprawie, gdy cel wróci.
+
+    Z INDEKSEM: sprawdzamy TYLKO znane linki (`is_link`) — `exists()` woła się
+    wyłącznie na nich (garść), zamiast `os.walk` + stat na KAŻDYM pliku (na NAS
+    to 100k+ zapytań = minuty ciszy w „Start…"). `cancel` przerywa responsywnie.
+    Bez indeksu: fallback na os.walk (też z cancel)."""
     removed = 0
+    checked = 0
+
+    def _drop(p: Path) -> bool:
+        nonlocal removed
+        try:
+            remove_link(p)
+        except OSError as e:
+            if log:
+                log(f"nie usunięto zerwanego linku {p}: {e}")
+            return False
+        if index is not None:
+            try:
+                index.remove_path(p)
+            except OSError:
+                pass
+        removed += 1
+        if log:
+            log(f"USUNIĘTO zerwany link: {p}")
+        return True
+
+    if index is not None:
+        seen: set = set()
+        for root in roots:
+            if not root or not Path(root).is_dir():
+                continue
+            try:
+                rows = list(index.all_under(root, physical_only=False))
+            except Exception:
+                rows = []
+            for row in rows:
+                if cancel is not None and cancel.is_set():
+                    return removed
+                try:
+                    if not row["is_link"]:
+                        continue
+                except (KeyError, IndexError):
+                    continue
+                p = Path(row["path"])
+                k = os.path.normcase(str(p))
+                if k in seen:
+                    continue
+                seen.add(k)
+                checked += 1
+                if log and checked % 2000 == 0:
+                    log(f"  …sprawdzono {checked} linków (zerwanych: {removed})")
+                if not p.exists():          # podąża za linkiem → False gdy zerwany
+                    _drop(p)
+        return removed
+
+    # BEZ indeksu: pełny os.walk (rzadka ścieżka), też z cancel
     for root in roots:
-        if not root:
+        if not root or not Path(root).is_dir():
             continue
-        r = Path(root)
-        if not r.is_dir():
-            continue
-        for dirpath, _dn, filenames in os.walk(r):
+        for dirpath, _dn, filenames in os.walk(root):
+            if cancel is not None and cancel.is_set():
+                return removed
             for name in filenames:
                 p = Path(dirpath) / name
-                # exists() podąża za linkiem → False gdy zerwany
                 if is_link(p) and not p.exists():
-                    try:
-                        remove_link(p)
-                    except OSError as e:
-                        if log:
-                            log(f"nie usunięto zerwanego linku {p}: {e}")
-                        continue
-                    if index is not None:
-                        try:
-                            index.remove_path(p)
-                        except OSError:
-                            pass
-                    removed += 1
-                    if log:
-                        log(f"USUNIĘTO zerwany link: {p}")
+                    _drop(p)
     return removed
 
 

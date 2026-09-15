@@ -50,6 +50,10 @@ DEFAULT_RULES: dict[str, Any] = {
     "subdir_per_game": True,
     # Podmieniaj wersje (Japan) na fanowskie tłumaczenia (T-En) z innych DAT-ów.
     "prefer_translations": False,
+    # ROLA DAT-u: "collection" (zwykły cel: parent/child) albo "translations"
+    # (pula fanowskich tłumaczeń — nie cel podstawowy, dostarcza wariantów do
+    # podmiany innych DAT-ów; patrz core/translations.py).
+    "role": "collection",
     # Format przechowywania (patrz FORMATS).
     "format": "keep",
     # Konwencja nazw katalogów per system (patrz NAMINGS).
@@ -146,7 +150,7 @@ def suggest_format(system_short: str) -> str:
 
 
 # Reguły tekstowe (reszta jest boolowska).
-_STR_RULES = {"target", "format", "naming", "rom_root", "platform"}
+_STR_RULES = {"target", "format", "naming", "rom_root", "platform", "role"}
 
 
 def _coerce(name: str, value):
@@ -171,15 +175,46 @@ def folder_name(entry, naming: str) -> str:
     return entry.name          # domyślnie nazwa z <header><name>
 
 
+# Jednoznaczne markery PŁYTY w nazwach ROM-ów DAT-a (obraz/opis ścieżek).
+# `.bin`/`.img` celowo POMINIĘTE — bywają i w kartridżach, i w torach CD.
+_DISC_MARKERS = {"iso", "cue", "gdi", "toc", "chd"}
+
+
+def _dat_is_cartridge(entry) -> bool:
+    """True, gdy DAT NIE zawiera plików PŁYTOWYCH (cue/iso/gdi/toc/chd) — czyli
+    to kartridż/HuCard (np. PC Engine `.pce`), mimo że system bywa sklasyfikowany
+    jako „płytowy". PC Engine ma OBA media (HuCard i CD) pod tym samym skrótem,
+    więc o formacie musi decydować TREŚĆ DAT-u, nie sam system. Wtedy CHD nie ma
+    sensu (goły ROM bez cue → i tak pomijany) → ZIP."""
+    try:
+        games = entry.load().games
+    except Exception:
+        return False
+    checked = 0
+    for g in games:
+        for r in g.roms:
+            name = getattr(r, "name", "") or ""
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext in _DISC_MARKERS:
+                return False          # jest płyta → nie kartridż
+        checked += 1
+        if checked >= 30:             # próbka wystarczy (spójny DAT)
+            break
+    return checked > 0
+
+
 def resolve_format(fmt: str, entry) -> str:
-    """Rozwiązuje format 'auto' na konkret wg typu systemu."""
+    """Rozwiązuje format 'auto' na konkret wg typu systemu (i TREŚCI DAT-u dla
+    systemów dwumedialnych jak PC Engine)."""
     if fmt != "auto":
         return fmt
     short = _system_short(entry)
     if short in ("GCN", "WII"):
         return "rvz"
     if short in DISC_SYSTEMS:
-        return "chd"
+        # system „płytowy", ale DAT może być kartridżowy (PC Engine HuCard) —
+        # sprawdź treść: brak plików płytowych → ZIP, nie CHD.
+        return "zip" if _dat_is_cartridge(entry) else "chd"
     return "zip"               # kartridż → ZIP
 
 
@@ -219,6 +254,20 @@ class DirRules:
         """Efektywne reguły dla DAT-a (DatEntry) — kaskada ogólne→szczegółowe."""
         eff = dict(DEFAULT_RULES)
         for k in self._entry_keys(entry):
+            rule = self.raw.get(k)
+            if rule:
+                for name in DEFAULT_RULES:
+                    if name in rule:
+                        eff[name] = _coerce(name, rule[name])
+        return eff
+
+    def for_key(self, folder_path: str) -> dict[str, Any]:
+        """Efektywne reguły KATALOGU („ROMS", „ROMS/Sony") — kaskada global →
+        kolejne poziomy katalogów (bez reguł pojedynczych DAT-ów)."""
+        eff = dict(DEFAULT_RULES)
+        parts = [x for x in str(folder_path).replace("\\", "/").split("/") if x]
+        keys = ["*"] + ["/".join(parts[:i]).lower() for i in range(1, len(parts) + 1)]
+        for k in keys:
             rule = self.raw.get(k)
             if rule:
                 for name in DEFAULT_RULES:
@@ -293,6 +342,76 @@ def scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list[str]:
     return out
 
 
+def platform_scan_dirs(entries, rules: DirRules, rom_root) -> list[str]:
+    """Istniejące katalogi-kandydaci dla platform danych `entries`, w OBU
+    znanych konwencjach nazw, cel SKONFIGUROWANY pierwszy:
+
+      1) `entry.target_dir` — realny cel z reguł (naming/target),
+      2) Redump: ``<rom_root>/<nazwa z nagłówka DAT-a>`` (płasko),
+      3) EmulationStation: ``<rom_root>/<es-folder>`` (np. ps2, psx).
+
+    Do PRIORYTETOWEGO skanu wybranej platformy: skanujemy te katalogi jako
+    pierwsze, żeby wszystko lądowało w wybranym katalogu i — gdy platforma
+    wyjdzie kompletna — nie trzeba szukać jej gdzie indziej. Kolejność =
+    preferencja: gdy nie ma katalogu wybranej konwencji (np. „PS2"), ale jest
+    drugiej („Sony - PlayStation 2"), użyty zostanie ten istniejący.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(p) -> None:
+        if not p:
+            return
+        path = Path(p)
+        key = os.path.normcase(str(path))
+        if key in seen or not path.is_dir():
+            return
+        seen.add(key)
+        out.append(str(path))
+
+    for e in entries:
+        eff = rules.for_entry(e)
+        base = Path(eff["rom_root"]) if eff.get("rom_root") else Path(rom_root)
+        add(getattr(e, "target_dir", None))       # skonfigurowany cel (priorytet)
+        add(base / folder_name(e, "dat"))          # Redump: <nazwa DAT-a> płasko
+        add(base / folder_name(e, "es"))           # EmulationStation: es-folder
+    return out
+
+
+def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list[str]:
+    """Katalogi do skanu = katalogi WŁĄCZONYCH platform (obie konwencje,
+    istniejące) + ToSort + nadpisania rom_root. NIE cały rom_root.
+
+    Skanujemy tylko platformy, które użytkownik WŁĄCZYŁ (checkbox), więc pliki
+    innych platform (np. RVZ GameCube/Wii przy wybranym PS1/PS2) nie są ruszane.
+    Katalogi platform rozwiązuje `platform_scan_dirs` (target z reguł + Redump +
+    EmulationStation) — dawny „skan całego rom_root" był potrzebny tylko dlatego,
+    że skan używał wyłącznie nieistniejącego target=<nazwa DAT-a>; teraz realne
+    katalogi (ps2/psx itd.) są znajdowane wprost, bez przemiatania obcych.
+    """
+    out: list[str] = list(platform_scan_dirs(entries, rules, rom_root))
+    seen: set[str] = {os.path.normcase(p) for p in out}
+
+    def add(p) -> None:
+        if not p:
+            return
+        path = Path(p)
+        key = os.path.normcase(str(path))
+        if key in seen or not path.is_dir():
+            return
+        seen.add(key)
+        out.append(str(path))
+
+    for e in entries:                       # własne rom_root-y dzieci (inny dysk)
+        add(rules.for_entry(e).get("rom_root"))
+    if isinstance(tosort, (list, tuple, set)):
+        for t in tosort:
+            add(t)
+    else:
+        add(tosort)
+    return out
+
+
 def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
     """Wylicza katalog docelowy każdego DAT-a z reguł (kaskada global→
     katalog→DAT):
@@ -300,8 +419,11 @@ def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
     - `rom_root` (rule) nadpisuje bazę (np. inny dysk dla dzieci);
     - `target` (rule) = pełne przekierowanie względem bazy;
     - inaczej: baza / <katalog DAT-a względem dat_root> / <nazwa systemu>,
-      gdzie nazwa wg `naming` (dat/es). Struktura katalogu DAT-a (1G1R/ROMS)
-      rozdziela rodzica od dzieci; przy własnym rom_root rozdziela root.
+      gdzie nazwa wg `naming` (dat/es). Struktura DatRoot ODZWIERCIEDLA się
+      w rom_root dla OBU konwencji: `DatRoot/ROMS/x.dat` z naming=es →
+      `<rom_root>/ROMS/<es-folder>` (np. Z:/ROMS/ROMS/atari2600),
+      `DatRoot/1G1R/x.dat` → `<rom_root>/1G1R/<nazwa>`;
+    - RĘCZNIE wybrany `rom_root` (reguła) = płasko: `<rom_root>/<nazwa>`.
     Ustawia też e.subdir_per_game.
     """
     from pathlib import Path
@@ -314,25 +436,27 @@ def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
         naming = eff.get("naming", "dat")
         if eff.get("target"):
             e.target_dir = base / eff["target"]
-        elif naming == "es" or eff.get("rom_root"):
-            # ES/RetroBat wymaga PŁASKIEGO układu: <rom_root>/<system> (np.
-            # roms/gb, roms/ps2) — katalog-grupa DAT-ów (ROMS/1G1R) NIE wchodzi
-            # do ścieżki fizycznej. Tak samo przy własnym rom_root (root dzieli).
+        elif eff.get("rom_root"):
+            # RĘCZNIE wybrany rom_root (reguła) — ten katalog JEST już
+            # rozdzieleniem, więc płasko: <rom_root>/<system>.
+            e.target_dir = base / folder_name(e, naming)
+        else:
+            # Struktura katalogów DatRoot (ROMS/1G1R/[T-En]…) ODZWIERCIEDLA SIĘ
+            # w rom_root — dla naming=dat i naming=es. Konwencja decyduje tylko
+            # o nazwie LIŚCIA (ps2 vs „Sony - PlayStation 2"). Dawniej naming=es
+            # układało płasko (<rom_root>/<system>), gubiąc katalog-grupę DAT-a:
+            # DatRoot/ROMS lądował w Z:/ROMS/atari2600 zamiast Z:/ROMS/ROMS/atari2600.
             leaf = folder_name(e, naming)
             if log and naming == "es" and leaf == e.name:
                 # brak mapowania ES => nazwa z DAT-a — GŁOŚNO, żeby mieszanina
                 # konwencji nie była niespodzianką (dodaj alias w shortcuts.py)
                 log(f"UWAGA naming=es: brak mapowania ES dla '{e.name}' — "
                     f"katalog dostanie nazwę z DAT-a")
-            e.target_dir = base / leaf
-        else:
-            # naming=dat: struktura katalogów DAT-ów (1G1R/ROMS) mapuje się na
-            # podkatalogi rom_root (rozdziela rodzica od dzieci).
             try:
                 rel = e.dat_path.parent.relative_to(dat_root)
             except ValueError:
                 rel = Path()
-            e.target_dir = base / rel / folder_name(e, naming)
+            e.target_dir = base / rel / leaf
         e.subdir_per_game = bool(eff.get("subdir_per_game", True))
         e.store_format = resolve_format(eff.get("format", "keep"), e)
 

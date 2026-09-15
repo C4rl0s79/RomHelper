@@ -233,6 +233,15 @@ def deep_identify(
     Każda pominięta metoda to jedna pełna ekstrakcja mniej."""
     tried: List[str] = []
 
+    def _mk_scratch() -> Path:
+        """Katalog roboczy dla jednej próby. ODPORNE na ZNIKNIĘCIE scratchu w
+        trakcie (np. RAM-dysk odmontowany nagle): `resilient_dir` tworzy katalog
+        tuż przed użyciem, próbuje ODTWORZYĆ RAM-dysk, a w ostateczności spada na
+        systemowy temp — identyfikacja nie wywala się wyjątkiem."""
+        from .scratch import resilient_dir
+        wd = resilient_dir(work_dir, log=(lambda m: log(f"  {m}")))
+        return Path(tempfile.mkdtemp(prefix="chddeep_", dir=str(wd)))
+
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
@@ -266,7 +275,7 @@ def deep_identify(
             break
         tried.append(name)
         log(f"Próba: {name}…")
-        tmp = Path(tempfile.mkdtemp(prefix="chddeep_", dir=str(work_dir)))
+        tmp = _mk_scratch()
         try:
             out = tmp / (path.stem + ext)
             split_native = False

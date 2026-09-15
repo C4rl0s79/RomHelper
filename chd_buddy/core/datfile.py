@@ -29,12 +29,16 @@ class DatRom:
     crc: str = ""
     md5: str = ""
     sha1: str = ""
+    merge: str = ""      # MAME: ten ROM jest WSPÓŁDZIELONY z rodzicem pod nazwą
+                         # `merge` (w secie split/merged bierze się go z parenta)
 
 
 @dataclass
 class DatGame:
     name: str
     roms: List[DatRom] = field(default_factory=list)
+    cloneof: str = ""    # MAME: nazwa gry-RODZICA (klon), np. darkseal1→darkseal
+    romof: str = ""      # MAME: skąd dziedziczy ROM-y (zwykle == cloneof)
 
     @property
     def media(self) -> MediaType:
@@ -148,11 +152,23 @@ class DatIndex:
         return idx.load_many(expanded)
 
 
-def parse_dat_header(path: Path) -> dict:
-    """Czyta nagłówek DAT-a (Logiqx <header>): name, description, version.
+def _looks_xml(path: Path) -> bool:
+    """Czy plik zaczyna się jak XML (`<`) — inaczej traktujemy jak ClrMamePro."""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(512)
+    except OSError:
+        return True                              # niech XML-owa ścieżka zgłosi błąd
+    # pomiń BOM i białe znaki
+    chunk = chunk.lstrip(b"\xef\xbb\xbf").lstrip()
+    return chunk[:1] == b"<"
 
-    Przerywa parsowanie po nagłówku — nie czyta całego pliku.
-    """
+
+def parse_dat_header(path: Path) -> dict:
+    """Czyta nagłówek DAT-a: name, description, version. Obsługuje Logiqx XML
+    (`<header>`) oraz ClrMamePro (`clrmamepro ( … )`). Nie czyta całego pliku."""
+    if not _looks_xml(path):
+        return _cmpro_header(path)
     out = {"name": "", "description": "", "version": ""}
     try:
         for _event, elem in ET.iterparse(str(path), events=("end",)):
@@ -170,7 +186,10 @@ def parse_dat_header(path: Path) -> dict:
 
 
 def parse_dat(path: Path):
-    """Generator gier z pliku DAT (Logiqx XML). Odporny na duże pliki."""
+    """Generator gier z pliku DAT. Logiqx XML albo ClrMamePro (auto-wykrycie)."""
+    if not _looks_xml(path):
+        yield from _parse_cmpro(path)
+        return
     context = ET.iterparse(str(path), events=("end",))
     for _event, elem in context:
         if elem.tag != "game" and elem.tag != "machine":
@@ -188,7 +207,163 @@ def parse_dat(path: Path):
                 crc=(r.get("crc") or "").strip(),
                 md5=(r.get("md5") or "").strip(),
                 sha1=(r.get("sha1") or "").strip(),
+                merge=(r.get("merge") or "").strip(),
             ))
         if roms:
-            yield DatGame(name=name, roms=roms)
+            # MAME: relacje rodzic/klon (świadomość merged/split/non-merged)
+            yield DatGame(name=name, roms=roms,
+                          cloneof=(elem.get("cloneof") or "").strip(),
+                          romof=(elem.get("romof") or "").strip())
         elem.clear()  # zwolnij pamięć
+
+
+# --- ClrMamePro (format tekstowy, np. libretro BIOS/System.dat) --------------
+import re as _re
+
+# token: "łańcuch w cudzysłowie" | ( | ) | goły-wyraz
+_CMPRO_TOK = _re.compile(r'"([^"]*)"|(\()|(\))|([^\s()]+)')
+_CMPRO_GAME_KW = {"game", "machine", "set", "resource"}
+# bloki wewnątrz gry, które POMIJAMY (nie niosą ROM-ów potrzebnych do matchu)
+_CMPRO_SKIP_BLOCK = {"disk", "release", "biosset", "sample", "archive", "chip",
+                     "video", "sound", "input", "dipswitch", "driver", "device"}
+_CMPRO_ROM_KEYS = {"name", "size", "crc", "md5", "sha1", "merge", "flags",
+                   "date", "status", "serial"}
+
+
+def _cmpro_tokens(text: str) -> list:
+    out = []
+    for m in _CMPRO_TOK.finditer(text):
+        if m.group(1) is not None:
+            out.append(("str", m.group(1)))
+        elif m.group(2):
+            out.append(("(", "("))
+        elif m.group(3):
+            out.append((")", ")"))
+        else:
+            out.append(("word", m.group(4)))
+    return out
+
+
+def _cmpro_skip(toks: list, i: int, n: int) -> int:
+    """Pomija zawartość bloku `( … )` (z zagnieżdżeniem). `i` wskazuje ZA `(`."""
+    depth = 1
+    while i < n and depth > 0:
+        k = toks[i][0]
+        if k == "(":
+            depth += 1
+        elif k == ")":
+            depth -= 1
+        i += 1
+    return i
+
+
+def _cmpro_read_rom(toks: list, i: int, n: int):
+    """Czyta `rom ( name … size … crc … )`. `i` wskazuje ZA `(`."""
+    attrs: Dict[str, str] = {}
+    while i < n and toks[i][0] != ")":
+        t, v = toks[i]
+        if t == "word" and v.lower() in _CMPRO_ROM_KEYS and i + 1 < n \
+                and toks[i + 1][0] in ("str", "word"):
+            attrs[v.lower()] = toks[i + 1][1]
+            i += 2
+            continue
+        i += 1
+    if i < n and toks[i][0] == ")":
+        i += 1
+    try:
+        size = int(attrs.get("size", "0") or 0)
+    except ValueError:
+        size = 0
+    rom = DatRom(name=attrs.get("name", ""), size=size,
+                 crc=(attrs.get("crc") or "").strip(),
+                 md5=(attrs.get("md5") or "").strip(),
+                 sha1=(attrs.get("sha1") or "").strip(),
+                 merge=(attrs.get("merge") or "").strip())
+    return (rom if rom.name else None), i
+
+
+def _cmpro_read_game(toks: list, i: int, n: int):
+    """Czyta blok `game ( … )`. `i` wskazuje ZA `(`. Zwraca (DatGame|None, i)."""
+    name = cloneof = romof = ""
+    roms: List[DatRom] = []
+    while i < n and toks[i][0] != ")":
+        t, v = toks[i]
+        if t == "word":
+            key = v.lower()
+            if key == "rom" and i + 1 < n and toks[i + 1][0] == "(":
+                rom, i = _cmpro_read_rom(toks, i + 2, n)
+                if rom:
+                    roms.append(rom)
+                continue
+            if key in _CMPRO_SKIP_BLOCK and i + 1 < n and toks[i + 1][0] == "(":
+                i = _cmpro_skip(toks, i + 2, n)
+                continue
+            if key in ("name", "cloneof", "romof") and i + 1 < n \
+                    and toks[i + 1][0] in ("str", "word"):
+                val = toks[i + 1][1]
+                if key == "name":
+                    name = val
+                elif key == "cloneof":
+                    cloneof = val
+                else:
+                    romof = val
+                i += 2
+                continue
+            if key in ("description", "year", "manufacturer", "comment",
+                       "category") and i + 1 < n \
+                    and toks[i + 1][0] in ("str", "word"):
+                i += 2
+                continue
+        i += 1
+    if i < n and toks[i][0] == ")":
+        i += 1
+    game = DatGame(name=name, roms=roms, cloneof=cloneof, romof=romof)
+    return (game if roms else None), i
+
+
+def _parse_cmpro(path: Path):
+    """Generator gier z DAT-a w formacie ClrMamePro (`game ( … rom ( … ) )`)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    toks = _cmpro_tokens(text)
+    i, n = 0, len(toks)
+    while i < n:
+        t, v = toks[i]
+        if t == "word" and v.lower() in _CMPRO_GAME_KW and i + 1 < n \
+                and toks[i + 1][0] == "(":
+            game, i = _cmpro_read_game(toks, i + 2, n)
+            if game:
+                yield game
+        elif t == "word" and v.lower() == "clrmamepro" and i + 1 < n \
+                and toks[i + 1][0] == "(":
+            i = _cmpro_skip(toks, i + 2, n)       # nagłówek — pomiń tutaj
+        else:
+            i += 1
+
+
+def _cmpro_header(path: Path) -> dict:
+    """Nagłówek DAT-a ClrMamePro: `clrmamepro ( name … description … version … )`."""
+    out = {"name": "", "description": "", "version": ""}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(8192)                    # nagłówek jest na górze
+    except OSError:
+        return out
+    toks = _cmpro_tokens(text)
+    n = len(toks)
+    for i in range(n):
+        if toks[i][0] == "word" and toks[i][1].lower() == "clrmamepro" \
+                and i + 1 < n and toks[i + 1][0] == "(":
+            j = i + 2
+            while j < n and toks[j][0] != ")":
+                t, v = toks[j]
+                if t == "word" and v.lower() in out and j + 1 < n \
+                        and toks[j + 1][0] in ("str", "word"):
+                    out[v.lower()] = toks[j + 1][1].strip()
+                    j += 2
+                    continue
+                j += 1
+            break
+    return out

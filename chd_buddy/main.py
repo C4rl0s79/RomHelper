@@ -6,6 +6,7 @@ Można uruchomić na dwa sposoby:
 """
 from __future__ import annotations
 
+import os
 import sys
 
 if __package__ in (None, ""):
@@ -23,28 +24,18 @@ if __package__ in (None, ""):
 
 
 def _crash_log_path() -> "os.PathLike | str":
-    """Ścieżka pliku crash-logu.
-
-    Zamrożona aplikacja (PyInstaller) pisze log OBOK exe — przenośnie, zgodnie
-    z zasadą portable. W trybie deweloperskim (z kodu źródłowego) log idzie do
-    katalogu temp, żeby NIE lądował w drzewie źródeł/pakiecie (inaczej sdist
-    i PyInstaller pakują stary log razem z kodem). Fallback do temp, gdy katalog
-    obok exe jest tylko-do-odczytu.
-    """
+    """Ścieżka pliku crash-logu — obok aplikacji, z fallbackiem do temp."""
     import os
     import tempfile
 
-    temp = os.path.join(tempfile.gettempdir(), "chd_buddy_crash.log")
-    if not getattr(sys, "frozen", False):
-        return temp
-    base = os.path.dirname(os.path.abspath(sys.executable))
+    base = os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
     candidate = os.path.join(base, "chd_buddy_crash.log")
     try:
         with open(candidate, "a"):
             pass
         return candidate
     except OSError:
-        return temp
+        return os.path.join(tempfile.gettempdir(), "chd_buddy_crash.log")
 
 
 def _install_crash_handlers() -> None:
@@ -122,10 +113,35 @@ def _maybe_elevate(settings) -> bool:
     return relaunch_as_admin()
 
 
+def _sweep_stale_mei() -> None:
+    """Sprząta ZALEGŁE katalogi `_MEI*` w %TEMP% (po sesjach onefile, których
+    bootloader nie zdążył skasować — np. gdy nie-admin instancja ginie zaraz po
+    podniesieniu do admina). Pomija BIEŻĄCY `_MEIPASS` i te ZABLOKOWANE (rmtree
+    padnie → działająca instancja je trzyma → zostawiamy). Tylko dla builda."""
+    if not getattr(sys, "frozen", False):
+        return
+    import glob
+    import shutil
+    import tempfile
+    cur = os.path.normcase(getattr(sys, "_MEIPASS", "") or "")
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
+        if not os.path.isdir(d) or os.path.normcase(d) == cur:
+            continue
+        try:
+            shutil.rmtree(d)           # zablokowany (żywa instancja) → wyjątek → skip
+        except OSError:
+            pass
+
+
 def main() -> int:
     _install_crash_handlers()
 
     from .core.settings import Settings
+
+    try:
+        _sweep_stale_mei()             # posprzątaj zaległe _MEI z poprzednich sesji
+    except Exception:
+        pass
 
     settings = Settings.load()
     # Język UI wg ustawień (polski = domyślny, brak tłumaczenia = fallback PL).

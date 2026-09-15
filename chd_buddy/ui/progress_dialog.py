@@ -65,6 +65,16 @@ class ProgressDialog(QDialog):
         self.bar_detail.setFormat("")
         lay.addWidget(self.bar_detail)
 
+        # RÓWNOLEGŁE: po jednym pasku na każdy plik liczony jednocześnie
+        # (skan wielowątkowy na NAS/SSD). Tworzone leniwie, chowane po pliku.
+        self.lbl_slots = QLabel(tr("Pliki liczone równolegle:"))
+        self.lbl_slots.setVisible(False)
+        lay.addWidget(self.lbl_slots)
+        self._slots_lay = QVBoxLayout()
+        self._slots_lay.setContentsMargins(0, 0, 0, 0)
+        lay.addLayout(self._slots_lay)
+        self._slot_bars: dict = {}       # slot -> (QLabel, QProgressBar)
+
         self.lbl_time = QLabel(tr("czas:") + " 0:00")
         lay.addWidget(self.lbl_time)
 
@@ -142,8 +152,53 @@ class ProgressDialog(QDialog):
             self.bar_detail.setFormat("")
         self.lbl_detail.setText(text or "")
 
+    def _slot_widgets(self, slot: int):
+        """Leniwie tworzy (etykieta, pasek) dla slotu równoległego."""
+        pair = self._slot_bars.get(slot)
+        if pair is None:
+            lbl = QLabel("")
+            lbl.setWordWrap(True)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(True)
+            bar.setFormat("")
+            self._slots_lay.addWidget(lbl)
+            self._slots_lay.addWidget(bar)
+            pair = (lbl, bar)
+            self._slot_bars[slot] = pair
+            self.lbl_slots.setVisible(True)
+        return pair
+
+    def set_slot(self, slot: int, done: int, total: int, text: str) -> None:
+        """Pasek jednego równoległego pliku. text=='' albo total<0 => zwolniony
+        (chowamy). total<=0 => pulsuje; inaczej postęp bajtowy."""
+        lbl, bar = self._slot_widgets(slot)
+        if not text or total < 0:
+            bar.setVisible(False)
+            lbl.setVisible(False)
+            return
+        lbl.setVisible(True)
+        bar.setVisible(True)
+        if total > 0:
+            d, t = self._scale(done, total)
+            bar.setRange(0, t)
+            bar.setValue(d)
+            bar.setFormat("%p%")
+        else:
+            bar.setRange(0, 0)
+            bar.setFormat("")
+        lbl.setText(text)
+
+    def _clear_slots(self) -> None:
+        for lbl, bar in self._slot_bars.values():
+            bar.setVisible(False)
+            lbl.setVisible(False)
+        self.lbl_slots.setVisible(False)
+
     def finish(self, err: str = "") -> None:
         self._finished = True
+        self._clear_slots()
         self._timer.stop()
         self.bar.setRange(0, 100)
         self.bar_detail.setRange(0, 100)

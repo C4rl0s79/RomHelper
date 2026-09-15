@@ -233,6 +233,11 @@ def _rebuild_dvd_one(chd_path: Path, game_name: str, iso_rom, chd, settings,
         return
     if not info.is_cd_typed:
         st.ok_layout += 1               # już DVD — kontener poprawny
+        if index is not None:
+            try:
+                index.set_bad_container(chd_path, 0)
+            except Exception:
+                pass
         return
     log(f"ODBUDOWA CD→DVD: {chd_path.name} [{game_name}]")
     if dry_run:
@@ -293,6 +298,7 @@ def _rebuild_dvd_one(chd_path: Path, game_name: str, iso_rom, chd, settings,
             crc, md5, sha1 = hash_file(chd_path)
             index.record_file(chd_path, crc, md5, sha1)
             index.set_data_sha1(chd_path, iso_rom.sha1.lower())
+            index.set_bad_container(chd_path, 0)   # kontener naprawiony
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -306,6 +312,11 @@ def _rebuild_one(chd_path: Path, game_name: str, data, cue_rom, lib, chd,
     n_chd = _chd_cd_tracks(chd, chd_path)
     if n_chd == len(data):
         st.ok_layout += 1
+        if index is not None:
+            try:
+                index.set_bad_container(chd_path, 0)
+            except Exception:
+                pass
         return                              # kontener już kanoniczny
     cue_bytes = lib.load(cue_rom.sha1)
     if cue_bytes is None:
@@ -388,5 +399,6 @@ def _rebuild_one(chd_path: Path, game_name: str, data, cue_rom, lib, chd,
             index.record_file(chd_path, crc, md5, sha1)
             # odcisk KOMPLETU ścieżek (nie pojedynczej — 1S vs 5S!)
             index.set_data_sha1(chd_path, game_profile(data))
+            index.set_bad_container(chd_path, 0)   # kontener kanoniczny
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

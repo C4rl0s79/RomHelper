@@ -52,12 +52,20 @@ class Settings:
     work_dir: str = ""
     # Kompresja: "default" => niech chdman wybierze wg polecenia.
     compression_preset: str = "default"   # CHD: kodeki (patrz presets.py)
-    # ZIP: poziom DEFLATE 0–9 (0=bez kompresji, 6=domyślny zlib, 9=maks).
+    # ZIP: poziom 0–9 (0=bez kompresji, 6=domyślny, 9=maks).
     zip_level: int = 6
+    # Metoda kompresji ZIP: "deflate" (zgodne z KAŻDYM emulatorem/scraperem)
+    # albo "zstd" (mniejszy plik, ale wiele narzędzi go NIE czyta — „Failed to
+    # inflate"). Domyślnie deflate dla kompatybilności.
+    zip_method: str = "deflate"
     # RVZ (DolphinTool): poziom zstd 1–22 (5=domyślny) i rozmiar bloku w KB.
     rvz_level: int = 5
     rvz_block_kb: int = 128
     threads: int = 0                 # 0 => auto (chdman)
+    # Ile konwersji RÓWNOLEGLE w potoku naprawy (każda 1 wątek chdman → tyle
+    # rdzeni). 0 => auto (min(8, rdzenie_logiczne//2)). Mniej = mniej strumieni
+    # I/O na NAS i mniej RAM-dysku naraz. Domyślnie 4.
+    convert_workers: int = 4
     verify_after_create: bool = True
     # Round-trip: po createdvd wypakuj obraz i porównaj SHA-1 ze źródłem.
     # Silniejsze niż verify (dowód danych, nie tylko kontenera) — domyślnie ON,
@@ -113,7 +121,7 @@ class Settings:
     # RAM dysk (ImDisk) na operacje tymczasowe: wypakowanie/przepakowanie CHD.
     # Ulotny — nie zapycha dysku kolekcji, nic nie zostaje po przerwaniu.
     ramdisk_enabled: bool = True
-    ramdisk_size_gb: int = 30
+    ramdisk_size_gb: int = 40
     ramdisk_letter: str = "R"
     # Przy starcie proś o podniesienie do administratora (UAC), by móc tworzyć
     # symlinki bez trybu dewelopera. Odmowa UAC => program działa bez admina.
@@ -124,6 +132,19 @@ class Settings:
     fix_del_tosort: bool = True      # usuń z ToSort pliki już na miejscu
     fix_convert: bool = False        # konwertuj do formatu docelowego
     fix_dedup: bool = True           # kopie potwierdzonych → symlinki
+    # Równoległe hashowanie w skanie wg nośnika katalogu (NAS/SSD; HDD=1 zawsze).
+    # Kilka odczytów naraz ukrywa latencję sieci/kolejkę SSD — duży zysk na
+    # pierwszym skanie TB; na pojedynczym HDD szkodzi (skakanie głowicy).
+    scan_workers_nas: int = 8
+    scan_workers_ssd: int = 4
+    # Ręczne nadpisanie nośnika per katalog: {ścieżka: "nas"|"ssd"|"hdd"}.
+    # Puste => auto-wykrywanie (dysk sieciowy vs lokalny). Przełącznik w GUI.
+    storage_overrides: dict = field(default_factory=dict)
+    # Stan interfejsu (pamiętany między sesjami):
+    #   ui_geometry         — pozycja/rozmiar okna (base64 saveGeometry),
+    #   ui_collapsed_groups — klucze zwiniętych grup-katalogów w drzewie DAT-ów.
+    ui_geometry: str = ""
+    ui_collapsed_groups: list = field(default_factory=list)
 
     @property
     def tosort_dirs(self) -> list:
