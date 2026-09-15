@@ -880,7 +880,7 @@ class FileIndex:
             return prober(path) or ""
         except Exception as e:  # próbnik nie może ubić skanu
             if log:
-                log(f"CHD prober: {path.name}: {e}")
+                log(f"CHD prober: {path}: {e}")
             return ""
 
     def _mark_missing(self, root: Path, seen: Iterable[str],

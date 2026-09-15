@@ -78,7 +78,7 @@ def _pulse(log: Callable[[str], None], progress=None, total: int = 0,
                     n=g, name=path.name))
         if n % every == 0:
             tail = f"/{total}" if total else ""
-            log(f"  … {g}{tail} plików ({path.name})")
+            log(f"  … {g}{tail} plików ({path})")
     return cb
 
 
@@ -100,6 +100,27 @@ def _chd_prober(settings, log):
     return prober
 
 
+_DISC_EXT = (".cue", ".gdi", ".iso", ".chd", ".cdi", ".toc")
+
+
+def _is_disc_entry(entry) -> bool:
+    """Czy DAT opisuje gry PŁYTOWE (tylko takie mogą mieć CHD do identyfikacji).
+
+    Format katalogu chd/rvz przesądza; inaczej patrzymy w treść DAT-u. DAT-y
+    kartridżowe (np. kolekcje tłumaczeń [T-En] SNES/MSX) nie mają po co
+    uruchamiać sondy CHD — a ta potrafi wypakowywać pełne obrazy z NAS-a."""
+    if (getattr(entry, "store_format", "") or "").lower() in ("chd", "rvz"):
+        return True
+    try:
+        for g in entry.load().games:
+            for r in g.roms:
+                if r.name.lower().endswith(_DISC_EXT):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 def _deep_probe_gui(idx, entries, settings, chd_mode: str,
                     roots, log: Callable[[str], None], cancel=None,
                     on_progress=None, detail=None, slot=None) -> None:
@@ -110,6 +131,12 @@ def _deep_probe_gui(idx, entries, settings, chd_mode: str,
     głęboka ekstrakcja gated liczbą mieszczącą się na RAM-dysku."""
     if chd_mode != "deep":
         return
+    disc = [e for e in entries if _is_disc_entry(e)]
+    if not disc:
+        log(f"CHD: wśród {len(entries)} DAT-ów tego etapu brak płytowych — "
+            f"pomijam identyfikację CHD")
+        return
+    entries = disc
     from ..core.chdman import CHDMan, CHDManNotFound
     from ..core.matcher import deep_probe_chds
     try:
@@ -965,6 +992,11 @@ class SuiteWindow(QMainWindow):
         self.tree.currentItemChanged.connect(self._on_dat_selected)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
         self._filling = False
+        from PySide6.QtGui import QKeySequence, QShortcut
+        for _seq, _d in (("Ctrl+Up", -1), ("Ctrl+Down", +1)):
+            _sc = QShortcut(QKeySequence(_seq), self.tree)
+            _sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            _sc.activated.connect(lambda _d=_d: self._move_current_folder(_d))
 
         # panel 2: gry wybranego DAT-a + wybór sortowania
         mid = QWidget()
@@ -1065,16 +1097,22 @@ class SuiteWindow(QMainWindow):
 
     @staticmethod
     def _display_order(items, dat_root: Path, key):
-        """Kolejność WYŚWIETLANIA: alfabetycznie w obrębie katalogu
-        (grupy zostają razem). Priorytet parent→child jest niezależny —
-        wynika z reguł/wielkości, nie z kolejności w drzewie."""
+        """Kolejność WYŚWIETLANIA katalogów = ich PRIORYTET (_kolejnosc.json):
+        katalog wyżej ma pierwszeństwo nad niższymi. Bez zapisanej kolejności
+        katalogi-rodzice (parent_priority) stoją na górze, reszta alfabetycznie
+        — dokładnie tak, jak są przetwarzane. W katalogu DAT-y alfabetycznie."""
+        from ..core.dirrules import DirRules
+        from ..core.folder_order import folder_rank, load_order
+        order = load_order(dat_root)
+        rules = DirRules(dat_root) if Path(dat_root).is_dir() else None
+
+        def is_parent(path: str) -> bool:
+            return bool(rules and rules.for_key(path).get("parent_priority"))
+
         def sort_key(x):
             entry = key(x)
-            try:
-                rel = str(entry.dat_path.parent.relative_to(dat_root)).lower()
-            except ValueError:
-                rel = ""
-            return (rel, entry.name.lower())
+            return (folder_rank(entry.dat_path, dat_root, order, is_parent),
+                    entry.name.lower())
         return sorted(items, key=sort_key)
 
     def _group_parent(self, dat_root: Path, dat_path: Path,
@@ -1404,14 +1442,19 @@ class SuiteWindow(QMainWindow):
                                 tr("V1 obsługuje gry jednoplikowe."))
             return
         preserve = self._preserve_dir(entry)
+        from ..core.translations import slot_path
+        fmt = getattr(entry, "store_format", "keep")
+        slot = slot_path(canonical, Path(variant.canonical), game.name, fmt)
         if QMessageBox.question(
                 self, tr("Podmień na tłumaczenie"),
-                tr("Gra: {}\nWariant: {}\n\nOryginał → {}\nSlot (nazwa "
-                   "kanoniczna) → symlink do tłumaczenia.\n\nKontynuować?")
-                .format(game.name, variant.game, preserve)) \
+                tr("Gra: {}\nWariant: {}\n\nOryginał → {}\nSlot {} → symlink "
+                   "do tłumaczenia.\n\nKontynuować?")
+                .format(game.name, variant.game, preserve, slot.name)) \
                 != QMessageBox.StandardButton.Yes:
             return
         ok2 = apply_substitution(canonical, Path(variant.canonical), preserve,
+                                 game_name=game.name, store_format=fmt,
+                                 zip_method=getattr(self.settings, "zip_method", "deflate"),
                                  index=None, make_links=True, dry_run=False,
                                  log=self._log)
         if not ok2:
@@ -1444,14 +1487,19 @@ class SuiteWindow(QMainWindow):
             return
         replp = Path(repl)
         preserve = self._preserve_dir(entry)
+        from ..core.translations import slot_path
+        fmt = getattr(entry, "store_format", "keep")
         if QMessageBox.question(
                 self, tr("Podmień plik ręcznie"),
                 tr("Slot: {}\nZamiennik: {}\n\nOryginał → {}\n\nKontynuować?")
-                .format(canonical.name, replp.name, preserve)) \
+                .format(slot_path(canonical, replp, game.name, fmt).name, replp.name,
+                        preserve)) \
                 != QMessageBox.StandardButton.Yes:
             return
-        if not apply_substitution(canonical, replp, preserve, index=None,
-                                  make_links=True, dry_run=False,
+        if not apply_substitution(canonical, replp, preserve, game_name=game.name,
+                                  store_format=fmt,
+                                  zip_method=getattr(self.settings, "zip_method", "deflate"),
+                                  index=None, make_links=True, dry_run=False,
                                   log=self._log):
             QMessageBox.warning(self, tr("Tłumaczenia"),
                                 tr("Podmiana nie powiodła się (patrz log)."))
@@ -1483,8 +1531,8 @@ class SuiteWindow(QMainWindow):
                 .format(game.name, preserve)) \
                 != QMessageBox.StandardButton.Yes:
             return
-        restore_original(canonical, preserve, index=None, dry_run=False,
-                         log=self._log)
+        restore_original(canonical, preserve, game_name=game.name, index=None,
+                         dry_run=False, log=self._log)
         store.remove(entry.name, game.name)
         store.save()
         self._log(f"ODTWORZONO oryginał: {game.name}")
@@ -1756,6 +1804,11 @@ class SuiteWindow(QMainWindow):
             a_folder.triggered.connect(lambda: self._folder_settings(data))
             a_parent = menu.addAction(tr("⭐ Wszystkie DAT-y tu = rodzice platform"))
             a_parent.triggered.connect(lambda: self._folder_all_parents(data))
+            menu.addSeparator()
+            a_up = menu.addAction(tr("⬆ Wyżej — wyższy priorytet (Ctrl+↑)"))
+            a_up.triggered.connect(lambda: self._move_folder(data, -1))
+            a_down = menu.addAction(tr("⬇ Niżej — niższy priorytet (Ctrl+↓)"))
+            a_down.triggered.connect(lambda: self._move_folder(data, +1))
             menu.exec(self.tree.viewport().mapToGlobal(pos))
             return
         if not isinstance(data, DatEntry):
@@ -1772,6 +1825,83 @@ class SuiteWindow(QMainWindow):
         a_ico = menu.addAction(tr("🖼 Generuj ikony dla całego DAT-a"))
         a_ico.triggered.connect(lambda: self._icons_for_dat(data))
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _move_current_folder(self, delta: int) -> None:
+        it = self.tree.currentItem()
+        data = it.data(0, Qt.ItemDataRole.UserRole) if it is not None else None
+        if isinstance(data, str):
+            self._move_folder(data, delta)
+
+    def _move_folder(self, folder_key: str, delta: int) -> None:
+        """Przesuwa katalog DAT-ów wyżej/niżej = zmienia priorytet rodzic→dzieci.
+
+        Kolejność trafia do _kolejnosc.json. DAT-y i przepis naprawy są od razu
+        przestawiane (bez ponownego skanu) — naprawa idzie katalog po katalogu
+        w tej kolejności, więc wyższy katalog trzyma pliki fizycznie."""
+        if self._busy:
+            QMessageBox.information(
+                self, tr("Trwa operacja"),
+                tr("W trakcie skanowania/naprawy nie można zmieniać kolejności."))
+            return
+        from ..core.datstore import DatStore
+        from ..core.dirrules import DirRules
+        from ..core.folder_order import move_folder
+        dat_root = Path(self.row_dats.path)
+        entries = list(getattr(self, "_entries", None) or [])
+        parts = [p for p in folder_key.split("/") if p]
+        parent = [p.lower() for p in parts[:-1]]
+        siblings: dict = {}
+        for e in entries:
+            try:
+                rel = e.dat_path.parent.relative_to(dat_root).parts
+            except ValueError:
+                continue
+            if (len(rel) > len(parent)
+                    and [p.lower() for p in rel[:len(parent)]] == parent):
+                siblings.setdefault(rel[len(parent)].lower(), rel[len(parent)])
+        rules = DirRules(dat_root)
+        try:
+            changed = move_folder(
+                dat_root, folder_key, delta, list(siblings.values()),
+                is_parent=lambda p: bool(rules.for_key(p).get("parent_priority")))
+        except OSError as e:
+            self._log(f"BŁĄD zapisu kolejności: {e}")
+            return
+        if not changed:
+            return
+        if entries:
+            DatStore(dat_root, Path(self.row_roms.path),
+                     use_cache=False).sort_entries(entries)
+            self._entries = entries
+            if self._reports:
+                pos = {id(e): i for i, e in enumerate(entries)}
+                self._reports.sort(key=lambda r: pos.get(id(r.entry), len(pos)))
+            self._plan = None           # plan podglądu zakładał starą kolejność
+            self._fill_dats(entries, with_stats=bool(self._reports_by_id
+                                                     or self._saved_states))
+        # zaznacz przesunięty katalog, żeby można było przesuwać dalej
+        target = "/".join(parts)
+        for i in range(self.tree.topLevelItemCount()):
+            found = self._find_group_item(self.tree.topLevelItem(i), target)
+            if found is not None:
+                self.tree.setCurrentItem(found)
+                break
+        order = [str(e.dat_path.parent.relative_to(dat_root)).split(os.sep)[0]
+                 for e in entries if e.dat_path.parent != dat_root]
+        seen: list = []
+        for o in order:
+            if o not in seen:
+                seen.append(o)
+        self._log(f"Kolejność katalogów (priorytet): {' → '.join(seen)}")
+
+    def _find_group_item(self, node, key: str):
+        if node.data(0, Qt.ItemDataRole.UserRole) == key:
+            return node
+        for i in range(node.childCount()):
+            hit = self._find_group_item(node.child(i), key)
+            if hit is not None:
+                return hit
+        return None
 
     def _folder_settings(self, folder_key: str) -> None:
         from .folder_settings_dialog import FolderSettingsDialog
@@ -2323,7 +2453,14 @@ class SuiteWindow(QMainWindow):
                     # (na NAS 100k+ lexists w ciszy potrafiło „zawiesić" skan).
                     idx.prune_ghosts(log, skip_roots=roots)
                     if not cancel.is_set():
-                        _deep_probe_gui(idx, enabled, settings, chd_mode, roots,
+                        # Przy ZAZNACZONEJ platformie identyfikacja CHD dotyczy
+                        # tylko jej DAT-ów. Faza 2 doskanowuje resztę, bo pliki
+                        # zaznaczonej platformy mogą leżeć gdzie indziej — ale
+                        # ekstrakcja CHD innych (tylko włączonych) platform to
+                        # nie jest to, o co prosi zaznaczenie: z zaznaczoną pulą
+                        # [T-En] (nigdy „kompletną") mieliło CHD PS1/PS2.
+                        _deep_probe_gui(idx, sel_entries or enabled, settings,
+                                        chd_mode, roots,
                                         log, cancel=cancel, on_progress=progress,
                                         detail=detail, slot=slot)
                 log(f"DAT-ów: {len(enabled)} włączonych z {len(all_entries)}")
@@ -2407,14 +2544,18 @@ class SuiteWindow(QMainWindow):
             self._variant_index = {}
             self._log(f"UWAGA: tłumaczenia niedostępne: {e}")
         self._plan = None            # plan (dry-run) unieważniony nowym skanem
-        self._saved_states = {}      # świeży raport zastępuje cache w widoku
-        self._fill_dats(all_entries, with_stats=True)
-        # zapisz stan raportu (trwale) — po ponownym otwarciu widać ostatni skan
+        # zapisz stan raportu (trwale, DOKŁADAJĄC do zapamiętanego) — po ponownym
+        # otwarciu widać ostatni skan, a DAT-y wyłączone w tym skanie zachowują
+        # swój ostatni stan. Świeży raport i tak ma pierwszeństwo w widoku
+        # (`_game_statuses_for` bierze najpierw `_reports_by_id`).
         try:
-            from ..core.datcache import save_report_states
+            from ..core.datcache import load_report_states, save_report_states
             save_report_states(reports)
+            self._saved_at, self._saved_states = load_report_states()
         except Exception as e:      # zapis cache nie może ubić raportu
+            self._saved_states = {}
             self._log(f"UWAGA: nie zapisano cache raportu: {e}")
+        self._fill_dats(all_entries, with_stats=True)
         # łączne podsumowanie na poziomie GRY (spójne z listą i kolumnami)
         stats = [r.game_stats() for r in reports]
         complete = sum(s[1] for s in stats)
@@ -2482,6 +2623,16 @@ class SuiteWindow(QMainWindow):
                 self.tree.addTopLevelItem(item)
             else:
                 parent.addChild(item)
+        # NUMER POZYCJI katalogu wśród rodzeństwa (= priorytet): „📁 1. ROMS".
+        # Kolejność węzłów wynika z _display_order, więc wystarczy policzyć.
+        _counters: dict = {}
+        for key, node in groups.items():
+            parent_key = key[:-1]
+            _counters[parent_key] = _counters.get(parent_key, 0) + 1
+            node.setText(0, f"📁 {_counters[parent_key]}. {key[-1]}")
+            node.setToolTip(0, tr("Priorytet katalogu: wyżej = trzyma pliki "
+                                  "fizycznie, niżej = symlinki. Przesuwanie: "
+                                  "prawy klik albo Ctrl+↑ / Ctrl+↓."))
         # rozwinięte domyślnie, ZWINIĘTE gdy zapamiętane z poprzedniej sesji
         collapsed = set(getattr(self.settings, "ui_collapsed_groups", []) or [])
         for key, node in groups.items():

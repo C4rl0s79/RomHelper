@@ -303,15 +303,98 @@ def preserve_dir_for(tosort_root: str | os.PathLike, system: str) -> Path:
     return Path(tosort_root) / "translated" / safe
 
 
+ARCHIVE_EXTS = (".zip", ".7z")
+
+
+def _is_archive(p: Path) -> bool:
+    return p.suffix.lower() in ARCHIVE_EXTS
+
+
+def game_forms(canonical: Path, game_name: str = "") -> List[Path]:
+    """Wszystkie miejsca, w których kolekcja może trzymać grę jednoplikową:
+    luźny ROM pod nazwą z DAT-u oraz archiwum `<gra>.zip` / `<gra>.7z`."""
+    stem = game_name or canonical.stem
+    out = [canonical]
+    for ext in ARCHIVE_EXTS:
+        p = canonical.with_name(stem + ext)
+        if p not in out:
+            out.append(p)
+    return out
+
+
+_CONTAINER_EXT = {"zip": ".zip", "7z": ".7z", "chd": ".chd", "rvz": ".rvz"}
+
+
+def slot_path(canonical: Path, variant_file: Path, game_name: str = "",
+              store_format: str = "keep") -> Path:
+    """Ścieżka slotu wg USTAWIENIA KATALOGU (format zapisu DAT-u) — twardo.
+
+    Nazwa z DAT-u to nazwa ROM-u („… (Japan).rom"), ale katalog z formatem
+    `zip` trzyma grę jako `<gra>.zip` i slot NIE może być `.rom`. Dawniej link
+    dostawał nazwę ROM-u i wskazywał archiwum tłumaczenia: emulatory wybierające
+    sposób otwarcia po rozszerzeniu (blueMSX) go nie czytały, a oryginalny
+    `<gra>.zip` zostawał obok i to on się uruchamiał.
+
+    * `zip` / `7z` / `chd` / `rvz` → `<gra>.<ext>`,
+    * `extract` → luźny ROM pod nazwą z DAT-u,
+    * `keep` → forma wariantu (archiwum → `<gra>.<ext>`, luźny → nazwa z DAT-u).
+    """
+    stem = game_name or canonical.stem
+    fmt = (store_format or "keep").lower()
+    if fmt in _CONTAINER_EXT:
+        return canonical.with_name(stem + _CONTAINER_EXT[fmt])
+    if fmt == "extract":
+        return canonical
+    if variant_file.suffix.lower() == canonical.suffix.lower():
+        return canonical
+    if _is_archive(variant_file):
+        return canonical.with_name(stem + variant_file.suffix)
+    return canonical
+
+
+def _slot_action(slot: Path, variant_file: Path) -> str:
+    """Jak wypełnić slot wariantem: "link" (ta sama forma), "pack" (luźny →
+    ZIP), "extract" (ZIP → luźny) albo "" gdy nie da się bez utraty zgodności."""
+    s, v = slot.suffix.lower(), variant_file.suffix.lower()
+    if s == v or not (_is_archive(slot) or _is_archive(variant_file)
+                      or s in (".chd", ".rvz") or v in (".chd", ".rvz")):
+        return "link"
+    if s == ".zip" and not _is_archive(variant_file) and v not in (".chd", ".rvz"):
+        return "pack"
+    if v == ".zip" and not _is_archive(slot) and s not in (".chd", ".rvz"):
+        return "extract"
+    return ""
+
+
+def link_form_mismatch(link: Path) -> bool:
+    """True, gdy link i jego cel różnią się formą (luźny plik ↔ archiwum) —
+    ślad po starej podmianie (`… .rom` → `… .zip`)."""
+    try:
+        target = Path(os.path.realpath(link))
+    except OSError:
+        return False
+    return _is_archive(link) != _is_archive(target)
+
+
 def apply_substitution(
         canonical: Path, variant_file: Path, preserve_dir: Path, *,
-        index=None, make_links: bool = True, dry_run: bool = False,
+        game_name: str = "", store_format: str = "keep",
+        zip_method: str = "deflate", index=None,
+        make_links: bool = True, dry_run: bool = False,
         log: LogCB = lambda m: None) -> bool:
     """Podmiana slotu kolekcji na tłumaczenie:
-      1) oryginał (jeśli FIZYCZNY plik pod `canonical`) → `preserve_dir`
-         (zachowanie do odtworzenia i walidacji setu); istniejący symlink
-         po prostu usuwamy,
-      2) symlink `canonical` (NAZWA KANONICZNA) → `variant_file`.
+      1) gra w KAŻDEJ formie (luźny ROM, `<gra>.zip`, `<gra>.7z`): fizyczny
+         plik → `preserve_dir` (zachowanie do odtworzenia i walidacji setu),
+         istniejący symlink po prostu usuwamy — inaczej oryginał w innej
+         formie zostawałby obok tłumaczenia,
+      2) SLOT (forma wg formatu katalogu, patrz `slot_path`) ← wariant:
+         symlink, gdy forma się zgadza; luźny wariant w katalogu `zip` jest
+         pakowany do `<gra>.zip`, wariant `.zip` w katalogu `extract` —
+         wypakowany. Innych przejść nie robimy (odmowa, nic nie ruszone).
+         Zip wariantu w INNEJ metodzie niż `zip_method` (np. ZSTD przy deflate)
+         nie jest linkowany, tylko kopiowany do slotu i przepakowany: link
+         przeniósłby ZSTD do kolekcji („Failed to inflate" w emulatorach), a
+         normalizacja kompresji w naprawie linków nie rusza.
     Nie kasuje żadnego pliku bezpowrotnie. Zwraca True gdy podmiana zrobiona
     (albo w dry-run zapowiedziana)."""
     from .linker import create_link, is_link, remove_link, LinkPrivilegeError
@@ -324,93 +407,176 @@ def apply_substitution(
     if not make_links and not dry_run:
         log("  linki wyłączone — podmiana pominięta (oryginał nietknięty)")
         return False
-    # 1) zabezpiecz oryginał / usuń stary link (z możliwością COFNIĘCIA)
-    _rollback = None                 # ("move"|"copy", dest) — jak przywrócić
-    if os.path.lexists(canonical):
-        if is_link(canonical):
-            log(f"  usuwam poprzedni link: {canonical.name}")
+    slot = slot_path(canonical, variant_file, game_name, store_format)
+    action = _slot_action(slot, variant_file)
+    if not action:
+        log(f"TŁUMACZENIE: format katalogu „{store_format}” wymaga {slot.name}, "
+            f"a wariant to {variant_file.suffix} — tej konwersji nie robię "
+            f"(oryginał nietknięty)")
+        return False
+    if action == "extract":
+        try:
+            import zipfile
+            with zipfile.ZipFile(variant_file) as z:
+                members = [i for i in z.infolist() if not i.is_dir()]
+        except (OSError, zipfile.BadZipFile) as e:
+            log(f"TŁUMACZENIE: nie da się odczytać {variant_file.name}: {e}")
+            return False
+        if len(members) != 1:
+            log(f"TŁUMACZENIE: {variant_file.name} ma {len(members)} plików — "
+                f"wypakowuję tylko gry jednoplikowe (oryginał nietknięty)")
+            return False
+    if action == "link" and slot.suffix.lower() == ".zip":
+        from .convert import zip_needs_repack
+        if zip_needs_repack(variant_file, zip_method):
+            action = "repack"
+            log(f"  {variant_file.name}: inna metoda kompresji niż {zip_method} — "
+                f"slot będzie przepakowaną kopią, nie linkiem")
+    if slot != canonical:
+        log(f"  slot wg formatu katalogu ({store_format}): {slot.name} (DAT: {canonical.name})")
+    # 1) zabezpiecz oryginał / usuń stare linki (z możliwością COFNIĘCIA)
+    rollback: list = []              # (kind "move"|"copy", zachowany, ścieżka)
+    for form in [slot] + [p for p in game_forms(canonical, game_name) if p != slot]:
+        if not os.path.lexists(form):
+            continue
+        if is_link(form):
+            log(f"  usuwam poprzedni link: {form.name}")
             if not dry_run:
-                remove_link(canonical)
+                remove_link(form)
+            continue
+        dest = preserve_dir / form.name
+        log(f"  oryginał → {dest}")
+        if dry_run:
+            continue
+        preserve_dir.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            form.unlink()                   # już zachowany — usuń bieżący
+            if index is not None:
+                try:
+                    index.remove_path(form)
+                except Exception:
+                    pass
+            rollback.append(("copy", dest, form))   # odtwórz z zachowanej kopii
         else:
-            dest = preserve_dir / canonical.name
-            log(f"  oryginał → {dest}")
-            if not dry_run:
-                preserve_dir.mkdir(parents=True, exist_ok=True)
-                if dest.exists():
-                    canonical.unlink()          # już zachowany — usuń bieżący
-                    if index is not None:
-                        try:
-                            index.remove_path(canonical)
-                        except Exception:
-                            pass
-                    _rollback = ("copy", dest)   # odtwórz z zachowanej kopii
-                else:
-                    os.replace(canonical, dest)
-                    if index is not None:
-                        try:
-                            index.rename(canonical, dest)
-                        except Exception:
-                            pass
-                    _rollback = ("move", dest)
-    # 2) symlink kanoniczny → wariant
-    log(f"TŁUMACZENIE: {canonical.name} -> {variant_file}")
+            os.replace(form, dest)
+            if index is not None:
+                try:
+                    index.rename(form, dest)
+                except Exception:
+                    pass
+            rollback.append(("move", dest, form))
+    # 2) slot ← wariant
+    verb = {"link": "->", "pack": "<= spakowany", "extract": "<= wypakowany z",
+            "repack": f"<= przepakowany ({zip_method})"}[action]
+    log(f"TŁUMACZENIE: {slot.name} {verb} {variant_file}")
     if dry_run:
         return True
     try:
-        create_link(canonical, variant_file, is_dir=False)
+        if action == "link":
+            create_link(slot, variant_file, is_dir=False)
+        elif action == "pack":
+            from .convert import pack_zip
+            res = pack_zip([variant_file], slot, arcnames=[canonical.name],
+                           method=zip_method, log=log)
+            if not res.ok:
+                raise OSError(res.message)
+        elif action == "repack":
+            import shutil as _sh
+            from .convert import repack_zip
+            tmp = slot.with_name(slot.name + ".chdbuddy_tmp")
+            _sh.copyfile(variant_file, tmp)
+            res = repack_zip(tmp, method=zip_method, log=log)
+            if not res.ok:
+                raise OSError(res.message)
+            os.replace(tmp, slot)
+        else:
+            import zipfile
+            tmp = slot.with_name(slot.name + ".chdbuddy_tmp")
+            with zipfile.ZipFile(variant_file) as z, open(tmp, "wb") as out:
+                member = next(i for i in z.infolist() if not i.is_dir())
+                with z.open(member) as src:
+                    import shutil as _sh
+                    _sh.copyfileobj(src, out)
+            os.replace(tmp, slot)
     except (LinkPrivilegeError, OSError) as e:
+        slot.with_name(slot.name + ".chdbuddy_tmp").unlink(missing_ok=True)
         if isinstance(e, LinkPrivilegeError):
             log(f"  UWAGA: {e} — uruchom jako administrator.")
         else:
-            log(f"  BŁĄD symlinku: {e}")
-        # ROLLBACK: nie zostawiaj kanonicznej ścieżki PUSTEJ — przywróć oryginał.
-        if _rollback is not None:
-            kind, dsrc = _rollback
+            log(f"  BŁĄD zapisu slotu: {e}")
+        # ROLLBACK: nie zostawiaj slotu PUSTEGO — przywróć oryginały.
+        for kind, dsrc, form in rollback:
             try:
                 if kind == "move":
-                    os.replace(dsrc, canonical)
+                    os.replace(dsrc, form)
                     if index is not None:
                         try:
-                            index.rename(dsrc, canonical)
+                            index.rename(dsrc, form)
                         except Exception:
                             pass
                 else:                            # "copy" — oryginał był duplikatem
                     import shutil as _sh
-                    _sh.copy2(dsrc, canonical)
-                log(f"  przywrócono oryginał: {canonical.name}")
-            except OSError as re:
-                log(f"  NIE udało się przywrócić oryginału {canonical}: {re}")
+                    _sh.copy2(dsrc, form)
+                log(f"  przywrócono oryginał: {form.name}")
+            except OSError as re_:
+                log(f"  NIE udało się przywrócić oryginału {form}: {re_}")
         return False
-    if index is not None:
+    if index is not None and action == "link":
         try:
-            index.mark_link(canonical)
+            index.mark_link(slot)
         except Exception:
             pass
     return True
 
 
-def restore_original(canonical: Path, preserve_dir: Path, *, index=None,
-                     dry_run: bool = False,
+def restore_original(canonical: Path, preserve_dir: Path, *, game_name: str = "",
+                     index=None, dry_run: bool = False,
                      log: LogCB = lambda m: None) -> bool:
-    """Cofa podmianę: usuwa symlink `canonical` i przywraca zachowany oryginał
-    z `preserve_dir`. Zwraca True, gdy przywrócono."""
+    """Cofa podmianę: usuwa linki gry (w każdej formie) i przywraca zachowane
+    oryginały z `preserve_dir`. Zwraca True, gdy przywrócono.
+
+    Po starej podmianie (link `.rom` → `.zip`, oryginał `<gra>.zip` nietknięty)
+    nie ma nic do przywrócenia — wtedy samo usunięcie linku jest odtworzeniem."""
     from .linker import is_link, remove_link
-    saved = preserve_dir / canonical.name
-    if not saved.exists():
-        log(f"ODTWORZENIE: brak zachowanego oryginału {saved}")
+    forms = game_forms(canonical, game_name)
+    saved = [(f, preserve_dir / f.name) for f in forms
+             if (preserve_dir / f.name).exists()]
+    links = [f for f in forms if os.path.lexists(f) and is_link(f)]
+    if not saved:
+        physical = [f for f in forms if os.path.lexists(f) and not is_link(f)]
+        if links and physical:
+            for f in links:
+                log(f"ODTWORZENIE: usuwam link {f.name} (oryginał {physical[0].name} na miejscu)")
+                if not dry_run:
+                    remove_link(f)
+            return True
+        log(f"ODTWORZENIE: brak zachowanego oryginału {preserve_dir / canonical.name}")
         return False
-    log(f"ODTWORZENIE: {canonical.name} <- {saved}")
-    if dry_run:
-        return True
-    if os.path.lexists(canonical):
-        if is_link(canonical):
-            remove_link(canonical)
-        else:
-            canonical.unlink()
-    os.replace(saved, canonical)
-    if index is not None:
-        try:
-            index.rename(saved, canonical)
-        except Exception:
-            pass
+    for f in links:
+        if not dry_run:
+            remove_link(f)
+    # Slot zbudowany z wariantu (spakowany/wypakowany), a nie link: podmiana
+    # przeniosła do `preserve_dir` WSZYSTKIE fizyczne formy gry, więc fizyczna
+    # forma bez zachowanego odpowiednika to nasz wytwór — odtwarzalny z wariantu.
+    saved_forms = {f for f, _ in saved}
+    for f in forms:
+        if f not in saved_forms and os.path.lexists(f) and not is_link(f):
+            log(f"ODTWORZENIE: usuwam slot zbudowany z tłumaczenia: {f.name}")
+            if not dry_run:
+                f.unlink()
+    for form, src in saved:
+        log(f"ODTWORZENIE: {form.name} <- {src}")
+        if dry_run:
+            continue
+        if os.path.lexists(form):
+            if is_link(form):
+                remove_link(form)
+            else:
+                form.unlink()
+        os.replace(src, form)
+        if index is not None:
+            try:
+                index.rename(src, form)
+            except Exception:
+                pass
     return True

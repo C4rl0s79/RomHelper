@@ -261,6 +261,20 @@ class DirRules:
                         eff[name] = _coerce(name, rule[name])
         return eff
 
+    def for_key(self, folder_path: str) -> dict[str, Any]:
+        """Efektywne reguły KATALOGU („ROMS", „ROMS/Sony") — kaskada global →
+        kolejne poziomy katalogów (bez reguł pojedynczych DAT-ów)."""
+        eff = dict(DEFAULT_RULES)
+        parts = [x for x in str(folder_path).replace("\\", "/").split("/") if x]
+        keys = ["*"] + ["/".join(parts[:i]).lower() for i in range(1, len(parts) + 1)]
+        for k in keys:
+            rule = self.raw.get(k)
+            if rule:
+                for name in DEFAULT_RULES:
+                    if name in rule:
+                        eff[name] = _coerce(name, rule[name])
+        return eff
+
     def explicit_rule(self, entry, name: str):
         """Surowa wartość reguły `name` z kaskady (szczegółowy klucz wygrywa)
         albo None, gdy ŻADEN klucz jej nie ustawia. Odróżnia „nie ustawiono"
@@ -405,8 +419,11 @@ def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
     - `rom_root` (rule) nadpisuje bazę (np. inny dysk dla dzieci);
     - `target` (rule) = pełne przekierowanie względem bazy;
     - inaczej: baza / <katalog DAT-a względem dat_root> / <nazwa systemu>,
-      gdzie nazwa wg `naming` (dat/es). Struktura katalogu DAT-a (1G1R/ROMS)
-      rozdziela rodzica od dzieci; przy własnym rom_root rozdziela root.
+      gdzie nazwa wg `naming` (dat/es). Struktura DatRoot ODZWIERCIEDLA się
+      w rom_root dla OBU konwencji: `DatRoot/ROMS/x.dat` z naming=es →
+      `<rom_root>/ROMS/<es-folder>` (np. Z:/ROMS/ROMS/atari2600),
+      `DatRoot/1G1R/x.dat` → `<rom_root>/1G1R/<nazwa>`;
+    - RĘCZNIE wybrany `rom_root` (reguła) = płasko: `<rom_root>/<nazwa>`.
     Ustawia też e.subdir_per_game.
     """
     from pathlib import Path
@@ -419,25 +436,27 @@ def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
         naming = eff.get("naming", "dat")
         if eff.get("target"):
             e.target_dir = base / eff["target"]
-        elif naming == "es" or eff.get("rom_root"):
-            # ES/RetroBat wymaga PŁASKIEGO układu: <rom_root>/<system> (np.
-            # roms/gb, roms/ps2) — katalog-grupa DAT-ów (ROMS/1G1R) NIE wchodzi
-            # do ścieżki fizycznej. Tak samo przy własnym rom_root (root dzieli).
+        elif eff.get("rom_root"):
+            # RĘCZNIE wybrany rom_root (reguła) — ten katalog JEST już
+            # rozdzieleniem, więc płasko: <rom_root>/<system>.
+            e.target_dir = base / folder_name(e, naming)
+        else:
+            # Struktura katalogów DatRoot (ROMS/1G1R/[T-En]…) ODZWIERCIEDLA SIĘ
+            # w rom_root — dla naming=dat i naming=es. Konwencja decyduje tylko
+            # o nazwie LIŚCIA (ps2 vs „Sony - PlayStation 2"). Dawniej naming=es
+            # układało płasko (<rom_root>/<system>), gubiąc katalog-grupę DAT-a:
+            # DatRoot/ROMS lądował w Z:/ROMS/atari2600 zamiast Z:/ROMS/ROMS/atari2600.
             leaf = folder_name(e, naming)
             if log and naming == "es" and leaf == e.name:
                 # brak mapowania ES => nazwa z DAT-a — GŁOŚNO, żeby mieszanina
                 # konwencji nie była niespodzianką (dodaj alias w shortcuts.py)
                 log(f"UWAGA naming=es: brak mapowania ES dla '{e.name}' — "
                     f"katalog dostanie nazwę z DAT-a")
-            e.target_dir = base / leaf
-        else:
-            # naming=dat: struktura katalogów DAT-ów (1G1R/ROMS) mapuje się na
-            # podkatalogi rom_root (rozdziela rodzica od dzieci).
             try:
                 rel = e.dat_path.parent.relative_to(dat_root)
             except ValueError:
                 rel = Path()
-            e.target_dir = base / rel / folder_name(e, naming)
+            e.target_dir = base / rel / leaf
         e.subdir_per_game = bool(eff.get("subdir_per_game", True))
         e.store_format = resolve_format(eff.get("format", "keep"), e)
 

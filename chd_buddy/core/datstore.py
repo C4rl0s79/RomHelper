@@ -275,6 +275,14 @@ class DatStore:
             log(f"UWAGA: pominięto {skipped} uszkodzonych DAT-ów "
                 f"(puste/nie-XML) — patrz komunikaty wyżej.")
 
+        return self.sort_entries(entries)
+
+    def sort_entries(self, entries: list) -> list:
+        """Porządek przetwarzania DAT-ów (= priorytet rodzic → dzieci), w miejscu.
+
+        Kolejność katalogów z drzewa (_kolejnosc.json) → reguła parent_priority
+        → platforma → ręczny _priorytet.txt → większy DAT. Wołane przez
+        `discover` i przez GUI po przesunięciu katalogu (bez ponownego skanu)."""
         manual = self._manual_priority()
 
         def _manual_rank(e: DatEntry) -> int:
@@ -287,10 +295,22 @@ class DatStore:
 
         # reguła parent_priority (folder oznaczony „wszystkie rodzicami")
         from .dirrules import DirRules
+        from .folder_order import folder_rank, load_order
         rules = DirRules(self.dat_root)
+        order = load_order(self.dat_root)
 
         def _parent_rank(e: DatEntry) -> int:
             return 0 if rules.for_entry(e).get("parent_priority") else 1
+
+        def _folder_is_parent(path: str) -> bool:
+            return bool(rules.for_key(path).get("parent_priority"))
+
+        def _folder_rank(e: DatEntry) -> tuple:
+            # KOLEJNOŚĆ KATALOGÓW z drzewa (_kolejnosc.json): katalog wyżej =
+            # pierwszeństwo nad niższymi (ROMS → No-intro → 1G1R). Bez pliku
+            # zwraca stałą krotkę dla rodzeństwa — wtedy decyduje parent_rank.
+            return folder_rank(e.dat_path, self.dat_root, order,
+                               _folder_is_parent) if order else ()
 
         # RODZICE ZAWSZE PIERWSI — GLOBALNIE, nie tylko w obrębie platformy.
         # Fizyczną kopię pliku dostaje DAT przetworzony jako pierwszy, więc
@@ -302,7 +322,7 @@ class DatStore:
         # child→parent) → ręczny _priorytet.txt → większy DAT. W obrębie
         # platformy rodzic nadal wypada przed dziećmi (ranga 0 < 1), więc
         # grupowanie i dziedziczenie formatu działają jak dotąd.
-        entries.sort(key=lambda e: (_parent_rank(e),
+        entries.sort(key=lambda e: (_folder_rank(e), _parent_rank(e),
                                     effective_platform_key(e, rules),
                                     _manual_rank(e), -e.rom_count,
                                     str(e.target_dir).lower()))

@@ -474,37 +474,60 @@ def match_game(entry: DatEntry, game, index: FileIndex,
     # mimo że jego treść ≠ sumy z podstawowego DAT-u. Bez tego skan cofałby
     # świadomą podmianę. V1: gry jednoplikowe (jeden ROM danych).
     if subs:
-        from .translations import sub_key
+        from .translations import (sub_key, game_forms, link_form_mismatch,
+                                   slot_path)
         rec = subs.get(sub_key(entry.name, game.name))
         if rec:
             data_sts = [s for s in statuses
                         if not s.rom.name.lower().endswith((".cue", ".gdi"))]
             if len(data_sts) == 1:
-                canonical = data_sts[0].canonical_path
+                base = data_sts[0].canonical_path
+                fmt_t = getattr(entry, "store_format", "keep") or "keep"
+                if fmt_t != "keep":
+                    # Twardo wg ustawienia katalogu: katalog `zip` = `<gra>.zip`.
+                    canonical = slot_path(base, base, game.name, fmt_t)
+                else:
+                    forms = game_forms(base, game.name)
+                    canonical = next((f for f in forms if os.path.islink(f)),
+                                     next((f for f in forms if os.path.exists(f)), base))
+                # Stara podmiana: link `.rom` → archiwum `.zip`. Emulator tego
+                # nie otworzy, a oryginał w innej formie zostaje obok — to NIE
+                # jest spełniona podmiana (GUI pokaże grę bez 🌐, do ponowienia).
+                form_ok = not (os.path.islink(canonical) and link_form_mismatch(canonical))
                 # NIE ufaj samemu istnieniu wpisu: WISZĄCY symlink (skasowany
                 # cel tłumaczenia) albo OBCY plik pod kanoniczną nazwą dawałyby
                 # fałszywe „komplet". Wymagamy, by CEL istniał (os.path.exists
                 # podąża za linkiem → False dla wiszącego), a gdy indeks zna
                 # treść — by zgadzała się z zapisanym wyborem (rec["sha1"]).
                 want = (rec.get("sha1") or "").lower()
-                have_sha = ""
+                have = set()             # znane sumy slotu (plik + członek archiwum)
                 if index is not None:
                     try:
                         orow = index.lookup(canonical)
                     except Exception:
                         orow = None
                     if orow is not None and not orow["missing"]:
-                        have_sha = (orow["sha1"] or "").lower()
-                        if not have_sha and orow["is_link"]:
+                        have.add((orow["sha1"] or "").lower())
+                        if not orow["sha1"] and orow["is_link"]:
                             try:
                                 trow = index.lookup(
                                     Path(os.path.realpath(canonical)))
-                                have_sha = ((trow["sha1"] or "").lower()
-                                            if trow else "")
+                                have.add((trow["sha1"] or "").lower()
+                                         if trow else "")
                             except Exception:
-                                have_sha = ""
-                if (os.path.exists(canonical)
-                        and not (want and have_sha and have_sha != want)):
+                                pass
+                    # Slot-archiwum: wybór zapisany jest sumą ROM-u W ŚRODKU, a
+                    # suma całego pliku to suma kontenera — porównujemy obie.
+                    if canonical.suffix.lower() in (".zip", ".7z"):
+                        try:
+                            mem = index.members_of(Path(os.path.realpath(canonical)))
+                        except Exception:
+                            mem = []
+                        if len(mem) == 1:
+                            have.add((mem[0]["sha1"] or "").lower())
+                have.discard("")
+                if (form_ok and os.path.exists(canonical)
+                        and not (want and have and want not in have)):
                     for s in statuses:
                         s.state = RomState.HAVE
                         s.is_translation = True
@@ -684,6 +707,20 @@ def deep_probe_chds(
             if Path(p).is_file():
                 candidates.append(row)
     total_cand = len(candidates) or 1
+    if candidates:
+        # SKĄD są pliki: bez tego log podawał same nazwy i nie było wiadomo,
+        # który katalog jest przemiatany.
+        per_dir: dict = {}
+        for row in candidates:
+            d = str(Path(row["path"]).parent)
+            per_dir[d] = per_dir.get(d, 0) + 1
+        _log(f"CHD do sprawdzenia: {len(candidates)} w {len(per_dir)} katalogach "
+             f"(DAT-y: {', '.join(e.name for e in entries[:5])}"
+             f"{' …' if len(entries) > 5 else ''})")
+        for d, n in sorted(per_dir.items(), key=lambda kv: -kv[1])[:15]:
+            _log(f"  {n:5}  {d}")
+        if len(per_dir) > 15:
+            _log(f"  … i {len(per_dir) - 15} innych katalogów")
 
     # 2. PASS: identyfikacja RÓWNOLEGŁA. Odczyt/ekstrakcja CHD to I/O na NAS +
     #    dekompresja (chdman) — POJEDYNCZY strumień nie wysyca ani łącza (SMB
@@ -781,12 +818,12 @@ def deep_probe_chds(
                     continue
                 hit, err = res[3], res[4]
                 if err:
-                    _log(f"CHD info: {path.name}: {err}")
+                    _log(f"CHD info: {path}: {err}")
                 if hit:
                     index.set_data_sha1(path, hit)
                     _flag_container(path, info, known[hit].media)
                     identified += 1
-                    _log(f"CHD OK (nagłówek): {path.name} -> {known[hit].game}")
+                    _log(f"CHD OK (nagłówek): {path} -> {known[hit].game}")
                 else:
                     need_deep.append((row, info))   # policzony w fazie głębokiej
                 _head_tick(path.name)
@@ -849,7 +886,7 @@ def deep_probe_chds(
             if wd is None:
                 return ("noscratch", row, info, need)
             slot = slot_q.get()
-            _log(f"CHD głęboko: {path.name}… (scratch: {wd})")
+            _log(f"CHD głęboko: {path}… (scratch: {wd})")
 
             def _dp(pct: float, msg: str = "", _name=path.name, _slot=slot) -> None:
                 # postęp ekstrakcji chdman → OSOBNY pasek slotu (kilka naraz);
@@ -906,7 +943,7 @@ def deep_probe_chds(
                     continue
                 if tag == "noscratch":
                     _log(f"CHD POMIJAM (za mało miejsca na ŻADNYM dysku): "
-                         f"{path.name} — potrzeba ~{r/1024**3:.1f} GB")
+                         f"{path} — potrzeba ~{r/1024**3:.1f} GB")
                     _deep_tick(path.name)
                     continue
                 # tag == "deep"
@@ -916,12 +953,12 @@ def deep_probe_chds(
                         known[r.sha1].media if r.sha1 in known else None)
                     _flag_container(path, info, _media)
                     identified += 1
-                    _log(f"CHD OK ({r.method}): {path.name} -> {r.game}")
+                    _log(f"CHD OK ({r.method}): {path} -> {r.game}")
                 elif _aborted():
                     pass                    # przerwane ręcznie — NIE zapisuj porażki
                 else:
                     index.set_deep_fail(path)   # zapamiętaj: nie próbuj ponownie
-                    _log(f"CHD BRAK: {path.name} — bez dopasowania "
+                    _log(f"CHD BRAK: {path} — bez dopasowania "
                          f"(prób: {len(r.tried)}; zapamiętane — nie będzie "
                          f"mielony przy kolejnych skanach)")
                 _deep_tick(path.name)

@@ -2,6 +2,76 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.6.33] — 2026-09-15
+
+### Dodane
+- **Priorytet katalogów DAT-ów przez przesuwanie w drzewie.** Prawy klik na
+  katalogu → „⬆ Wyżej / ⬇ Niżej" (albo Ctrl+↑ / Ctrl+↓). Katalog wyżej ma
+  pierwszeństwo nad niższymi: jego DAT-y są naprawiane pierwsze i trzymają pliki
+  fizycznie, identyczne pliki w niższych katalogach dostają symlinki — np.
+  ROMS → No-intro → 1G1R. Katalogi mają w drzewie numer pozycji („📁 1. ROMS"),
+  kolejność wyświetlania = kolejność przetwarzania. Zapis w `_kolejnosc.json`
+  obok `_reguly.json`; DAT-y i przepis naprawy przestawiają się od razu, bez
+  ponownego skanu. Bez zapisanej kolejności działa jak dawniej (katalogi
+  z „rodzice platform" na górze), a nowe katalogi nie przeskakują ustalonej
+  kolejności. `_priorytet.txt` rozstrzyga już tylko w obrębie jednego katalogu;
+  kolekcje tłumaczeń zostają pulą wariantów (rola `translations`).
+
+### Naprawione
+- **Struktura DatRoot odzwierciedla się w rom_root także przy `naming: es`.**
+  Konwencja ES układała płasko (`<rom_root>/<system>`), gubiąc katalog-grupę
+  DAT-a: `DatRoot/ROMS/…` lądował w `Z:/ROMS/atari2600` zamiast
+  `Z:/ROMS/ROMS/atari2600`. Teraz `<rom_root>/<katalog DAT-a>/<es-folder>` —
+  konwencja decyduje tylko o nazwie liścia. Ręcznie wybrany `rom_root`
+  (reguła, np. No-Intro) zostaje płaski. Pliki w starym płaskim układzie są
+  nadal skanowane (druga konwencja) i naprawa przeniesie je na nowe miejsce.
+- **Skan z zaznaczonym DAT-em kartridżowym identyfikował CHD innych platform.**
+  Zaznaczona pula tłumaczeń [T-En] nigdy nie jest „kompletna", więc skan zawsze
+  przechodził do Fazy 2, a ta uruchamiała głęboką identyfikację CHD dla
+  WSZYSTKICH włączonych DAT-ów (PS1/PS2 z `Z:\ROMS`, ToSort) — z ekstrakcją
+  obrazów z NAS-a. Teraz:
+  - identyfikacja CHD rusza tylko dla DAT-ów PŁYTOWYCH (format chd/rvz albo
+    cue/gdi/iso/chd w treści DAT-u); bez nich — jedna linia w logu i koniec,
+  - przy zaznaczonej platformie dotyczy wyłącznie zaznaczonych DAT-ów
+    (Faza 2 nadal doskanowuje pliki, ale nie mieli CHD innych platform).
+- **Log CHD pokazuje źródło.** Pełne ścieżki w „CHD głęboko / OK / BRAK /
+  info / POMIJAM" i w sondzie nagłówka przy skanie; na starcie identyfikacji
+  podsumowanie „CHD do sprawdzenia: N w K katalogach" z listą katalogów i DAT-ów.
+  Co 200 plików skan loguje pełną ścieżkę zamiast samej nazwy.
+- **Odznaczony DAT tracił zapamiętany raport.** Stan raportu był jednym plikiem
+  `report_state_cache.pkl`, nadpisywanym po każdym skanie samymi WŁĄCZONYMI
+  DAT-ami, a widok po skanie czyścił zapamiętane stany — odznaczenie DAT-u (żeby
+  skan był szybszy) kasowało jego wynik. Teraz raport jest zapisywany OSOBNO
+  per DAT (`report_states\<hash>.pkl`): skan zapisuje tylko przeskanowane DAT-y,
+  wyłączony zostaje nietknięty i dalej pokazuje ostatni stan. Stary wspólny
+  plik jest jednorazowo rozbijany na pliki per DAT (sam plik zostaje). Indeks
+  plików nie był dotknięty — sumy i identyfikacja CHD zawsze się zachowywały.
+
+## [0.6.32] — 2026-09-15
+
+### Naprawione
+- **Podmiana na tłumaczenie ignorowała format katalogu.** Slot dostawał nazwę
+  ROM-u z DAT-u („… (Japan).rom"), więc w katalogu z formatem `zip` powstawał
+  link `.rom` wskazujący na archiwum `.zip` tłumaczenia, a oryginalny
+  `<gra>.zip` zostawał obok i to on się uruchamiał (MSX2: Metal Gear 2,
+  Gekitotsu Pennant Race 2). Teraz slot wynika twardo z ustawienia katalogu:
+  - `zip` / `7z` / `chd` / `rvz` → `<gra>.<ext>`, `extract` → luźny ROM,
+    `keep` → forma tłumaczenia;
+  - oryginał w KAŻDEJ formie (luźny ROM, `.zip`, `.7z`) trafia do
+    `to sort\translated\<system>` — bez duplikatu obok tłumaczenia;
+  - rzadki rozjazd form: luźne tłumaczenie w katalogu `zip` jest pakowane do
+    `<gra>.zip`, zip w katalogu `extract` — wypakowany; innych przejść
+    (np. do 7z/CHD) nie robi, a oryginał zostaje nietknięty.
+- **Zip tłumaczenia w innej metodzie kompresji niż ustawiona** (np. ZSTD przy
+  deflate) nie jest linkowany, tylko kopiowany do slotu i przepakowany
+  z weryfikacją SHA-1. Link przeniósłby niezgodny zip do kolekcji, a
+  normalizacja kompresji w naprawie linków nie dotyka.
+- Matcher nie uznaje już starej podmiany (link `.rom` → `.zip`, luźny ROM
+  w katalogu `zip`) za spełnioną — gra traci 🌐 i można ją podmienić ponownie.
+  Porównanie sumy slotu-archiwum bierze też sumę ROM-u w środku.
+- „Cofnij podmianę" obsługuje wszystkie formy gry, slot zbudowany
+  z tłumaczenia (spakowany/przepakowany) oraz stan po starej podmianie.
+
 ## [0.6.31] — 2026-09-14
 
 ### Naprawione (z code review — druga partia)
