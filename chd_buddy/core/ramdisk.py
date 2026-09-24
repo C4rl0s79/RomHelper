@@ -42,6 +42,114 @@ def available() -> bool:
     return _imdisk_exe() is not None
 
 
+def _is_admin() -> bool:
+    try:
+        from .elevate import is_admin
+        return is_admin()
+    except Exception:
+        return False
+
+
+def _run_elevated_ps(ps_command: str, timeout: float = 180.0) -> bool:
+    """Uruchamia polecenie PowerShell JAKO ADMINISTRATOR (UAC), CZEKA i zwraca
+    True gdy proces zakończył się kodem 0. Używane, gdy główny program NIE jest
+    podniesiony — imdisk `-a`/`-D` i Format-Volume wymagają admina. Jeden prompt
+    UAC na wywołanie. Poza Windows / przy błędzie ShellExecute zwraca False."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return False
+
+    class _SHELLEXECUTEINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIconOrMonitor", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE)]
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_NO_CONSOLE = 0x00008000
+    info = _SHELLEXECUTEINFO()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
+    info.lpVerb = "runas"
+    info.lpFile = "powershell.exe"
+    info.lpParameters = (f'-NoProfile -NonInteractive -WindowStyle Hidden '
+                         f'-Command "{ps_command}"')
+    info.nShow = 0                                # SW_HIDE
+    try:
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+            return False
+        if not info.hProcess:
+            return False
+        ctypes.windll.kernel32.WaitForSingleObject(
+            info.hProcess, int(max(1.0, timeout) * 1000))
+        code = wintypes.DWORD()
+        ctypes.windll.kernel32.GetExitCodeProcess(
+            info.hProcess, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(info.hProcess)
+        return code.value == 0
+    except Exception:
+        return False
+
+
+def _create_elevated(size_gb: int, letter: str, label: str,
+                     log: Optional[LogCB]) -> Optional[Path]:
+    """Tworzy RAM dysk, gdy główny program NIE jest adminem: JEDEN elewowany
+    PowerShell robi attach + format (jeden prompt UAC). Istniejący, zapisywalny
+    R: przejmujemy BEZ promptu. Przy niepowodzeniu (odmowa UAC/błąd) → None,
+    scratch spadnie na dysk fizyczny (jak dotąd)."""
+    global _ACTIVE, _SIZE_GB, _LETTER
+    _LETTER = letter
+    root = Path(f"{letter}:\\")
+    if _ready(root):                              # reuse z poprzedniej sesji — 0 UAC
+        _ACTIVE = root
+        _SIZE_GB = size_gb
+        if log:
+            log(f"RAM dysk: używam istniejącego {letter}: (bez UAC).")
+        return root
+    exe = _imdisk_exe()
+    if exe is None:
+        return None
+    if log:
+        log(f"RAM dysk: tworzę {letter}: jako administrator — pojawi się "
+            f"JEDNORAZOWY prompt UAC (potem starty są bez pytania).")
+    # jeden skrypt: (odłącz zalegŁe RAW) attach + format. `2>$null` — cichy
+    # detach gdy nic nie ma. Kod wyjścia liczy Format-Volume.
+    ps = ("$ErrorActionPreference='Stop'; "
+          f"& '{exe}' -D -m {letter}: 2>$null; Start-Sleep -Milliseconds 300; "
+          f"& '{exe}' -a -s {size_gb}G -m {letter}: "
+          f"-p '/fs:ntfs /q /y /v:{label}'; Start-Sleep -Milliseconds 600; "
+          f"Format-Volume -DriveLetter {letter} -FileSystem NTFS "
+          f"-NewFileSystemLabel {label} -Confirm:$false -Force | Out-Null")
+    _run_elevated_ps(ps)                          # kod wyjścia bywa zwodniczy →
+    for _ in range(20):                           # weryfikujemy realną gotowość
+        if _ready(root):
+            _ACTIVE = root
+            _SIZE_GB = size_gb
+            if log:
+                log(f"RAM dysk: gotowy {letter}: ({size_gb} GB, sformatowany).")
+            return root
+        time.sleep(0.4)
+    if log:
+        log(f"RAM dysk: nie utworzono {letter}: (odmowa UAC lub błąd) — "
+            f"operacje tymczasowe pójdą na dysk fizyczny.")
+    return None
+
+
 def active_root() -> Optional[Path]:
     """Korzeń aktywnego RAM dysku albo None.
 
@@ -187,6 +295,11 @@ def create(size_gb: int = 40, letter: str = "R", label: str = "RAMTEMP",
             log("RAM dysk: brak ImDisk — operacje tymczasowe na dysku "
                 "fizycznym z wolnym miejscem.")
         return None
+    # Główny program działa BEZ admina (0.6.59): imdisk `-a`/format wymagają
+    # admina → podnosimy TYLKO tę operację (jeden prompt UAC). Gdy już admin —
+    # lecimy dawną, bezpośrednią ścieżką (bez promptu).
+    if os.name == "nt" and not _is_admin():
+        return _create_elevated(size_gb, letter, label, log)
     drive = f"{letter}:"
     root = Path(drive + "\\")
     last_err = ""
@@ -307,13 +420,26 @@ def remove(letter: str = "R", log: Optional[LogCB] = None,
     root = Path(drive + "\\")
     if not root.exists():
         return
+    # BEZ admina (0.6.59): `-D` też wymaga admina. NIE prosimy o UAC przy KAŻDYM
+    # zamknięciu — zostawiamy R: zamontowany; następny start przejmie go bez
+    # promptu (reuse_if_exists/_ready). RAM zwolni reboot albo ręczny detach.
+    if os.name == "nt" and not _is_admin():
+        if log:
+            log(f"RAM dysk: {drive} zostaje zamontowany (program bez admina — "
+                f"nie proszę o UAC przy zamknięciu; następny start go przejmie).")
+        return
     last = ""
     for i in range(1, max(1, attempts) + 1):
         try:
+            # timeout: wołane z closeEvent na WĄTKU GUI — zawieszony detach
+            # (zajęty wolumin) nie może zamrozić zamykania programu
             r = subprocess.run([exe, "-D", "-m", drive],
                                capture_output=True, text=True, encoding="oem",
-                               errors="replace", creationflags=_FLAGS)
+                               errors="replace", creationflags=_FLAGS,
+                               timeout=6)
             last = (r.stderr or r.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            last = "timeout detach"
         except OSError as e:
             last = str(e)
         time.sleep(0.6)

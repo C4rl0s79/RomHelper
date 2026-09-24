@@ -123,8 +123,10 @@ class Settings:
     ramdisk_enabled: bool = True
     ramdisk_size_gb: int = 40
     ramdisk_letter: str = "R"
-    # Przy starcie proś o podniesienie do administratora (UAC), by móc tworzyć
-    # symlinki bez trybu dewelopera. Odmowa UAC => program działa bez admina.
+    # Przy starcie proś o podniesienie CAŁEGO programu do administratora (UAC).
+    # DOMYŚLNIE WŁĄCZONE: symlinki (używane stale) wymagają admina, gdy tryb
+    # dewelopera Windows jest wyłączony. Bez admina RAM-dysk ImDisk i tak da się
+    # utworzyć (osobny prompt UAC), ale symlinki nie powstaną.
     auto_elevate: bool = True
     # Opcje naprawy Kombajnu (checkboxy w pasku) — trwałe między sesjami.
     fix_clean: bool = False          # nieznane → ToSort

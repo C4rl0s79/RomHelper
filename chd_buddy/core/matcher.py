@@ -30,6 +30,7 @@ from .datfile import DatRom
 from .datstore import DatEntry
 from .fileindex import FileIndex
 from .models import MediaType
+from .paths import dir_prefix, is_under
 
 
 class RomState(Enum):
@@ -211,7 +212,7 @@ def _row_full_match(row, rom) -> bool:
 def _pick(rows: Sequence, canonical: Path, target_dir: Path):
     """Wybiera najlepszego kandydata: kanoniczny > w katalogu DAT-a > inny."""
     canon = str(canonical)
-    tprefix = os.path.normcase(str(target_dir)).rstrip("\\/") + os.sep
+    tprefix = dir_prefix(target_dir)
     in_dir = None
     other = None
     for r in rows:
@@ -320,8 +321,7 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
 
 def _under(path: str, target_dir) -> bool:
     """Czy `path` leży w katalogu docelowym (bezpośrednio lub w podkatalogu)."""
-    return os.path.normcase(path).startswith(
-        os.path.normcase(str(target_dir)).rstrip("\\/") + os.sep)
+    return is_under(path, target_dir)
 
 
 def _archives_with_game(game, index: FileIndex) -> dict:
@@ -330,6 +330,12 @@ def _archives_with_game(game, index: FileIndex) -> dict:
     gdzie CAŁA gra siedzi w jednym pliku <gra>.zip."""
     per: dict[str, dict[int, str]] = {}
     for i, rom in enumerate(game.roms):
+        if (rom.size or 0) == 0:
+            # PUSTY znacznik (size=0): suma „pustego pliku" ma KAŻDE archiwum z
+            # pustym wpisem w całej kolekcji — nie niesie tożsamości, a wyszukanie
+            # po niej dawało tysiące archiwów na grę (DSi: ~5 min dopasowania).
+            # Sprawdzany po NAZWIE w _match_game_archive, tylko u kandydatów.
+            continue
         rows: list = []
         if rom.sha1:
             rows = index.find_member_sha1(rom.sha1)
@@ -354,6 +360,38 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
     """
     need = set(range(len(game.roms)))
     per = _archives_with_game(game, index)          # {archiwum: {rom_idx: nazwa}}
+    # PUSTE ZNACZNIKI (size=0, np. .msu MSU-1): sha1/crc puste, więc
+    # _archives_with_game ich nie łapie. Liczymy je jako obecne, gdy archiwum ma
+    # członka o tej NAZWIE (pusty wpis). Bez tego kompletne <gra>.zip nigdy nie
+    # jest „pełne" → naprawa wypakowuje/pakuje w kółko.
+    # Pytamy o członków WYŁĄCZNIE archiwa, które mają już WSZYSTKIE niepuste
+    # ROM-y gry (zwykle 1–2) — nie każde archiwum z jakimkolwiek wspólnym ROM-em
+    # (DSi: plik wspólny dla ~1200 gier → milion zapytań SQL na DAT).
+    empty_idx = {i for i, r in enumerate(game.roms) if (r.size or 0) == 0}
+    nonempty = need - empty_idx
+    if empty_idx and per and nonempty:
+        for a, m in per.items():
+            if not nonempty <= set(m):
+                continue                 # nie kandydat na pełną grę
+            try:
+                rows = index.members_of(a)
+            except Exception:
+                rows = []
+            by_name = {row["name"]: row for row in rows}
+            taken = set(m.values())
+            for i in empty_idx:
+                nm = game.roms[i].name
+                if nm in by_name:
+                    m[i] = nm
+                    taken.add(nm)
+                    continue
+                # pusty wpis pod INNĄ nazwą → obecny (naprawa przepakuje nazwę)
+                alt = next((r["name"] for r in rows
+                            if (r["size"] or 0) == 0 and r["name"] not in taken),
+                           None)
+                if alt is not None:
+                    m[i] = alt
+                    taken.add(alt)
     full = [(a, m) for a, m in per.items() if need <= set(m)]
     if not full:
         return None
@@ -394,12 +432,34 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
         except Exception:
             return False
 
+    def _own(archive: str) -> bool:
+        # archiwum pod NAZWĄ TEJ gry (<gra>.zip) — to jej kanoniczny plik
+        return Path(archive).stem.lower() == game.name.lower()
+
+    # ARCADE (parent/clone/BIOS): własny zip gry z DODATKOWYMI ROM-ami (rodzica,
+    # BIOS-u, klonów — np. set non-merged/merged) jest POPRAWNY do gry; NIE
+    # przepakowujemy go w miejscu (to wycinało ROM-y innych gier — 16.09: 4095
+    # przepakowań nadzbiorów w fbneo).
+    arcade = False
+    try:
+        from . import mamesets
+        arcade = mamesets.is_arcade(entry)
+    except Exception:
+        pass
+
     in_dir = [(a, m) for a, m in full if _under(a, entry.target_dir)]
     if in_dir:
-        in_dir.sort(key=lambda am: (0 if _names_ok(am[1]) else 1, am[0].lower()))
+        # NAJPIERW własny zip gry (pgm.zip przed ddp2.zip zawierającym ROM-y
+        # pgm) — dawniej alfabetycznie, więc gra „znajdowała się" w cudzym zipie.
+        in_dir.sort(key=lambda am: (0 if _own(am[0]) else 1,
+                                    0 if _names_ok(am[1]) else 1,
+                                    am[0].lower()))
         archive, members = in_dir[0]
         sup = _superset(archive)
-        if _names_ok(members) and not sup:
+        # własny zip arcade z dodatkami = OK (flaga `sup` zostaje PRAWDZIWA —
+        # przy złych nazwach rebuilder musi wiedzieć, że to nadzbiór)
+        tolerate = arcade and sup and _own(archive)
+        if _names_ok(members) and (not sup or tolerate):
             # w katalogu docelowym + poprawne nazwy + DOKŁADNY zestaw => zielone,
             # CHYBA że ZIP ma złą metodę kompresji (zstd/lzma) → „do naprawy"
             # (repack na deflate w miejscu; treść OK, tylko kontener niezgodny).
@@ -463,6 +523,18 @@ def match_game(entry: DatEntry, game, index: FileIndex,
     Układ: gra WIELOPLIKOWA luzem (bin/cue, gdi+tracki) dostaje podkatalog
     per gra (gdy entry.subdir_per_game); CHD i archiwa są płasko.
     """
+    # ARCADE (parent/clone): oczekiwana zawartość zipa wg `entry.arcade_format`.
+    # split-klon = tylko ROM-y unikalne (współdzielone bierze emulator z rodzica);
+    # non-merged/merged = pełna lista. Ten SAM helper liczy rebuilder → zero pętli
+    # „przepakuj". Zwykłe (nie-arcade) DAT-y: cloneof pusty → bez zmian.
+    if ((getattr(game, "cloneof", "") or getattr(game, "romof", ""))
+            and getattr(entry, "arcade_format", "")):
+        from . import mamesets
+        eff_roms = mamesets.effective_roms(entry, game)
+        if len(eff_roms) != len(game.roms):
+            import dataclasses
+            game = dataclasses.replace(game, roms=eff_roms)
+
     multi = len(game.roms) > 1 and getattr(entry, "subdir_per_game", True)
     single = len(game.roms) == 1
     statuses = [match_rom(entry, game.name, rom, index, game_multi=multi,
@@ -564,8 +636,7 @@ def match_game(entry: DatEntry, game, index: FileIndex,
     src = chd_row["path"]
     if _same_path(src, str(canonical)) or _link_satisfies(canonical, src, index):
         state = RomState.HAVE_CHD
-    elif os.path.normcase(src).startswith(
-            os.path.normcase(str(entry.target_dir)).rstrip("\\/") + os.sep):
+    elif is_under(src, entry.target_dir):
         state = RomState.WRONG_NAME
     else:
         state = RomState.ELSEWHERE
@@ -609,6 +680,61 @@ def match_store(entries: Sequence[DatEntry], index: FileIndex,
         if log:
             log(f"DAT: {e.name}")
         reports.append(match_entry(e, index, subs))
+    return reports
+
+
+def match_reports(entries: Sequence[DatEntry], index: FileIndex, *,
+                  subs: Optional[dict] = None,
+                  log: Optional[callable] = None,
+                  on_progress: Optional[callable] = None,   # (i, n, tekst)
+                  detail: Optional[callable] = None,         # (i, n, tekst)
+                  cancel=None,
+                  label: str = "dopasowanie",
+                  build_cache: bool = True,
+                  drop_cache: bool = True) -> list[DatReport]:
+    """Buduje raporty (per DAT) WYŁĄCZNIE z indeksu — bez skanu plików.
+
+    Wspólny etap „dopasowanie" dla skanu i naprawy (jedna ścieżka zamiast dwóch
+    rozjeżdżających się). Wczytuje indeks do RAM (`build_match_cache`), dopasowuje
+    per gra z podpostępem (wielkie DAT-y pokazują „gra X/Y"), zwalnia cache.
+    Cancel przerywa między DAT-ami i między grami (wyniki cząstkowe zostają).
+
+    Dla naprawy: ponowne dopasowanie z indeksu ODZWIERCIEDLA to, co już
+    naprawiono (naprawa zapisuje wyniki do indeksu z commitem per operacja),
+    więc gotowe gry są HAVE i wypadają z przepisu → naprawa wznawia od miejsca,
+    gdzie stanęła. `build_cache=False` gdy cache już zbudowany (skan)."""
+    subs = subs or {}
+    reports: list[DatReport] = []
+    if build_cache:
+        index.build_match_cache()
+    try:
+        total = len(entries)
+        for i, e in enumerate(entries):
+            if cancel is not None and cancel.is_set():
+                if log:
+                    log(f"PRZERWANO {label} na {i}/{total} DAT-ów — "
+                        f"wyniki cząstkowe zachowane.")
+                break
+            if on_progress:
+                on_progress(i, total, f"{label}: {e.name}")
+            e.load()
+            games = e.games
+            ng = len(games) or 1
+            if log and ng > 300:
+                log(f"  {label}: {e.name} — {ng} gier…")
+            rep = DatReport(e)
+            for gi, g in enumerate(games):
+                if cancel is not None and cancel.is_set():
+                    break
+                if detail and gi % 300 == 0:
+                    detail(gi, ng, f"{e.name}: gra {gi}/{ng}")
+                rep.statuses.extend(match_game(e, g, index, subs))
+            if detail:
+                detail(ng, ng, f"{e.name}: {ng}/{ng}")
+            reports.append(rep)
+    finally:
+        if drop_cache:
+            index.drop_match_cache()
     return reports
 
 
@@ -688,10 +814,16 @@ def deep_probe_chds(
             if key in seen or not p.lower().endswith(".chd"):
                 continue
             seen.add(key)
-            if row["data_sha1"] and row["data_sha1"] in known:
-                # zidentyfikowany po TREŚCI; ale jeśli KONTENER jeszcze
-                # niesprawdzony (bad_container=-1) — dołóż na TANI check
-                # (bez ekstrakcji), żeby wykryć np. DVD zrobione jako CD.
+            if row["data_sha1"]:
+                # JUŻ zidentyfikowany po TREŚCI (dopasowany do SWOJEGO DAT-u
+                # kiedyś) — NIE ekstrahujemy go ponownie dla INNEGO DAT-u.
+                # (Ból regresji: 5648 CHD ps2/psx/3do/saturn mielonych przeciw
+                # JEDNEMU obcemu DAT-owi CD32, bo ich odcisk nie był w wąskim
+                # `known`.) Plik z ustalonym `data_sha1` jest zidentyfikowany
+                # niezależnie od tego, które DAT-y są teraz w puli. Wyjątek:
+                # kontener niesprawdzony (bad_container=-1) → dołóż na TANI check
+                # nagłówka (bez ekstrakcji). Ponowną PEŁNĄ identyfikację wymusza
+                # zmiana pliku (mtime) albo pełny skan katalogu.
                 bc = row["bad_container"] if "bad_container" in row.keys() else 0
                 if bc != -1:
                     continue
@@ -715,7 +847,8 @@ def deep_probe_chds(
             d = str(Path(row["path"]).parent)
             per_dir[d] = per_dir.get(d, 0) + 1
         _log(f"CHD do sprawdzenia: {len(candidates)} w {len(per_dir)} katalogach "
-             f"(DAT-y: {', '.join(e.name for e in entries[:5])}"
+             f"(dopasowuję do {len(entries)} DAT-ów płytowych, {merged.games} gier: "
+             f"{', '.join(e.name for e in entries[:5])}"
              f"{' …' if len(entries) > 5 else ''})")
         for d, n in sorted(per_dir.items(), key=lambda kv: -kv[1])[:15]:
             _log(f"  {n:5}  {d}")
@@ -780,7 +913,10 @@ def deep_probe_chds(
         """W wątku roboczym: chd.info + dopasowanie nagłówka. BEZ dostępu do
         indeksu (SQLite tylko w wątku głównym). Zwraca krotkę do zastosowania."""
         path = Path(row["path"])
-        dsha_known = bool(row["data_sha1"]) and row["data_sha1"] in known
+        # ustalony data_sha1 = JUŻ zidentyfikowany (dowolny DAT) → tylko tani
+        # check kontenera z nagłówka, NIGDY ekstrakcja. Nie wymagamy obecności
+        # w bieżącym `known` (plik mógł być naprawiony do innego DAT-u).
+        dsha_known = bool(row["data_sha1"])
         info = None
         try:
             info = chd.info(path)
@@ -812,8 +948,11 @@ def deep_probe_chds(
                 tag, row, info = res[0], res[1], res[2]
                 path = Path(row["path"])
                 if tag == "known":
-                    _flag_container(path, info,
-                                    known[row["data_sha1"]].media)
+                    # media z DAT-u jeśli odcisk jest w bieżącej puli; gdy plik
+                    # naprawiony do INNEGO (niezaładowanego) DAT-u — media=None
+                    # (_flag_container ustawi 0: bez pewności nie strasz).
+                    _m = known.get(row["data_sha1"])
+                    _flag_container(path, info, _m.media if _m else None)
                     _head_tick(path.name)
                     continue
                 hit, err = res[3], res[4]
@@ -913,7 +1052,9 @@ def deep_probe_chds(
                 # deep_identify (Próba/✔/✗) się PRZEPLATAJĄ — bez nazwy „✔ ==
                 # DAT 'X'" wyglądałaby, jakby należała do sąsiedniego „CHD
                 # głęboko: Y". Prefiks czyni log jednoznacznym i weryfikowalnym.
-                _pfx = f"[{path.name}] " if n_deep > 1 else ""
+                # prefiks: PLATFORMA/plik (katalog nadrzędny = platforma), by
+                # w przeplatanym logu było widać, z którego katalogu leci CHD.
+                _pfx = f"[{path.parent.name}/{path.name}] " if n_deep > 1 else ""
                 r = deep_identify(chd, path, merged, wd,
                                   log=lambda m, _p=_pfx: _log(f"  {_p}{m}"),
                                   on_progress=_dp,

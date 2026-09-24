@@ -57,7 +57,7 @@ class HierarchyDialog(QDialog):
         lay.addWidget(self.tree, 1)
 
         rules = DirRules(dat_root)
-        groups = group_by_platform(entries, rules)   # z ręcznymi przypięciami
+        groups = group_by_platform(entries, rules, dat_root)  # z przypięciami + tier
         multi = 0
         for plat in sorted(groups):
             ents = groups[plat]     # już w kolejności priorytetu z discover()

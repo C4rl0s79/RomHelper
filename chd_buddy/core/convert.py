@@ -66,13 +66,19 @@ def _zip_compression(method: str):
 def pack_zip(files: Sequence[Path], dst_zip: Path, *,
              arcnames: Optional[Sequence[str]] = None,
              level: int = 6, method: str = "deflate",
+             empty_entries: Sequence[str] = (),
              log: LogCB = lambda m: None) -> ConvertResult:
     """Pakuje pliki do ZIP i WERYFIKUJE (SHA-1 członków po odczycie).
     `level` — poziom 0–9 (0=store, 6=domyślny, 9=maks). `method` — „deflate"
-    (zgodne wszędzie) albo „zstd" (mniejszy, ale słabo wspierany)."""
+    (zgodne wszędzie) albo „zstd" (mniejszy, ale słabo wspierany).
+    `empty_entries` — nazwy ROM-ów o rozmiarze 0 (puste znaczniki, np. `.msu`
+    MSU-1): zapisywane jako PUSTE wpisy, żeby archiwum było KOMPLETNE wg DAT-u
+    (bez tego zip ma o jeden plik za mało → gra nigdy nie „kompletna" → naprawa
+    wypakowuje/pakuje w kółko)."""
     arcnames = list(arcnames) if arcnames else [f.name for f in files]
     tmp = dst_zip.with_name(dst_zip.name + ".chdbuddy_tmp.zip")
     expected: dict[str, str] = {}
+    empty_sha = "da39a3ee5e6b4b0d3255bfef95601890afd80709"   # sha1(b"")
     lvl = max(0, min(int(level), 9))
     comp, ok = _zip_compression(method)
     if not ok:
@@ -84,6 +90,9 @@ def pack_zip(files: Sequence[Path], dst_zip: Path, *,
                 _, _, sha1 = hash_file(f)
                 expected[arc] = sha1
                 z.write(f, arc)
+            for name in empty_entries:
+                expected[name] = empty_sha
+                z.writestr(name, b"")           # pusty znacznik (size=0)
     except OSError as e:
         tmp.unlink(missing_ok=True)
         return ConvertResult(False, message=f"pakowanie ZIP: {e}")
@@ -101,7 +110,8 @@ def pack_zip(files: Sequence[Path], dst_zip: Path, *,
         tmp.unlink(missing_ok=True)
         return ConvertResult(False, message=f"ZIP weryfikacja: {e}")
     os.replace(tmp, dst_zip)
-    log(f"  ZIP OK: {dst_zip.name} ({len(files)} plików, zweryfikowane)")
+    _n = len(files) + len(list(empty_entries))
+    log(f"  ZIP OK: {dst_zip.name} ({_n} plików, zweryfikowane)")
     return ConvertResult(True, dst=dst_zip)
 
 
@@ -452,8 +462,40 @@ def _content_matches_game(chd_path: Path, game, chdman, work_dir: Path,
         return False
 
 
-def _game_physical_files(target_dir: Path, game, subdir: bool) -> list[Path]:
-    """Fizyczne (nie-symlink) pliki gry w kanonicznej lokalizacji."""
+def _indexed_by_parent(index, target_dir: Path):
+    """{normcase(katalog): [ścieżki]} fizycznych plików pod `target_dir` —
+    JEDNO zapytanie do indeksu zamiast `is_file`/`islink` per ROM na NAS.
+    None, gdy indeksu brak (wtedy wołający sprawdza dysk)."""
+    if index is None:
+        return None
+    try:
+        rows = index.all_under(target_dir, physical_only=True)
+    except Exception:
+        return None
+    out: dict = {}
+    for r in rows:
+        p = Path(r["path"])
+        out.setdefault(os.path.normcase(str(p.parent)), {})[
+            os.path.normcase(str(p))] = p
+    return out
+
+
+def _game_physical_files(target_dir: Path, game, subdir: bool,
+                         indexed=None) -> list[Path]:
+    """Fizyczne (nie-symlink) pliki gry w kanonicznej lokalizacji.
+
+    `indexed` (z `_indexed_by_parent`) — odpowiedź z INDEKSU, bez rund SMB.
+    Dawniej 2 rundy NAS (is_file + islink) na KAŻDY ROM każdej gry także wtedy,
+    gdy nie było nic do konwersji (Amiga: ~110 s ciszy na katalog). Wynik z
+    indeksu służy do DECYZJI; przed faktyczną konwersją wołający sprawdza dysk."""
+    if indexed is not None:
+        if subdir and len(game.roms) > 1:
+            d = target_dir / game.name
+            return sorted(indexed.get(os.path.normcase(str(d)), {}).values())
+        here = indexed.get(os.path.normcase(str(target_dir)), {})
+        return sorted({here[k] for k in (
+            os.path.normcase(str(target_dir / r.name)) for r in game.roms)
+            if k in here})
     if subdir and len(game.roms) > 1:
         d = target_dir / game.name
         if not d.is_dir():
@@ -515,10 +557,13 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
         if fmt in ("keep", "", "extract"):
             continue
         subdir = bool(eff.get("subdir_per_game", True))
+        # pliki z INDEKSU (1 zapytanie na katalog) — decyzja bez rund SMB
+        _idx_files = _indexed_by_parent(index, rep.entry.target_dir)
         for game in rep.entry.games:
             if cancel is not None and cancel.is_set():
                 break
-            files = _game_physical_files(rep.entry.target_dir, game, subdir)
+            files = _game_physical_files(rep.entry.target_dir, game, subdir,
+                                         indexed=_idx_files)
             if not files:
                 continue
             cur = current_format(files)
@@ -527,6 +572,13 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
             if cur != "loose":
                 st.skipped += 1        # np. już chd/zip w innym docelowym — pomiń
                 continue
+            if _idx_files is not None:
+                # REALNA konwersja → potwierdź stan na dysku (indeks mógł się
+                # rozjechać); dopiero tu dotykamy NAS, i tylko dla tej gry
+                files = [f for f in files
+                         if f.is_file() and not os.path.islink(f)]
+                if not files or current_format(files) != "loose":
+                    continue
             base = game.name
             if _convert_one(files, rep.entry.target_dir, base, fmt, subdir,
                             len(game.roms), tools, index, dry_run, log, st,
@@ -545,9 +597,18 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
                     index.remove_path(f)
             except OSError:
                 pass
-        for d in deferred_dirs:
+        # PUSTE PODKATALOGI po zabraniu źródeł — dla KAŻDEJ platformy, także gier
+        # JEDNOPLIKOWYCH w układzie <gra>/<gra>.iso (PSP, GC/Wii RVZ…). Dawniej
+        # kasowaliśmy tylko `deferred_dirs`, które wypełniał gate `n_roms > 1`, więc
+        # po konwersji pojedynczego ISO zostawał pusty katalog do ręcznego czyszczenia.
+        # rmdir zdejmuje TYLKO pusty katalog → nigdy nie ruszy katalogu platformy
+        # ani gry z pozostałymi plikami. Od najgłębszych, by zdjąć zagnieżdżenia.
+        empty_dirs = {Path(f).parent for f in deferred}
+        empty_dirs.update(deferred_dirs)
+        for d in sorted(empty_dirs, key=lambda p: len(str(p)), reverse=True):
             try:
-                d.rmdir()          # tylko puste — po zabraniu ścieżek
+                d.rmdir()          # tylko puste — inaczej cicho odpada
+                log(f"USUNIĘTO pusty katalog źródła: {d}")
             except OSError:
                 pass
     return st
@@ -822,9 +883,15 @@ def _link_child_to_parent(child_final: Path, parent_final: Path, make_links: boo
     """Tworzy SYMLINK child_final -> parent_final (dziecko dostaje własną nazwę,
     plik fizyczny zostaje u rodzica). Zasada: gdy symlinku NIE DA SIĘ utworzyć,
     nic nie kopiujemy (żadnych duplikatów) — zwracamy False."""
-    from .linker import (LinkPrivilegeError, create_link, is_link, remove_link)
+    from .linker import (LinkPrivilegeError, create_link, is_link, remove_link,
+                         same_file)
     if dry_run:
         log(f"  LINK(dziecko) {child_final} -> {parent_final} (podgląd)")
+        return True
+    # JUŻ zlinkowane (hardlink/symlink z poprzedniego uruchomienia) → nic nie rób,
+    # NIE przebudowuj fizycznie. Hardlink nie jest reparse pointem, więc `is_link`
+    # by go nie wychwycił i niżej poszłoby „KONFLIKT: zwykły plik" → kopia.
+    if os.path.lexists(child_final) and same_file(child_final, parent_final):
         return True
     if not make_links or links_blocked[0]:
         log(f"  SYMLINK pominięty (brak uprawnień/wyłączony): {child_final.name}")
@@ -867,7 +934,7 @@ def _relink_verified_duplicate(child: Path, parent: Path, prof, index,
     ZOSTAWIA fizyczny plik (nic nie kasujemy, żadnych strat). Zwraca True gdy
     dziecko wskazuje już na rodzica."""
     from .linker import (LinkPrivilegeError, create_link, is_link,
-                         remove_link)
+                         remove_link, same_file)
     child = Path(child)
     parent = Path(parent)
     # rodzic MUSI być realnym plikiem — inaczej skasowalibyśmy jedyną kopię
@@ -894,6 +961,9 @@ def _relink_verified_duplicate(child: Path, parent: Path, prof, index,
             f"— zostawiam fizyczny plik")
         return False
     child.parent.mkdir(parents=True, exist_ok=True)
+    # JUŻ hardlink/symlink do rodzica → nic nie kasuj, nic nie twórz.
+    if os.path.lexists(child) and same_file(child, parent):
+        return True
     if os.path.lexists(child):
         if is_link(child):
             try:
@@ -920,7 +990,14 @@ def _relink_verified_duplicate(child: Path, parent: Path, prof, index,
         return False
     if index is not None:
         try:
-            index.mark_link(child)
+            # hardlink = zwykły plik w indeksie; is_link tylko dla symlinku
+            if is_link(child):
+                index.mark_link(child)
+            elif prof:
+                row = index.lookup(parent)
+                if row is not None and row["sha1"]:
+                    index.record_file(child, row["crc32"], row["md5"],
+                                      row["sha1"])
         except Exception:
             pass
     log(f"  RELINK(dziecko) {child.name} -> {parent} "
@@ -985,8 +1062,15 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         dry_run: bool = False, log: LogCB = lambda m: None,
                         cancel=None, on_progress=None, detail=None,
                         on_converted=None, delete_roots=None, make_links=True,
-                        slot=None):
+                        slot=None, hierarchy=None, finals=None):
     """Konwersja PROSTO ZE ŹRÓDŁA na RAM → w docelowym ląduje TYLKO finał.
+
+    hierarchy — `Hierarchy` DAT-ów: JEDYNE źródło decyzji „link czy kopia
+    fizyczna" (link tylko DAT niżej → DAT wyżej, ta sama platforma). Bez niej
+    budowana z kolejności `reports`.
+    finals — współdzielona między wywołaniami (naprawa katalog po katalogu)
+    mapa (platforma, odcisk) → plik finalny; dziecko w późniejszym katalogu
+    linkuje do CHD zrobionego przez rodzica wcześniej w tej samej naprawie.
 
     Dla gier, których źródłem są luźne pliki albo ścieżki w archiwum (ToSort),
     i które trzeba przekonwertować (chd/rvz/zip): zbiera ścieżki na RAM,
@@ -1010,7 +1094,11 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     # ODCISK gry (game_profile) -> ścieżka finalnego pliku (rodzic). Kolejne
     # DAT-y z tym samym odciskiem (DZIECI, np. 1G1R) NIE robią drugiego CHD —
     # dostają SYMLINK z WŁASNĄ nazwą do pliku rodzica (jedna kopia fizyczna).
-    final_by_profile: dict = {}
+    final_by_profile: dict = finals if finals is not None else {}
+    from .hierarchy import Hierarchy
+    hier = hierarchy if hierarchy is not None else Hierarchy()
+    for _rep in reports:
+        hier.add(_rep.entry, rules_fn)
     _links_blocked = [False]                   # brak uprawnień → nic nie kopiujemy
     # Które źródła są WSPÓŁDZIELONE przez >1 grę (np. ścieżka audio dzielona
     # przez płyty zestawu, albo plik potrzebny też grze idącej do fallbacku)?
@@ -1046,8 +1134,8 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                     if _s.rom.crc and _s.rom.size:
                         _needed_crc.add(
                             (_s.rom.crc.lower().zfill(8), _s.rom.size))
-    del_prefixes = [os.path.normcase(str(Path(os.path.abspath(r)))).rstrip("\\/")
-                    + os.sep for r in (delete_roots or []) if r]
+    from .paths import dir_prefix, dir_prefixes
+    del_prefixes = dir_prefixes(delete_roots)
     n_total = sum(len(r.entry.games) for r in reports) or 1
     gi = 0
     # CACHE luźnych plików per KATALOG DOCELOWY (sha1 → [ścieżki]): budowany RAZ
@@ -1122,11 +1210,9 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     # (np. ten sam dump na MSX i Master System) to DWA legalne pliki fizyczne —
     # NIE rodzic/dziecko, żadnych cross-platformowych symlinków. Globalny dedug
     # po samym odcisku robił „wojnę między katalogami" i błędnie linkował.
-    from .datstore import platform_key as _pk
-
     def _plat_key(entry) -> str:
-        alias = rules_fn(entry).get("platform", "")
-        return _pk(str(alias)) if alias else _pk(entry.name)
+        n = hier.add(entry, rules_fn)
+        return n.platform if n else entry.name.lower()
 
     _shared_profiles: set = set()
     if not dry_run and _pipe_ram_budget > 0:
@@ -1194,11 +1280,6 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
         fmt = resolve_format(eff.get("format", "keep"), rep.entry)
         if fmt in ("keep", "", "extract"):
             continue
-        # KATALOG-RODZIC („wszystkie rodzicami", parent_priority): jego DAT-y
-        # ZAWSZE dostają plik FIZYCZNY — nigdy nie linkują się (nawet identyczna
-        # treść między platformami/DAT-ami w rodzicu). Tylko DAT-y spoza rodzica
-        # (dzieci) mogą linkować do fizycznego pliku rodzica.
-        is_parent = bool(eff.get("parent_priority"))
         subdir = bool(eff.get("subdir_per_game", True))
         by_game: dict = {}
         for s in rep.statuses:
@@ -1210,7 +1291,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
         # a to kolekcja jest źródłem prawdy. `sorted` jest stabilne → w obrębie
         # każdej grupy kolejność DAT-u zachowana. Nie rusza rodzic-przed-dzieckiem
         # (to kolejność MIĘDZY raportami, tu zmieniamy tylko wewnątrz jednego).
-        _tprefix = os.path.normcase(str(rep.entry.target_dir)).rstrip("\\/") + os.sep
+        _tprefix = dir_prefix(rep.entry.target_dir)
 
         def _in_place_first(g, _bg=by_game, _tp=_tprefix) -> int:
             for s in _bg.get(g.name, ()):
@@ -1225,6 +1306,23 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             gi += 1
             sts = by_game.get(game.name, [])
             if not sts:
+                continue
+            # POSTĘP PRZERWANEJ NAPRAWY: gra JUŻ ma zweryfikowany <gra>.chd w
+            # docelowym (indeks: fizyczny, `data_sha1==game_profile`). Naprawa
+            # działa „z przepisu" (raporty z OSTATNIEGO skanu) — po przerwaniu i
+            # ponowieniu status bywa nieaktualny („luźna"), więc BEZ tego strażnika
+            # budowalibyśmy ten sam CHD od nowa. Indeks jest commitowany na bieżąco
+            # (record_file/set_data_sha1), więc żywy check łapie zrobione konwersje.
+            if (fmt == "chd" and index is not None
+                    and _disc_on_verified_chd(game, rep.entry.target_dir,
+                                              index, dry_run)):
+                done.add(f"{id(rep.entry)}::{game.name}")
+                # KRYTYCZNE: zarejestruj istniejący CHD jako KANONICZNY, inaczej
+                # faza sprzątania (_clean_dir) uzna go za „obcy" i ZMIECIE do
+                # ToSort — mimo że to poprawny, zweryfikowany, wcześniej naprawiony
+                # plik. (Regresja 0.6.39: skip bez add_canonical.)
+                if on_converted is not None:
+                    on_converted(rep.entry.target_dir / f"{game.name}.chd")
                 continue
             # DYSK w JEDNYM archiwum (cue/gdi + tory) → CHD: buduj CHD WPROST z
             # archiwum jego WŁASNYM cue (nazwy w środku pasują do torów). Ratuje
@@ -1257,8 +1355,8 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         in (".zip", ".7z")):
                     arch = Path(next(iter(arch_srcs)))
                     _pr0 = game_profile(game.data_roms)
-                    # rejestracja keepera (platforma, odcisk) — także dla RODZICA,
-                    # by DZIECI mogły linkować; is_parter blokuje tylko linkowanie
+                    # rejestracja keepera (platforma, odcisk) — dzieci linkują
+                    # do niego, gdy pozwala hierarchia
                     _pk0 = (_plat_key(rep.entry), _pr0) if _pr0 else None
                     if arch.is_file() and _try_disc_archive_chd(
                             rep.entry, game, arch, tools, index, log, st,
@@ -1325,11 +1423,12 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         if keeper is None and own_ok:
                             # RODZIC — jego fizyczny CHD zostaje keeperem
                             final_by_profile[pkey] = own
-                        elif (not is_parent and keeper is not None and own_ok
+                        elif (keeper is not None and own_ok
                               and os.path.normcase(os.path.abspath(
-                                  str(keeper))) != cn):
-                            # DZIECKO z redundantnym fizycznym CHD → relink
-                            # (gra z katalogu-RODZICA nigdy: zostaje fizyczna)
+                                  str(keeper))) != cn
+                              and hier.should_link(rep.entry, keeper)):
+                            # DZIECKO z redundantnym fizycznym CHD → relink do
+                            # rodzica (tylko DAT niżej → wyżej, ta sama platforma)
                             if _relink_verified_duplicate(
                                     own, keeper, prof, index,
                                     make_links, _links_blocked, dry_run, log):
@@ -1380,10 +1479,11 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             pkey = (_plat_key(rep.entry), prof) if prof else None
 
             # DUPLIKAT (dziecko, np. 1G1R): ten sam odcisk zawartości już
-            # zrobiony przez rodzica → SYMLINK z WŁASNĄ nazwą do pliku rodzica,
-            # NIE druga kopia. Nazwa dziecka może się różnić (inny DAT). Gra z
-            # katalogu-RODZICA NIE linkuje (zawsze fizyczna) — patrz is_parent.
-            if not is_parent and pkey is not None and pkey in final_by_profile:
+            # zrobiony przez DAT WYŻEJ tej platformy → SYMLINK z WŁASNĄ nazwą do
+            # jego pliku, NIE druga kopia. Decyduje hierarchia (ta sama kolekcja
+            # / dedup_copies=false → własna kopia fizyczna, jak w rebuilderze).
+            if (pkey is not None and pkey in final_by_profile
+                    and hier.should_link(rep.entry, final_by_profile[pkey])):
                 parent_final = final_by_profile[pkey]
                 ext = parent_final.suffix
                 child_final = rep.entry.target_dir / f"{game.name}{ext}"
@@ -1863,7 +1963,8 @@ def _conv_build_run(job, tools, log, _dtl, fmt, base, game, gathered, work,
         r = pack_zip(gathered, tmp_out, log=log,
                      level=getattr(tools.get("settings"), "zip_level", 6),
                      method=getattr(tools.get("settings"), "zip_method",
-                                    "deflate"))
+                                    "deflate"),
+                     empty_entries=job.get("empty_entries", ()))
         cue_synth = False
     elif fmt == "chd":
         main = min(gathered, key=lambda f: (_DISC_MAIN_PRIORITY.get(
@@ -2013,6 +2114,7 @@ def _conv_prepare(entry, game, sts, fmt, tools, log):
         return (s.state not in (RomState.MISSING, RomState.NO_HASH)
                 and bool(s.source_path))
 
+    empty_entries: list = []
     if fmt == "chd":
         data_missing = [r for r in roms if not _gatherable(r)
                         and r.name.rsplit(".", 1)[-1].lower()
@@ -2022,13 +2124,23 @@ def _conv_prepare(entry, game, sts, fmt, tools, log):
                 f"{[r.name for r in data_missing]} — nie złożę płyty.")
             return None
         roms = [r for r in roms if _gatherable(r)]     # opis dołożymy syntezą
+    elif fmt == "zip":
+        # PUSTE ZNACZNIKI (size=0, np. .msu MSU-1) NIE muszą być zbieralne —
+        # pakujemy je jako puste wpisy, żeby archiwum było KOMPLETNE wg DAT-u
+        # (bez tego zip ma o plik za mało → gra nigdy nie „kompletna" → naprawa
+        # wypakowuje/pakuje w kółko). Reszta (dane) musi być zbieralna.
+        empty_entries = [r.name for r in game.roms if (r.size or 0) == 0]
+        data_roms = [r for r in roms if (r.size or 0) > 0]
+        if any(not _gatherable(r) for r in data_roms):
+            return None                                # kartridż musi mieć wszystko
+        roms = data_roms
     elif any(not _gatherable(r) for r in roms):
         return None                                    # kartridż musi mieć wszystko
     if not roms:
         return None
     return {"entry": entry, "game": game, "sts": sts, "fmt": fmt, "base": base,
             "target_dir": target_dir, "final": final, "roms": roms,
-            "st_by_rom": st_by_rom}
+            "st_by_rom": st_by_rom, "empty_entries": empty_entries}
 
 
 def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
@@ -2046,16 +2158,33 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
     st_by_rom = job["st_by_rom"]
     target_dir = job["target_dir"]
 
+    # ŹRÓDŁO konwersji w logu — bez tego nie było wiadomo, SKĄD leci konwersja
+    # (np. PSP: ISO w podkatalogu ROMS\psp\<gra>\ vs archiwum w ToSort).
+    _srcs = []
+    for r in roms:
+        _s = st_by_rom.get(r.name)
+        if _s and _s.source_path and _s.source_path not in _srcs:
+            _srcs.append(_s.source_path)
+    _srctxt = ""
+    if _srcs:
+        _srctxt = f"  [źródło: {_srcs[0]}" + (
+            f" (+{len(_srcs) - 1})" if len(_srcs) > 1 else "") + "]"
+
     # PODGLĄD (dry-run): NIE odpytujemy wolnego miejsca (na NAS to blokujące) —
     # tylko zapowiadamy plan; miejsce sprawdzimy przy faktycznej naprawie.
     if dry_run:
-        log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}")
+        log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}{_srctxt}")
         st.converted += 1
         log(f"  finał → {final} (podgląd)")
         for r in roms:
             sp = st_by_rom[r.name].source_path
             if sp:
                 deferred.append(Path(sp))
+        # jak w prawdziwej naprawie: planowany finał jest DOCELOWY — inaczej
+        # podgląd sprzątania „wymiatał" do ToSort plik spod tej samej ścieżki
+        # (np. stary, niepełny <gra>.zip, który ta konwersja nadpisze).
+        if on_converted is not None:
+            on_converted(final)
         return final
 
     # KONWERSJA w 3 FAZACH (te same fazy używa też potok równoległy):
@@ -2065,7 +2194,7 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
     if scratch is None:
         return None
     job["scratch"] = scratch
-    log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}")
+    log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}{_srctxt}")
     try:
         if _conv_gather_phase(job, log) is None:
             return None                         # niezgodność → fallback placement
@@ -2138,9 +2267,16 @@ def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
     try:
         if fmt == "zip":
             _dtl(0, 0, f"pakowanie ZIP: {base}")     # szybkie — pasek pulsuje
+            # PUSTE ZNACZNIKI (size=0, np. .msu) których NIE ma wśród plików —
+            # dołóż jako puste wpisy, by <gra>.zip był kompletny wg DAT-u.
+            _have = {f.name for f in files}
+            _empty = ([r.name for r in game.roms
+                       if (r.size or 0) == 0 and r.name not in _have]
+                      if game is not None else [])
             r = pack_zip(files, tmp_out, log=log,
                          level=getattr(_settings, "zip_level", 6),
-                         method=getattr(_settings, "zip_method", "deflate"))
+                         method=getattr(_settings, "zip_method", "deflate"),
+                         empty_entries=_empty)
         elif fmt == "chd":
             main = min(files, key=lambda f: (_DISC_MAIN_PRIORITY.get(
                 f.suffix.lower().lstrip("."), 9), f.name.lower()))

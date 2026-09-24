@@ -523,7 +523,10 @@ def apply_substitution(
         return False
     if index is not None and action == "link":
         try:
-            index.mark_link(slot)
+            # hardlink (ten sam wolumin) = zwykły plik w indeksie; is_link=1
+            # tylko dla realnego symlinku (reparse point).
+            if is_link(slot):
+                index.mark_link(slot)
         except Exception:
             pass
     return True

@@ -67,7 +67,11 @@ CREATE TABLE IF NOT EXISTS files (
     -- deflate — np. ZSTD/LZMA/bzip2). -1 = niesprawdzony, 0 = OK, 1 = ZŁA metoda
     -- => „do naprawy" (przepakowanie na deflate). Skan zapisuje to z centralnego
     -- katalogu ZIP-a (tanio), żeby naprawa NIE otwierała wszystkich zipów.
-    bad_zip_method INTEGER NOT NULL DEFAULT -1
+    bad_zip_method INTEGER NOT NULL DEFAULT -1,
+    -- CHD gry CD: czy UKŁAD ścieżek (liczba/rodzaj torów) zgadza się z DAT.
+    -- -1 = niesprawdzony, 1 = zgodny. Odbudowa CHD pomija zgodne BEZ czytania
+    -- nagłówka z NAS (dawniej każdy przebieg sprawdzał setki PSX/Saturn/DC).
+    layout_ok INTEGER NOT NULL DEFAULT -1
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
@@ -306,6 +310,12 @@ class FileIndex:
                 "INTEGER NOT NULL DEFAULT -1")
         except sqlite3.OperationalError:
             pass                       # kolumna już jest
+        try:
+            self._db.execute(
+                "ALTER TABLE files ADD COLUMN layout_ok "
+                "INTEGER NOT NULL DEFAULT -1")
+        except sqlite3.OperationalError:
+            pass                       # kolumna już jest
         self._db.commit()
 
     # --- cykl życia ---------------------------------------------------------
@@ -358,7 +368,7 @@ class FileIndex:
             "  md5=excluded.md5, sha1=excluded.sha1, "
             "  data_sha1=excluded.data_sha1, is_link=0, missing=0, "
             "  scanned_at=excluded.scanned_at, deep_fail=0, "
-            "  bad_container=-1",     # plik się zmienił → sprawdź od nowa
+            "  bad_container=-1, layout_ok=-1",  # plik się zmienił → od nowa
             (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, ds, now),
         )
         stats.hashed += 1
@@ -656,8 +666,8 @@ class FileIndex:
         POMIJAMY (już obsłużone). KLUCZOWE na NAS: bez tego `lexists` po całym
         indeksie (100k+ wpisów) to 100k+ zapytań SMB w ciszy — skan „stoi".
         """
-        skips = [os.path.normcase(os.path.abspath(str(r))).rstrip("\\/") + os.sep
-                 for r in (skip_roots or []) if r]
+        from .paths import dir_prefixes
+        skips = dir_prefixes(skip_roots)
 
         def _under_skip(p: str) -> bool:
             pn = os.path.normcase(p)
@@ -1086,7 +1096,7 @@ class FileIndex:
             "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
             "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
             "  md5=excluded.md5, sha1=excluded.sha1, is_link=0, missing=0, "
-            "  scanned_at=excluded.scanned_at",
+            "  scanned_at=excluded.scanned_at, layout_ok=-1",
             (str(p), st.st_size, st.st_mtime_ns, crc32.lower(), md5.lower(),
              sha1.lower(), now))
         self._db.commit()
@@ -1098,6 +1108,19 @@ class FileIndex:
         if physical_only:
             q += " AND is_link=0"
         return self._db.execute(q, (len(prefix), prefix)).fetchall()
+
+    def identified_chds_under(self, root: Path | str) -> list[sqlite3.Row]:
+        """Fizyczne .chd pod `root` z USTALONYM odciskiem treści (data_sha1) —
+        filtr w SQL, bez przeglądania całego drzewa w Pythonie (ToSort ma
+        dziesiątki tysięcy wpisów, a takich CHD — garstkę)."""
+        # prefiks jak w all_under (ścieżki w bazie NIE są normcase — SQL
+        # porównuje z rozróżnieniem wielkości liter)
+        prefix = str(Path(os.path.abspath(root))).rstrip("/" + os.sep) + os.sep
+        return self._db.execute(
+            "SELECT * FROM files WHERE missing=0 AND is_link=0 "
+            "AND substr(path, 1, ?) = ? AND data_sha1 != '' "
+            "AND lower(substr(path, -4)) = '.chd'",
+            (len(prefix), prefix)).fetchall()
 
     def rename(self, old: Path | str, new: Path | str) -> None:
         """Aktualizuje ścieżkę wpisu po przeniesieniu/zmianie nazwy pliku.
@@ -1145,6 +1168,14 @@ class FileIndex:
         key = str(Path(os.path.abspath(path)))
         self._db.execute("UPDATE files SET bad_container=? WHERE path=?",
                          (int(bad), key))
+        self._db.commit()
+
+    def set_layout_ok(self, path: Path | str, ok: int) -> None:
+        """Zapisuje wynik sprawdzenia UKŁADU ścieżek CHD gry CD vs DAT:
+        -1 niesprawdzony, 1 zgodny (odbudowa go pominie bez czytania z NAS)."""
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET layout_ok=? WHERE path=?",
+                         (int(ok), key))
         self._db.commit()
 
     def set_bad_zip_method(self, path: Path | str, bad: int) -> None:

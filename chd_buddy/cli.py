@@ -242,26 +242,6 @@ def cmd_dupes(args, settings: Settings) -> int:
     return 0
 
 
-def cmd_dedup(args, settings: Settings) -> int:
-    from .core.linker import LinkPrivilegeError, apply_dedup, plan_dedup
-    with _open_index(args, settings) as idx:
-        actions = plan_dedup(idx, prefer_roots=args.prefer or (),
-                             min_size=args.min_size)
-        if not actions:
-            print("Brak duplikatów w indeksie.")
-            return 0
-        dry = not args.yes
-        if dry:
-            print("PODGLĄD (bez --yes nic nie zmieniam):")
-        try:
-            st = apply_dedup(actions, index=idx, dry_run=dry, log=print)
-        except LinkPrivilegeError as e:
-            print(f"Błąd: {e}", file=sys.stderr)
-            return 3
-        print(f"\n{st.summary()}")
-    return 0 if st.errors == 0 else 1
-
-
 def cmd_mirror(args, settings: Settings) -> int:
     from .core.linker import DEFAULT_EXCLUDES, LinkPrivilegeError, mirror_tree
     excludes = (tuple(e.strip() for e in args.exclude.split(",") if e.strip())
@@ -598,15 +578,6 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--min-size", type=int, default=1, help="minimalny rozmiar pliku (B)")
     pd.set_defaults(func=cmd_dupes)
 
-    pdd = sub.add_parser("dedup", help="zastąp duplikaty symlinkami (jedna kopia fizyczna)")
-    pdd.add_argument("--db", help="plik bazy indeksu")
-    pdd.add_argument("--prefer", action="append", metavar="KATALOG",
-                     help="katalog preferowany na kopię fizyczną (można podać wielokrotnie, "
-                          "kolejność = priorytet)")
-    pdd.add_argument("--min-size", type=int, default=1)
-    pdd.add_argument("--yes", action="store_true",
-                     help="wykonaj podmiany (bez tego tylko podgląd)")
-    pdd.set_defaults(func=cmd_dedup)
 
     pm = sub.add_parser("mirror", help="mirror drzewa ROM-ów symlinkami (serwer → RetroBat)")
     pm.add_argument("source", help="katalog źródłowy na serwerze (np. Z:\\ROMS)")

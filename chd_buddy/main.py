@@ -179,7 +179,20 @@ def main() -> int:
     app.setApplicationName("ROM Kombajn")
     win = SuiteWindow(settings)
     win.show()
-    return app.exec()
+    win.raise_()             # wyjdź na wierzch przy starcie
+    win.activateWindow()
+    rc = app.exec()
+    # TWARDE WYJŚCIE po zamknięciu okna: globalna pula wątków Qt przy
+    # sprzątaniu CZEKA na zalegające zadania (np. obchód NAS bez sprawdzania
+    # przerwania, oczekiwanie na UAC) — proces „wisiał" minutami po zamknięciu.
+    # Wszystko trwałe jest już zapisane (indeks commituje per operację,
+    # ustawienia w closeEvent), więc kończymy od razu.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(int(rc))
 
 
 if __name__ == "__main__":

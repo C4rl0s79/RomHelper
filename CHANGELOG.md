@@ -2,6 +2,701 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.6.71] — 2026-09-24
+
+### „Zawieszenie" na PlayStation w Znajdź naprawy / Napraw
+- **Przyczyna:** krok „Odbudowa CHD" przed PIERWSZĄ linią logu sprawdzał dla
+  KAŻDEJ gry z DAT-u, czy `<gra>.chd` istnieje — osobnym zapytaniem do NAS
+  (`is_file`), szeregowo. PSX: ~4600 zapytań × ~39 ms = **~3 minuty ciszy**
+  (bez paska, bez logu). Przy każdym z ~600 katalogów przeglądał też cały
+  ToSort (53 tys. wpisów) w Pythonie.
+- **Poprawka:** istnienie CHD z INDEKSU (jedno zapytanie na katalog), CHD w
+  ToSort filtrowane w SQL (`identified_chds_under`). PSX: 3 min → **1 s**.
+  Samą odbudowę i tak poprzedza odczyt nagłówka pliku.
+- **Widoczność:** w przeliczaniu kandydatów pasek pokazuje bieżącą grę i
+  licznik („Odbudowa CHD — przeliczam: <gra>", zrobione / wszystkie); dalej,
+  jak dotąd, „CHD wg cue: <gra>" przy czytaniu nagłówków.
+
+## [0.6.70] — 2026-09-24
+
+### Porządki (bez zmiany zachowania)
+- **Nowy moduł `core/paths.py`** — jedno miejsce na porównania „czy ścieżka
+  leży w katalogu" (`dir_key`, `dir_prefix`, `dir_prefixes`, `is_under`,
+  `under_any`). Zastępuje ręcznie sklejane prefiksy w matcherze, rebuilderze,
+  konwersji, indeksie i GUI (w tym wzorcu łatwo o błąd z separatorem albo
+  wielkością liter). Zapytania SQL indeksu z prefiksem zostały bez zmian.
+- **Rebuilder: jedna funkcja kopii fizycznej** (`_copy_file`) zamiast dwóch
+  identycznych bloków w `_process`.
+- Podgląd PS2 na realnych danych identyczny jak w 0.6.69 (2074 linki do ROMS,
+  0 przeniesień). Testy: `tests/test_paths.py`.
+
+## [0.6.69] — 2026-09-24
+
+### Wycofana reguła „rodzic" (parent_priority) — hierarchię wyznacza drzewo
+- **Kolejność katalogów (`_kolejnosc.json`) jest jedynym źródłem hierarchii.**
+  Reguła „wszystkie DAT-y katalogu = rodzice" dublowała ją, a jej drugą rolę
+  (zawsze kopie fizyczne) pełni już `dedup_copies=false`.
+- **Jednorazowa, automatyczna migracja `_reguly.json`:** `parent_priority=true`
+  → „zawsze kopie fizyczne" (`dedup_copies=false`); katalog-rodzic spoza
+  zapisanej kolejności jest do niej dopisywany (zostaje tam, gdzie stał).
+  Komunikat migracji trafia do logu po wczytaniu DAT-ów.
+- GUI: z menu katalogu zniknęło „⭐ Wszystkie DAT-y tu = rodzice platform";
+  w ustawieniach katalogu zamiast „Rola: rodzice" jest „Wymuszenie: zawsze
+  kopie fizyczne (bez linków do DAT-ów wyżej)".
+
+### Konwersja ze źródła na tej samej hierarchii co naprawa (krok 2)
+- `convert_from_source` pyta `Hierarchy` (ten sam obiekt co rebuilder):
+  zniknęły `is_parent`, własny klucz platformy i osobne sprawdzanie
+  `dedup_copies`.
+- **Dziecko w późniejszym katalogu linkuje do pliku zrobionego przez rodzica
+  wcześniej w tej samej naprawie** — mapa gotowych finałów jest wspólna dla
+  wszystkich katalogów (dawniej tworzona od nowa per katalog, więc takie linki
+  w konwersji praktycznie nie powstawały).
+- **Dwie gry jednego DAT-u o identycznej treści = dwie kopie fizyczne**
+  (dawniej konwersja linkowała je wewnątrz kolekcji — wbrew regule).
+- Testy: `tests/test_convert_hierarchy.py` (dziecko → rodzic między
+  katalogami, wymuszenie fizycznych, duplikat w jednej kolekcji, inna
+  platforma). Podgląd na realnych danych PS2 / Master System bez zmian
+  względem 0.6.68 (2074 / 1030 linków do ROMS, 0 przeniesień).
+
+## [0.6.68] — 2026-09-24
+
+### Jedna reguła dedup: hierarchia DAT-ów (`core/hierarchy.py`)
+- **Nowy moduł `Hierarchy`** — jedyne miejsce, które decyduje „kopia fizyczna
+  czy link": katalog docelowy DAT-u + kolejność z `sort_entries` + platforma.
+  Link tylko DAT niżej → DAT wyżej tej samej platformy; „rodzic" i
+  `dedup_copies=false` zawsze fizycznie; różne platformy nigdy się nie linkują.
+- **Naprawa (rebuilder) przepięta na hierarchię** — zniknęły równoległe
+  mechanizmy: flaga `is_parent`, porównania prefiksów katalogów (`intra`),
+  listy `protected` / `coll_prefixes` / `parent_prefixes` w finałowym dedupie
+  i łatka 0.6.66. Rezerwacje rozdzielone na dwie role: „gdzie treść już leży"
+  (źródło kopii) i „kopia tej platformy" (cel linku).
+- **Naprawiony ukryty błąd cross-platform:** dziecko (np. SMS 1G1R) mogło
+  linkować do pliku INNEJ platformy o identycznej treści (MSX), bo rezerwacja
+  nie znała platformy. Teraz linkuje do rodzica swojej platformy.
+- **ToSort nigdy nie dostaje linków** — kopia treści już ułożonej w kolekcji
+  jest kasowana („usuń z ToSort pliki już na miejscu"), a nie zamieniana na
+  link. Po naprawie w ToSort nie zostaje nic z DAT-ów.
+- **Usunięty przycisk „Dedup" z zakładki Indeks i komenda CLI `dedup`** —
+  działały po samym SHA-1, bez platform i hierarchii (mogły zlinkować MSX↔SMS
+  albo pliki w katalogu-rodzicu). Dedup robi Naprawa. „Pokaż duplikaty" zostaje.
+- Podgląd na realnych danych: PS2 — 1092 linki No-intro → ROMS\ps2 i 982 linki
+  1G1R → ROMS\ps2 (bezpośrednio do pliku fizycznego), 0 przeniesień z ROMS;
+  Master System — 694 + 336 linków do ROMS\mastersystem, 0 przeniesień.
+
+## [0.6.67] — 2026-09-23
+
+### Dedup wg hierarchii DAT-ów (katalog + hierarchia, bez rezerwacji)
+- **Kopia fizyczna w katalogu DAT-u stojącego wyżej = oryginał; niższy DAT
+  robi do niej link, nigdy jej nie przenosi.** O tym decyduje wyłącznie
+  katalog docelowy i hierarchia DAT-ów (kolejność folderów → „rodzic" →
+  `_priorytet.txt`), w obrębie tej samej platformy. Rezerwacje z bieżącego
+  przebiegu już o tym nie decydują — bywały niekompletne (np. rodzic
+  pominięty, przerwany albo niewłączony) i wtedy planowało się `PRZENIEŚ`
+  z ROMS do No-intro zamiast LINK. Kierunek odwrotny bez zmian: plik leżący
+  u dziecka rodzic może zabrać do siebie.
+  Testy: `test_file_in_parent_dir_child_links_without_any_claim`,
+  `test_file_in_child_dir_parent_may_take_it`.
+
+## [0.6.66] — 2026-09-23
+
+### Hierarchia rodzic → dziecko respektowana dla gier na CHD
+- **Dziecko nie przenosi już CHD z katalogu rodzica.** Przy katalogu rodzica
+  konwersja ze źródła zgłasza także GOTOWE CHD jako obsłużone, a układanie takie
+  gry pomijało — bez zapisania, że plik należy do rodzica. Dziecko (np. No-intro
+  pod ROMS) widziało go jako „wolny" i planowało `PRZENIEŚ ROMS\ps2\… ->
+  No-intro\…` (podgląd PS2: 1090 takich przeniesień) zamiast linku. Teraz
+  pominięta gra rodzica na CHD nadal rezerwuje swój plik → dziecko dostaje LINK.
+  Test: `test_parent_chd_skipped_as_converted_still_claimed_child_links`.
+
+## [0.6.65] — 2026-09-23
+
+### FinalBurn Neo / arcade (split): koniec kopiowania cudzych zipów i wycinania ROM-ów
+- **Klucz roszczeń gry-archiwum zawiera odcisk TREŚCI gry**, nie samą ścieżkę
+  źródłowego zipa. Dawniej dwie RÓŻNE gry znalezione w jednym zipie (pgm w
+  ddp2.zip, apb3 w apb2.zip, klon w zipie rodzica) wyglądały na duplikat →
+  „KOPIA pgm.zip <- ddp2.zip" (cały cudzy zip pod nazwą innej gry). Teraz każda
+  gra dostaje WŁASNY zip z wypakowanymi SWOIMI ROM-ami, źródło zostaje.
+  Realny podgląd fbneo: KOPIA 31 → 0.
+- **Split: gry na BIOS-ie** (romof=pgm/cchip/ym2608/namcoc69, bez cloneof) nie
+  „potrzebują" już ROM-ów BIOS-u (dawniej tylko klony odcinały `merge=`). W
+  non-merged/merged BIOS też nigdy nie jest wtapiany w grę (osobny zip).
+- **Własny zip gry ma pierwszeństwo** przy wielu kandydatach (pgm.zip przed
+  ddp2.zip) — dawniej alfabetycznie, więc gra „znajdowała się" w cudzym zipie.
+- **Nadzbiory arcade NIE są przepakowywane w miejscu z utratą danych**: własny
+  zip gry z dodatkowymi ROM-ami (rodzica/BIOS-u/klonów) = kompletny; przy złych
+  nazwach wewnętrznych poprawiamy tylko nazwy, dodatki ZOSTAJĄ. (16.09 naprawa
+  zrobiła 4095 takich przepakowań w fbneo, wycinając ROM-y innych gier.)
+- Log „PRZEPAKUJ" pokazuje pełną ścieżkę źródła, gdy leży w innym katalogu
+  (np. ToSort\mame\gra.zip → fbneo\gra.zip), a nie mylące „gra.zip -> gra.zip".
+- Testy: `tests/test_arcade_fbneo.py` (scenariusze z realnej naprawy).
+
+## [0.6.64] — 2026-09-23
+
+### Naprawa nie „stoi" na kompletnych platformach
+- **Konwersja w miejscu decyduje z INDEKSU** (`convert_reports`): dawniej dla
+  KAŻDEJ gry i KAŻDEGO ROM-u robiła `is_file` + `islink` na NAS — także gdy nic
+  nie było do zrobienia. Pomiar: Amiga ~111 s ciszy w logu → ~0 s (3176 gier z
+  indeksu w ułamku sekundy); Atari 2600 ~30 s, C64 ~12 s. Dysk sprawdzany jest
+  już tylko dla gier, które faktycznie trzeba skonwertować.
+- **Dopasowanie DAT-ów z pustymi plikami** (DSi CDN, MSU-1): regresja z 0.6.55 —
+  pusty ROM (SHA-1 pustego pliku) łapał KAŻDE archiwum z pustym wpisem w całej
+  kolekcji, a potem dla każdego leciało zapytanie o członków (DSi Encrypted:
+  ~milion zapytań SQL, ~248 s przy starcie naprawy). Teraz puste ROM-y nie są
+  wyszukiwane po sumie, a po NAZWIE sprawdzane tylko w archiwach-kandydatach
+  (mających wszystkie niepuste ROM-y). DSi: 248 s → 13 s.
+
+## [0.6.63] — 2026-09-23
+
+### Odbudowa CHD: licznik mówi prawdę + gry CD nie są sprawdzane co przebieg
+- Komunikat „Odbudowa CHD: N plików do przerobienia" był mylący — N to
+  kandydaci do SPRAWDZENIA (odczyt nagłówka), a przerabiane są tylko te z
+  linią „ODBUDOWA". Teraz: „N plików do SPRAWDZENIA … M już potwierdzonych jako
+  OK — pominięte". (Przykład: PS2 1538 kandydatów → ~880 realnie do przerobienia.)
+- Nowy znacznik w indeksie `layout_ok` (układ ścieżek CHD gry CD zgodny z DAT).
+  Potwierdzone gry CD (PSX/Saturn/Dreamcast/Sega CD) są pomijane BEZ czytania
+  nagłówka z NAS — dawniej każdy przebieg sprawdzał setki plików. Znacznik
+  zeruje się, gdy plik się zmieni.
+- Kolejność odbudowy = kolejność gier w pliku DAT (Redump PS2 jest ułożony wg
+  kolejności zrzutów, nie alfabetycznie) — bez zmian, tylko wyjaśnienie.
+
+### MSU-1 / konwersja ze źródła
+- Sprzątanie NIE przenosi do ToSort źródeł zaplanowanych do skasowania po
+  konwersji (np. współdzielone luźne `.pcm` gry spakowanej do `<gra>.zip`) —
+  są kasowane, a nie dublowane w ToSort.
+- Podgląd („Znajdź naprawy") rejestruje planowany finał jako docelowy — koniec
+  fałszywych „TOSORT <gra>.zip" zaraz po „finał → <gra>.zip".
+
+## [0.6.62] — 2026-09-23
+
+### Cofnięte: administrator znów domyślnie WŁĄCZONY (symlinki)
+- `auto_elevate` domyślnie **True** (cofnięcie zmiany z 0.6.59). Symlinki są
+  używane stale, a bez trybu dewelopera Windows wymagają administratora —
+  wyłączenie admina „bo hardlinki” było błędnym założeniem. Opisy przełączników
+  (pasek i okno RAM-dysku) poprawione.
+- Ścieżka „RAM dysk przez osobny prompt UAC” zostaje jako fallback, gdy UAC przy
+  starcie zostanie odrzucony.
+
+## [0.6.61] — 2026-09-23
+
+### Koniec „Nie odpowiada": start, Przerwij, zamykanie
+- **Główna przyczyna zamrożeń GUI**: odczyt zapisanego wyniku skanu
+  (`load_report_states`) sprawdzał `os.path.isfile` dla KAŻDEGO z ~650 DAT-ów —
+  a DAT-y leżą na NAS, więc to ~45 s seryjnych rund SMB **na wątku GUI** (przy
+  starcie po wczytaniu DAT-ów, po „Przerwij" i po każdym skanie). Pomiar:
+  54,9 s → 3,3 s. Teraz filtrujemy po DAT-ach odkrytych w pamięci
+  (`known_keys`), bez dotykania NAS; a odczyt przy starcie idzie w wątku tła.
+- **Przerwanie** nie przeładowuje już stanów (są w pamięci od startu).
+- **Zamykanie nie wisi**: po zamknięciu okna proces kończy się twardo
+  (`os._exit`) — globalna pula wątków Qt czekała na zalegające zadania (obchód
+  NAS, oczekiwanie na UAC); `waitForDone` 10 s → 3 s; `imdisk -D` przy zamykaniu
+  z timeoutem. Wszystko trwałe jest już zapisane (indeks commituje per operację).
+- **Skan: widoczny postęp przygotowania** — fazy ustalania katalogów platform,
+  szukania folderów-sierot i analizy rozmiarów DAT-ów (sprawdzenia na NAS)
+  logują się i pokazują licznik; analiza DAT-ów reaguje na Przerwij.
+- Checkbox „uruchamiaj jako administrator (auto)" w pasku ma aktualny opis
+  (zalecane: wyłączone). Uwaga: działający program nadpisywał zmianę w pliku
+  ustawień przy zamknięciu — ustawienie zmieniaj checkboxem w programie.
+
+## [0.6.60] — 2026-09-22
+
+### Przerwanie skanu = STOP (koniec wielominutowego mielenia dopasowania)
+- **Przerwanie skanu zatrzymuje NATYCHMIAST.** Dawniej po „Przerwij" program
+  czyścił flagę i MIMO TO odpalał pełne dopasowanie po WSZYSTKICH włączonych
+  DAT-ach (z trwałego indeksu) — a to potrafiło mielić minuty w czystym Pythonie
+  NAWET gdy w tej sesji nie przeskanowano ani jednego pliku (użytkownik: „nie ma
+  czego dopasowywać"), blokując też zamknięcie programu (GUI „Nie odpowiada").
+  Teraz przerwanie kończy pracę od razu, poprzedni wynik zostaje nienaruszony.
+- **Odświeżenie dopasowania bez skanu plików**: przycisk „Znajdź naprawy" i tak
+  przelicza dopasowanie z indeksu (szybko) — nie trzeba go już wymuszać po
+  przerwanym skanie. Przerwanie w TRAKCIE dopasowania (pełny skan) też kończy
+  od razu bez nadpisywania wyniku.
+
+## [0.6.59] — 2026-09-22
+
+### Elevacja tylko dla ImDisk (okno wychodzi na wierzch, łatwe zamknięcie)
+- **Główny program NIE startuje już jako administrator** (`auto_elevate`
+  domyślnie False). Elevacja całego programu powodowała, że Windows (UIPI)
+  blokował wyciąganie okna na wierzch kliknięciem w pasku zadań i utrudniał
+  ubicie procesu. Linkowanie i tak idzie HARDLINKAMI (bez admina), a symlinki
+  nie działają na SMB — admin był potrzebny właściwie tylko dla RAM-dysku.
+- **RAM dysk ImDisk podnoszony OSOBNO**: gdy program działa bez admina, tworzenie
+  R: idzie przez jeden elewowany PowerShell (`ShellExecuteEx runas` → JEDEN prompt
+  UAC przy pierwszym starcie; attach + format w jednym kroku). Istniejący R:
+  (z poprzedniej sesji) jest przejmowany BEZ promptu, więc kolejne starty nie
+  pytają. Przy zamknięciu bez admina R: NIE jest odmontowywany (zero promptu przy
+  zamykaniu; następny start go przejmie). Odmowa UAC/błąd → scratch na dysku
+  fizycznym (jak dotąd).
+- Przełącznik „Uruchamiaj CAŁY program jako administrator" w oknie RAM-dysku
+  (dla potrzebujących symlinków mirror_tree/RetroBat bez trybu dewelopera).
+
+## [0.6.58] — 2026-09-22
+
+### Start/zamknięcie: koniec „cichego zawieszenia"
+- **Start nie milczy** — wczytywanie DAT-ów loguje każdą fazę (szukam plików →
+  sygnatury → kolizje → metadane JSON → migracja cache → wczytuję DAT: X).
+  Wcześniej migracja monolitu + liczenie sum kolizji (jednorazowo ~30–60 s) nie
+  dawały żadnego znaku → wyglądało na zawieszenie. Migracja cache DAT-ów loguje
+  „Migruję… / zakończona (N plików)".
+- **Zamknięcie nie wisi minutami** — `discover` przyjmuje `cancel` i sprawdza go
+  między fazami i między DAT-ami; auto-wczytanie na starcie wpięło `cancel`.
+  Wcześniej zamknięcie w trakcie pierwszego (długiego) wczytywania z NAS czekało
+  aż parsowanie się skończy (proces wisiał, bo wątek ignorował przerwanie).
+- **Okno wychodzi na wierzch przy starcie** (`raise_`/`activateWindow`).
+  Uwaga: gdy program działa JAKO ADMINISTRATOR, Windows (UIPI) potrafi blokować
+  wyciąganie okna na wierzch kliknięciem w pasku zadań — patrz ustawienie
+  auto-elevacji (RAM dysk ImDisk wymaga admina).
+- Komunikat „Warsztat" jest teraz samowyjaśniający (to pole katalogu-matki na
+  górze okna; pusta wartość = ścieżki ustawiasz osobno).
+
+## [0.6.57] — 2026-09-22
+
+### Naprawa: przepis z indeksu + wznawianie (open→Napraw bez skanu)
+- **Naprawa odtwarza przepis z INDEKSU na starcie** (wspólna funkcja
+  `matcher.match_reports`, ta sama ścieżka co etap „dopasowanie" skanu — koniec
+  dwóch rozjeżdżających się ścieżek). Wcześniej naprawa wymagała świeżego
+  „Skanuj i raportuj" w tej samej sesji (`self._reports` w pamięci); po restarcie
+  mówiła „Brak przepisu". Teraz:
+  - **open → Napraw działa od razu** — przepis powstaje z trwałego indeksu w
+    sekundy, bez skanu plików (DAT-y odkrywane w locie, cache per DAT).
+  - **WZNAWIANIE** — naprawa zapisuje wynik do indeksu per operacja (z commitem),
+    więc ponowne dopasowanie widzi gry już naprawione jako HAVE i one wypadają z
+    przepisu. Po przerwaniu/restarcie/twardym ubiciu naprawa rusza od miejsca,
+    gdzie stanęła, a nie od początku (koniec „doszedł do PS2, przerwałem, a po
+    restarcie robi wszystko od nowa").
+  - **zmiana DAT** jest łapana bez skanu plików (discover re-parsuje zmieniony
+    DAT po sygnaturze, dopasowanie liczone z indeksu). Skan plików potrzebny
+    wyłącznie gdy zmieniły się PLIKI.
+- **„Znajdź naprawy" (podgląd) = to samo dopasowanie z indeksu + plan dry-run** —
+  przestaje być krokiem obowiązkowym przed naprawą, zostaje jako podgląd planu.
+- Test: `test_match_reports_from_index_matches_store`.
+
+## [0.6.56] — 2026-09-22
+
+### Wydajność (wczytywanie DAT-ów — koniec „ładowania od nowa" przy każdym starcie)
+- **Cache sparsowanych DAT-ów rozbity na OSOBNY plik per DAT** (dawniej jeden
+  monolit `dat_parse_cache.pkl` ~315 MB obok exe). Katalog `dat_parse_cache/`,
+  jeden mały `<hash>.pkl` na DAT: zmiana JEDNEGO DAT-a nadpisuje tylko jego plik,
+  a nie całe 315 MB. Stary monolit jest jednorazowo rozbijany na pliki per DAT
+  i usuwany (dane przenoszone 1:1, bez ponownego parsowania). Cache dalej obok
+  exe — DAT-y są na NAS, więc lokalny cache omija transfer SMB.
+- **Równoległy `stat()` DAT-ów** (`DatStore._stat_sigs`): pomiar wykazał, że
+  hamulcem NIE było parsowanie ani odpicklowanie (odczyt 315 MB = 2,5 s), tylko
+  **szeregowy `stat()` 609 plików na NAS = ~52 s** (runda SMB na plik). Teraz
+  jeden RÓWNOLEGŁY przebieg pobiera sygnatury (mtime+rozmiar) wszystkich DAT-ów
+  (liczba wątków wg nośnika: NAS dużo, HDD 1); te same sygnatury zasilają dedup
+  kolizji i walidację cache — **koniec drugiego przebiegu `stat()` i `stat()` per
+  rekord**.
+- **Cache SHA-1 dla dedupu kolizji** (`_load/_save_sha1_cache`,
+  `dat_sha1_cache.pkl` obok exe): `_dedupe_collisions` hashowało z NAS treść
+  DAT-ów o kolidującym rozmiarze — a identyczne DAT-y ROMS/No-Intro (celowy
+  układ) kolidują ZAWSZE, więc było to ~36 s przy KAŻDYM wczytaniu. Teraz SHA-1
+  jest cache'owany po sygnaturze; steady-state = 0 odczytów z NAS w dedupie.
+- **Sidecary JSON jednym przebiegiem** (`_sidecar_index`): dawniej
+  `glob("*.json")` per katalog na NAS (11 katalogów × ~5 s = ~53 s przez listing
+  SMB). Teraz jeden `rglob` + RÓWNOLEGŁY odczyt/parse.
+- **Błąd: `DatParseCache.prune` kasował cache SHA-1**: prune usuwał z katalogu
+  cache KAŻDY `*.pkl` spoza zbioru per-DAT, w tym `dat_sha1_cache.pkl` — więc
+  dedup wiecznie re-hashował z NAS. prune rusza teraz TYLKO pliki o kształcie
+  per-DAT (`<20 hex>.pkl`).
+- **Efekt (pomiar na żywym NAS):** wczytanie wszystkich DAT-ów (`discover`)
+  ~104 s → **~13 s** w steady-state (pierwszy przebieg po zmianie DAT-ów dłuższy).
+  Testy: `test_cache_is_one_file_per_dat`,
+  `test_cache_migrates_monolith_to_per_dat`, `test_prune_keeps_non_per_dat_files`.
+
+## [0.6.55] — 2026-09-21
+
+### Naprawiono (MSU1/format=zip: pusty znacznik .msu w archiwum — koniec pętli wypakuj/pakuj)
+- **`<gra>.zip` (format=zip, wieloplikowa) zawiera teraz PUSTE znaczniki size=0
+  (np. `.msu` MSU-1).** Dotąd pakowarka gubiła ROM size=0 → zip miał o plik za
+  mało (20/21) → matcher NIGDY nie uznawał gry za kompletną (HAVE) → naprawa
+  wypakowywała luźno ze źródła i pakowała w kółko, za każdym razem znów bez
+  `.msu`. Fix: `pack_zip(empty_entries=…)` zapisuje puste wpisy; `_conv_prepare`
+  (i `_convert_one` w miejscu) wyliczają znaczniki size=0 z DAT-u i pakują je,
+  a nie wymagają ich „zbieralności".
+- **Matcher liczy pusty znacznik jako obecny w archiwum**: `_match_game_archive`
+  dopasowuje ROM-y size=0 po NAZWIE członka (sha1/crc puste — nie łapały się po
+  treści). Dzięki temu kompletny `<gra>.zip` = HAVE → luźny folder obok staje się
+  redundantny (sprzątany), koniec re-dekompresji. Testy:
+  `test_pack_zip_writes_empty_markers`.
+
+## [0.6.54] — 2026-09-21
+
+### Naprawiono (Przerwanie naprawy działa na granicy gry — nie mieli do końca DAT-u)
+- **„Przerwij" w Naprawie reaguje teraz na GRANICY GRY**, a nie dopiero po całym
+  DAT-cie. Dotąd cancel był sprawdzany raz na DAT (`rebuilder.run`), więc przy
+  wielkim DAT-cie (np. SNESMSU1 = setki gier × dziesiątki plików) „przerwij"
+  wypakowywał tysiące plików do końca platformy, zanim stanął. Teraz pętla
+  sprawdza cancel przy KAŻDEJ zmianie gry: **bieżąca gra jest dokańczana**
+  (żadnych pół-wypakowanych MSU1), następna NIE jest zaczynana, po czym stop.
+  Wykonane operacje są na dysku i w indeksie; wznowienie dokończy resztę.
+  Test: `test_cancel_finishes_current_game_skips_next`.
+- **Jaśniejszy komunikat przy żądaniu przerwania**: „dokańczam gry będące w
+  trakcie, nie zaczynam nowych; po ich zakończeniu stop" (potok konwersji i tak
+  dokańcza zadania w locie i nie bierze nowych — `StagePipeline.drain`).
+
+## [0.6.53] — 2026-09-21
+
+### Naprawiono (odbudowa CHD: stabilność potoku + czytelny postęp)
+- **Scratch odbudowy NIGDY nie spada na NAS.** Dotąd przy pełnym RAM-dysku scratch
+  lądował „obok pliku" = `Z:\ROMS\ROMS\ps2` (SMB) — wielogigowy `createdvd` przez
+  sieć zwieszał potok (CPU/dysk/sieć stały minutami) i sypał `createdvd kod 1`.
+  Teraz scratch = tylko RAM-dysk → `scratch_dir` (lokalny) → temp systemowy (tylko
+  gdy brak RAM-dysku, tryb seryjny). Gdy nic lokalnego się nie mieści → zadanie
+  POMINIĘTE (`skipped_space`) i wznowione następnym przebiegiem (odbudowa jest
+  idempotentna). Test: `test_scratch_tmp_never_falls_back_to_nas`.
+- **Budżet RAM z zapasem (0.6 zamiast 0.85 wolnego RAM-dysku).** Scratch na
+  RAM-dysku to ten sam fizyczny RAM, o który walczą OS + cache odczytu z NAS +
+  chdman; zapełnianie pod korek wypychało 17–30 GB na `C:\pagefile.sys` (thrash).
+  Zapas 40% trzyma RAM pod kontrolą i ogranicza równoległość, gdy trzeba.
+- **Realny licznik postępu „zrobione / wszystkie" + nagłówek z kolekcjami/dyskami.**
+  Dotąd pasek pokazywał indeks DAT-u („0 / 1"). Teraz: pre-liczenie plików do
+  przerobienia z rozbiciem per katalog (platforma + dysk) i licznik podbijany przy
+  KAŻDYM zakończonym zadaniu (potok: w release; seryjnie: po zadaniu).
+- **Szybkie wznawianie.** Gry DVD z kontenerem już DVD (`bad_container=0` w indeksie)
+  są pomijane bez czytania nagłówka z NAS — po przerwaniu wznowienie nie miele od
+  nowa wszystkich ~2600 PS2.
+- **GUI:** po odbudowie nota, że liczby „do naprawy" odświeży Skanuj/dopasuj
+  (indeks już zaktualizowany; bieżący raport jest sprzed odbudowy).
+
+## [0.6.52] — 2026-09-16
+
+### Naprawiono (deep-scan CHD nie miele gotowych plików innych platform)
+- **Deep-scan CHD dopasowuje teraz do PEŁNEJ puli włączonych DAT-ów płytowych,
+  a nie tylko zaznaczonej platformy.** Objaw (log usera): `CHD do sprawdzenia:
+  5648 w 22 katalogach (DAT-y: Commodore Amiga CD32 …)` — 5648 gotowych CHD
+  (ps2/psx/3do/saturn/dreamcast) było wypakowywanych (extractcd/deframe/…) i
+  znaczonych „brak dopasowania w DAT", bo `known` zawierał TYLKO jeden obcy DAT
+  (CD32). Faza 2 skanu wołała `_deep_probe_gui` z wąskim `sel_entries` przy
+  pełnym zakresie `roots` → treść 3DO nie była w wąskiej puli. Pliki były CAŁE
+  (data_sha1 == profil z DAT-u, round-trip OK) — to skan pytał zły DAT. Fix:
+  Faza 2 przekazuje `enabled` (wszystkie włączone).
+- **CHD z ustalonym `data_sha1` (już zidentyfikowany do SWOJEGO DAT-u) NIE jest
+  ponownie wypakowywany dla innego DAT-u — niezależnie od bieżącej puli.**
+  Utwardzenie selekcji kandydatów i taniego checku nagłówka: plik zidentyfikowany
+  = zidentyfikowany, kropka; ekstrakcję wymusza dopiero zmiana pliku (mtime) lub
+  pełny skan. Chroni przed powtórką „mielenia" przy każdym zawężeniu puli DAT.
+  Testy: `test_identified_chd_not_reprobed_for_foreign_dat`.
+- **Log sondy CHD**: nagłówek pokazuje `dopasowuję do N DAT-ów płytowych, M gier`
+  (od razu widać patologię „tylko 1 DAT"); prefiks per-plik to teraz
+  `[platforma/plik.chd]` (widać, z którego katalogu leci CHD w przeplatanym logu).
+
+## [0.6.51] — 2026-09-16
+
+### Naprawiono (re-parenting: dziecko nie może zostać puste)
+- **Gdy jedyna kopia fizyczna leży w niższym tierze (np. 1G1R), a naprawa
+  RE-PARENTUJE ją do wyższego (ROMS, parent_priority) — miejsce dziecka dostaje
+  teraz LINK, zamiast zostać PUSTE.** Scenariusz: gra istniała fizycznie tylko w
+  1G1R, potem doszedł wpis do DAT-u ROMS. Rodzik (przetwarzany pierwszy) zabierał
+  jedyny plik do siebie, a gałąź HAVE liczyła dziecko jako `already_ok` bez
+  odtworzenia linku (bo `_relink_if_stale` odpalało się TYLKO dla istniejącego
+  symlinku, a przeniesiony plik po prostu znikał) → gra znikała z 1G1R. Teraz
+  warunek obejmuje też „canonical zniknął, a treść jest pod claimem".
+- **Utrzymany inwariant (user):** jedna kopia fizyczna na grę, reszta linki;
+  priorytet decyduje tylko GDZIE leży oryginał. Zmiana priorytetu przy hardlinkach
+  nie robi żadnego ruchu fizycznego (jeden i-węzeł, kilka nazw → `already_ok`).
+  Testy: `test_reparent_when_higher_tier_dat_added`, `test_priority_change_no_physical_churn`.
+
+## [0.6.50] — 2026-09-16
+
+### Dodano (HARDLINKI na tym samym woluminie zamiast symlinków)
+- **Linkowanie (dedup dziecko→rodzic, zamiana kopii na link, tłumaczenia) na TYM
+  SAMYM woluminie tworzy teraz HARDLINK (`os.link`), a nie symlink.** Powód: symlink
+  na Windows wymaga trybu dewelopera/administratora (WinError 1314) i **nie działa
+  na SMB Z:** — u usera realne linkowanie w ogóle się nie odbywało (miejsca dzieci
+  zostawały puste / links_skipped). Hardlink nie wymaga uprawnień i działa na tym
+  samym share. `create_link` próbuje hardlink dla PLIKÓW na tym samym woluminie
+  (litera dysku albo UNC `\\serwer\share`), a symlink jest fallbackiem (inny wolumin,
+  katalog, brak wsparcia). `mirror_tree` (RetroBat) celowo zostaje na symlinkach
+  (`prefer_hardlink=False`) — polega na semantyce reparse pointa do bezpiecznego
+  czyszczenia i z założenia wskazuje inny wolumin.
+- **Hardlink = kopia równorzędna (nie reparse point).** W indeksie zapisywany jak
+  zwykły plik z tą treścią (is_link=1 tylko dla realnego symlinku). Nowy helper
+  `linker.same_file` (ten sam st_dev+st_ino) rozpoznaje „już zlinkowane" przy
+  powtórnym uruchomieniu — bez tego hardlink-dziecko (którego `is_link` nie widzi)
+  byłby błędnie uznany za „zwykły plik" → KONFLIKT / zbędna przebudowa fizyczna.
+  Poprawione ścieżki: `convert._link_child_to_parent`, `convert._relink_verified_duplicate`,
+  `rebuilder._process` (link dziecka), `rebuilder._dedup_confirmed`, `linker.apply_dedup`,
+  `translations`. Testy zaktualizowane pod semantykę współdzielenia treści (część
+  wcześniej pomijana z braku uprawnień do symlinków — teraz realnie działa).
+
+## [0.6.49] — 2026-09-16
+
+### Naprawiono (audyt spójności ustawień: dedup_copies honorowany też w konwersji)
+- **`dedup_copies=false` jest teraz respektowany w konwersji ze źródła (convert),
+  nie tylko w rebuilderze.** Dotąd `convert_from_source` linkował dziecko (np.
+  1G1R) do fizycznego pliku rodzica ZAWSZE, gdy zgadzał się odcisk treści — mimo
+  że katalog miał wyłączony dedup. Rebuilder tę regułę honorował (chronił katalog
+  przed dedupem), convert — nie: klasyczna regresja logiczna „zmieniasz opcję dla
+  DAT, a program dalej jej nie stosuje". Teraz przy `dedup_copies=false` dziecko
+  dostaje WŁASNĄ kopię fizyczną. Test: `test_convert_from_source_dedup_copies_false_makes_physical`.
+
+### Audyt (13 ustawień DAT × skaner/naprawa)
+- Zweryfikowano spójność wszystkich ustawień DEFAULT_RULES między skanem a naprawą
+  (patrz opis w odpowiedzi/sesji). Cel `target`/`naming`/`rom_root`/`platform`
+  schodzą przez `apply_rule_targets` do `entry.target_dir`, którego używają OBA
+  (matcher przy skanie, rebuilder/convert przy naprawie) — spójne. `only_complete`,
+  `skip`, `prefer_translations`, `parent_priority` honorowane per-DAT w rebuilderze;
+  podgląd „Znajdź naprawy" i „Napraw" to ta sama ścieżka `rebuilder.run` (dry/real).
+
+## [0.6.48] — 2026-09-16
+
+### Zmieniono (sieroty: migracja do targetu zamiast ślepego ToSort)
+- **Foldery-sieroty (stary/inny output tego samego DAT-u) są teraz SKANOWANE i
+  MIGROWANE do skonfigurowanego folderu docelowego DAT-u — a nie ślepo wysyłane do
+  ToSort.** Folder output DAT-u jest EDYTOWALNY i często różni się od nazwy z DAT-u
+  (np. Commodore 64 z output `c64`, a pliki leżą w starym `commodore64`) — to dalej
+  TEN SAM DAT. Poprzednio (0.6.46/0.6.47) sweep patrzył na NAZWĘ folderu i słał
+  całość do ToSort (fałszywy pozytyw: `commodore64`→ToSort mimo że to gry C64).
+  Teraz:
+  - `dirrules.stray_dirs` znajduje sieroty (rodzeństwo zarządzanych platform, nie
+    target/kandydat/przodek żadnego DAT-u — z WSZYSTKICH DAT-ów, też wyłączonych).
+  - Skan obejmuje sieroty → DAT dopasowuje ich treść po sumach → naprawa PRZENOSI
+    pliki do targetu (ELSEWHERE→move, zwykłe przeniesienie). Tak samo działa zmiana
+    ustawienia output (ES→nazwa DAT / własny) = migracja starego folderu do nowego.
+  - `sweep_orphans` przenosi do ToSort **tylko pliki niepasujące do ŻADNEGO DAT-u**
+    (pomija źródła dopasowanych gier — `_placed_sources`), więc nie ma sprzeczności
+    „przenieś do targetu" vs „→ToSort" dla tych samych plików. Puste sieroty po
+    migracji są usuwane.
+
+## [0.6.47] — 2026-09-16
+
+### Dodano / poprawiono (czytelność logów naprawy)
+- **Log KONWERSJI pokazuje ŹRÓDŁO**: `KONWERSJA(ze źródła)→CHD: <gra>  [źródło:
+  <ścieżka>]`. Wcześniej nie było widać, skąd leci konwersja (np. PSP: ISO w
+  `ROMS\psp\<gra>\` vs archiwum w ToSort).
+- **Czytelniejszy kierunek linku**: zamiast mylącego `LINK  A -> B` (czytane jak
+  „przenieś A do B") log pisze `LINK (tworzę) A  ⟶  wskazuje na B`. Semantyka bez
+  zmian: symlink powstaje w A (miejsce dziecka) i wskazuje na fizyczny plik B
+  (rodzic). Kierunek zawsze był poprawny (dziecko No-intro/1G1R → rodzic ROMS).
+
+### Znane / do zrobienia
+- **MSU1 (format=zip) układany LUŹNO, nie jako `<gra>.zip`.** Placement rebuildera
+  nie patrzy na `store_format=="zip"` i wypakowuje każdy ROM osobno; tylko
+  `convert_from_source` pakuje zip (i tylko dla gier w pełni „do zbudowania" —
+  stąd 1/~600 spakowana). Poprawne „jeden zip na grę" wymaga modelowania całej
+  gry format=zip jako JEDNEGO archiwum w matcher+rebuilder (dziecko linkuje jeden
+  `.zip`, nie per-.pcm) — planowane jako osobna, przetestowana zmiana.
+
+## [0.6.46] — 2026-09-16
+
+### Dodano (nieznane katalogi → ToSort)
+- **Katalogi/pliki BEZ DAT-a (np. „MAME") są przenoszone do ToSort** podczas
+  naprawy (gdy włączone „sprzątanie nieznanych"). Dawniej sprzątanie działało
+  TYLKO wewnątrz katalogów-celów DAT-ów, więc folder bez żadnego DAT-a zostawał w
+  katalogu docelowym na zawsze — trzeba było czyścić ręcznie. Teraz „sieroty"
+  (rodzeństwo zarządzanych platform) lądują w ToSort z zachowaniem względnej
+  ścieżki (`ToSort\<tier>\<nazwa>`), gdzie kolejny skan może je gdzieś dopasować.
+  `Rebuilder.sweep_orphans` używa **WSZYSTKICH odkrytych DAT-ów** (także
+  WYŁĄCZONYCH), więc platforma tylko odznaczona na ten przebieg NIE jest ruszana;
+  nie schodzimy w żaden target_dir ani w tier-przodka. Widoczne w podglądzie
+  („Znajdź naprawy") jako `NIEZNANY→ToSort (brak DAT-a): …`.
+
+### Naprawiono (puste katalogi po konwersji)
+- **Po konwersji ze źródła (ISO→CHD itd.) opróżniony katalog źródła jest usuwany —
+  dla KAŻDEJ platformy, także gier JEDNOPLIKOWYCH** (PSP `<gra>/<gra>.iso`, GC/Wii
+  RVZ). Dawniej `deferred_dirs` kasował podkatalog tylko przy `n_roms > 1`, więc po
+  konwersji pojedynczego ISO zostawał pusty katalog do ręcznego czyszczenia. Teraz
+  po skasowaniu źródeł usuwamy puste katalogi-rodziców wszystkich zabranych plików
+  (`rmdir` — tylko puste, nigdy nie ruszy katalogu platformy ani gry z plikami).
+
+## [0.6.45] — 2026-09-16
+
+### Dodano (logowanie do pliku + eksport list)
+- **Logi zapisywane do pliku, osobno dla każdej operacji, ze znacznikiem czasu
+  rozpoczęcia.** Każda operacja z paskiem postępu (skan, „Znajdź naprawy",
+  „Napraw", rebuild CHD, wymuś pełny skan…) tworzy własny, datowany plik
+  `<baza>\logs\<operacja>_RRRR-MM-DD_GG-MM-SS.log`. Każda linia z godziną; plik
+  jest flushowany na bieżąco (awaria/przerwanie nie gubi logu). Skan i rebuild
+  trafiają do ODDZIELNYCH plików (rozróżnia je tytuł operacji). Ścieżka pliku
+  wypisywana na końcu w oknie. (Wcześniej log był tylko w okienku, znikał po
+  zamknięciu — nie dało się diagnozować przebiegów po fakcie.)
+- **Eksport list gier („📄 Eksport list…").** Z ostatniego skanu/raportu zapisuje
+  trzy datowane pliki w `logs`: `have_*.txt` (komplet), `do_naprawy_*.txt`
+  (WRONG_NAME/ELSEWHERE/CREATABLE, ze ścieżką źródło → cel), `brak_*.txt`
+  (MISSING/NO_HASH). Do przejrzenia stanu kolekcji poza programem.
+
+### Uwaga
+- Diagnostyka hierarchii PSP/PS2 (naprawione CHD w tierze-rodzicu ROMS a linki
+  w dzieciach No-intro/1G1R) wymaga logu z przebiegu — teraz jest już zapisywany.
+
+## [0.6.44] — 2026-09-16
+
+### Naprawiono (regresja 0.6.39)
+- **Wcześniej naprawione CHD były WYNOSZONE do ToSort przy kolejnej naprawie.**
+  Fix 0.6.39 pomijał konwersję gry już na zweryfikowanym CHD (dodawał do `done`),
+  ale NIE rejestrował tego CHD jako kanonicznego (`on_converted`/`add_canonical`).
+  rb.run pomijał grę → jej CHD nie trafiał do `_canonical` → faza sprzątania
+  `_clean_dir` uznawała go za „obcy" i przenosiła do ToSort (kierunek: kolekcja →
+  ToSort). Teraz pominięcie rejestruje istniejący `<gra>.chd` jako kanoniczny —
+  plik zostaje na miejscu. (Objaw: `TOSORT Z:\ROMS\ROMS\saturn\… .chd -> ToSort`.)
+
+## [0.6.43] — 2026-09-15
+
+### Naprawiono (symlinki na SMB)
+- **Poprawne symlinki na udziale SMB były KASOWANE jako „zerwane".**
+  `remove_broken_links` sprawdzał `path.exists()`, które PODĄŻA za linkiem — a przy
+  wyłączonej ocenie remote→remote (R2R) Windows nie podąża za linkiem na SMB, więc
+  `exists()` zwraca False nawet dla POPRAWNEGO linku → dobre linki dzieci (1G1R→
+  rodzic) znikały, dzieci wracały „do naprawy". Teraz „zerwany" liczymy po CELU
+  (`os.readlink` → `os.path.lexists(cel)`), niezależnie od podążania. Nowe:
+  `linker.link_target`, `linker.link_is_broken`.
+- **Przestań przepinać poprawny link co przebieg** — `_relink_if_stale` też używał
+  `link_path.exists()` (podążanie); teraz sprawdza istnienie CELU.
+- Matcher `_link_satisfies` już wcześniej sprawdzał cel (bez podążania) — bez zmian.
+
+Uwaga: tworzenie symlinków wciąż wymaga uprawnienia (admin / Tryb dewelopera) —
+błąd WinError 1314 to brak uprawnień, nie problem SMB.
+
+## [0.6.42] — 2026-09-15
+
+### Naprawiono
+- **„KOLIZJA DAT" błędnie zwijała identyczny DAT z RÓŻNYCH tierów (ROMS vs
+  No-Intro) do jednego — i wybierała No-Intro zamiast ROMS.** To nie kolizja: ten
+  sam DAT w ROMS i No-Intro to CELOWY układ (ROMS = rodzic z nazwami
+  EmulationStation, No-Intro = dziecko z nazwami Redump; pliki linkowane, bez
+  podwójnego miejsca). Teraz dedup DAT-ów działa TYLKO w obrębie tego samego
+  tieru (przypadkowy duplikat w jednym katalogu); identyczny DAT w różnych
+  tierach → OBA zostają (ROMS wraca jako rodzic).
+- **Hierarchia rodzic/dziecko liczona po TIERZE katalogu (odporna).** Gdy w
+  platformie najwyższy tier (ROMS) ma JEDEN DAT → on rodzic, reszta dzieci (np.
+  Atari Jaguar: ROMS `J64` rodzic, No-Intro `JAG` + 1G1R dzieci — mimo różnych
+  kwalifikatorów). Gdy najwyższy tier ma WIELE wariantów i NIE ma nad nimi ROMS
+  (np. Apple II: No-Intro `A2R`/`Waveform`/`WOZ`) → platforma dzielona PO
+  WARIANCIE: każdy wariant to osobny rodzic swojego 1G1R (Retool), a nie dziecko
+  sąsiada. Dawniej wszystkie warianty zlepiały się w jeden „apple ii" i pierwszy
+  (A2R) fałszywie stawał się rodzicem Waveform/WOZ. Nowe: `datstore.variant_key`,
+  `group_by_platform(entries, rules, dat_root)`.
+
+## [0.6.41] — 2026-09-15
+
+### Dodano (format arcade per DAT — matcher + rebuilder, split)
+- Wspólny helper `mamesets.effective_roms(entry, game)` — oczekiwana zawartość
+  zipa gry wg `entry.arcade_format`; MATCHER i REBUILDER liczą to samo (brak pętli
+  „przepakuj"). `apply_rule_targets` ustawia `entry.arcade_format` (jak store_format).
+- **Split (domyślny):** klon (z rodzicem obecnym w DAT) = zip z TYLKO ROM-ami
+  unikalnymi (bez `merge=`); współdzielone bierze emulator z rodzica. Skutki:
+  - klon w split (same unikalne) → **HAVE** (zielony), koniec fałszywego
+    „niekompletny"/„nadzbiór do przepakowania";
+  - merged/pełny zip klona → przepakowywany DO split (unikalne), potem HAVE — raz.
+  - W split gry NIE zawierają ROM-ów BIOS-u (BIOS osobno) → znika błędny dedup
+    BIOS-ów (pgm/skns/cchip) przeciw grom (występował w merged/non-merged).
+- non-merged = pełna lista (bez zmian); merged (klon w rodzicu) — do zrobienia.
+- Zwykrywanie arcade po `cloneof/romof/isbios`; DAT-y bez parent/clone bez zmian.
+
+## [0.6.40] — 2026-09-15
+
+### Dodano (fundament: format zestawów arcade per DAT)
+- Model DAT czyta `isbios` (BIOS-y jak pgm/neogeo/skns); `cloneof/romof/merge` już były.
+- `core/mamesets.py` — czysta, przetestowana logika składania setów arcade:
+  `plan_sets(games, fmt)` (co ma zawierać każdy zip w **split**/merged/non-merged),
+  `families()` (grupowanie parent+klony, BIOS osobno), `has_parent_clone()`.
+- Reguła per DAT **`arcade_format`** (`split` domyślnie) w `_reguly.json`, edytowalna
+  w „Ustawienia DAT-a…" — dropdown pokazywany TYLKO dla DAT-ów z logiką parent/clone.
+  Na razie tylko ZAPIS preferencji; matcher/rebuilder skorzystają z niej w kolejnym
+  kroku (podgląd „Znajdź naprawy" przed wykonaniem). Zero zmiany zachowania naprawy.
+
+## [0.6.39] — 2026-09-15
+
+### Naprawiono
+- **Ponowna naprawa po przerwaniu budowała CHD od nowa dla gier JUŻ zrobionych.**
+  Naprawa działa „z przepisu" — ze statusów z OSTATNIEGO skanu. Po przerwaniu i
+  ponowieniu (bez skanu) status gry bywa nieaktualny („luźna"), więc
+  `convert_from_source` konwertował ją ponownie, mimo że zweryfikowany
+  `<gra>.chd` już istniał. (Postęp BYŁ zapisywany — plik na dysku + indeks
+  commitowany na bieżąco — ale planista naprawy o tym nie wiedział.) Dodano żywy
+  strażnik na wejściu pętli konwersji: jeśli indeks ma fizyczny `<gra>.chd` z
+  `data_sha1 == game_profile`, gra jest pomijana i oznaczana jako zrobiona.
+  Odbudowa kontenerów CD→DVD (`rebuild_bad_chds`) już wcześniej sprawdzała stan
+  na żywo (re-probe), więc jej to nie dotyczyło.
+
+## [0.6.38] — 2026-09-15
+
+### Naprawiono / Zmieniono
+- **„Wymuś pełny skan katalogu" hashował plik po pliku (1 wątek).** Ten przycisk
+  wołał `idx.scan(full=True)` BEZ `workers=`, więc na NAS czytał serialnie —
+  wielokrotnie wolniej niż zwykły skan (8 wątków).
+- **Ujednolicono skanowanie: „skan to skan".** Były TRZY osobne implementacje
+  pętli skanu (raport kolekcji, wymuszony pełny skan, skan zakładki Indeks) —
+  różniły się i dryfowały (stąd wymuszony zgubił równoległość). Wydzielono jeden
+  wspólny rdzeń `scan_paths()`: równoległe hashowanie wg nośnika (NAS/SSD wiele,
+  HDD 1), sloty postępu, size-cap per katalog (gdzie dotyczy), oversize→ToSort.
+  Wszystkie trzy przyciski korzystają teraz z tej samej ścieżki kodu, więc mają
+  identyczne własności wydajnościowe.
+
+## [0.6.37] — 2026-09-15
+
+### Naprawiono
+- **Po PRZERWANEJ naprawie sam odpalał się pełny, głęboki skan całej kolekcji.**
+  `done()` rozpoznaje przerwanie po `stats.cancelled`, ale flaga przerwania była
+  tylko na obiekcie `Rebuilder` (`rb.cancelled`), a `RebuildStats` w ogóle nie
+  miał takiego pola — więc `getattr(stats, "cancelled", False)` zawsze dawało
+  `False`, gałąź „PRZERWANO" nie wchodziła i sterowanie leciało do
+  `_collection_report()` (dwufazowy skan FS + deep-probe CHD). Dodano pole
+  `RebuildStats.cancelled` i ustawiamy je przed zwrotem (`rb.cancelled` lub
+  `cancel.is_set()`). Teraz przerwanie kończy się komunikatem „zrób skan i ponów",
+  bez automatycznego przemiatania NAS-a i głębokiej identyfikacji CHD.
+
+## [0.6.36] — 2026-09-15
+
+### Naprawiono
+- **Odbudowa CHD „stała" na 100% po zejściu pliku na NAS.** `_rb_upload` (i
+  seryjne `_rebuild_*_one`) liczyły sumy z pliku DOCELOWEGO na NAS PO
+  przeniesieniu — czyli PONOWNIE czytały cały CHD przez SMB (pasek na 100% po
+  „przenoszę…", a proces po cichu minutami czytał z sieci). Teraz sumy liczymy z
+  pliku w SCRATCHU (RAM) PRZED podmianą (treść identyczna, już po round-tripie).
+- **Duże DVD w odbudowie mieliły jednowątkowo** (regresja z 0.6.34: `threads=1`
+  na zadanie dla równoległości). Przy dużych DVD do RAM mieści się ~1 na raz →
+  zero zysku z równoległości, a chdman dostawał 1 wątek → ~12 MB/s, „jakby
+  zawieszone". Teraz **pula wątków dzielona dynamicznie**: `wątki_na_CHD =
+  pula // ile_takich_zmieści_się_w_budżecie_RAM`. Duży DVD (1 na raz) → cała pula
+  (do 8); małe CD (kilka na raz) → pula podzielona (np. 4×2). Zgodnie z zasadą
+  użytkownika: „8 do dyspozycji — 1 CHD=8, 2 CHD=po 4, 4 CHD=po 2".
+
+## [0.6.35] — 2026-09-15
+
+### Naprawiono
+- **FBNeo/arcade: te same ZIP-y „przepakowywały się" co przebieg naprawy.**
+  `PRZEPAKUJ x.zip -> x.zip (poprawne nazwy wewn.)` / `WYPAKUJ ...` padały z
+  „There is no item named 'X' in the archive", bo nazwę członka brano z INDEKSU
+  (`member_name_in`), a dla MAME merged/parent bywa nieaktualna (nazwa w indeksie
+  ≠ nazwa w pliku). Skutkiem repack się nie udawał, ścieżka kanoniczna nie była
+  zajmowana, a że placement leci raz na KAŻDY ROM gry — ta sama próba wracała
+  kilkanaście razy w jednym przebiegu i przy każdej kolejnej naprawie. Teraz:
+  - `_rebuild_zip` i `_extract_member` **dobierają członka z RZECZYWISTEGO
+    archiwum po CRC+rozmiar** (central directory, bez dekompresji), gdy nazwa z
+    indeksu nie istnieje w pliku; treść nadal weryfikowana SHA-1. ROM obecny pod
+    inną nazwą jest teraz poprawnie odczytany; ROM-a naprawdę nieobecnego nie
+    fabrykujemy (błąd raz, bez pętli).
+  - **Umieszczenie archiwum gry próbowane RAZ na ścieżkę kanoniczną**, nie raz na
+    ROM (`_archive_tried`) — koniec kilkunastu identycznych prób repacku na grę.
+
+### Znane (do zrobienia)
+- Pełna świadomość MAME merged/parent/BIOS/device: gry rozbite między
+  `mario.zip`+`marioe.zip`, oraz dedup zestawów device (`pgm/skns/cchip`) dający
+  `KONFLIKT: ... zajęte zwykłym plikiem` — wymaga rekonstrukcji zestawów wg
+  cloneof/romof/device (większy temat).
+
+## [0.6.34] — 2026-09-15
+
+### Zmieniono
+- **Odbudowa kontenerów CHD (CD→DVD / zły układ ścieżek) idzie teraz RÓWNOLEGLE**
+  — kilka `chdman` naraz, jak główna konwersja. Dotąd `rebuild_bad_chds` robiło
+  gry pojedynczo, mimo że reszta konwersji korzysta z potoku. Gdy jest RAM-dysk
+  (i nie podgląd), praca leci przez `StagePipeline` (gather I/O → build CPU →
+  upload I/O), liczba równoległych = ustawienie `convert_workers` lub auto
+  (min. 8, ~½ rdzeni logicznych), a REALNĄ równoległość ogranicza BUDŻET RAM
+  (0,85 wolnego RAM-dysku; wielkie DVD 11–13 GB → zwykle 2–3 naraz). Bez
+  RAM-dysku — jak dotąd, seryjnie. Zapisy do indeksu (SQLite) nadal wyłącznie w
+  wątku właściciela (finalize potoku).
+- **Przerwanie odbudowy CHD jest ŁAGODNE** — rozpoczęte konwersje DOKAŃCZAJĄ się
+  i są zatwierdzane (round-trip → atomowa podmiana → wpis do indeksu → zdjęcie
+  flagi `bad_container`), zamiast ubijać `chdman` w locie. Przerwanie wstrzymuje
+  tylko PODAWANIE nowych zadań; `chdman` nie dostaje już `cancel_event` (spójnie
+  z głównym potokiem konwersji). **Status przerwanego pliku:** nierozpoczęte CHD
+  zostają z `bad_container=1` i następny przebieg je WZNAWIA; oryginał nie jest
+  kasowany, dopóki nie powstanie zweryfikowany zamiennik (brak plików częściowych).
+
 ## [0.6.33] — 2026-09-15
 
 ### Dodane

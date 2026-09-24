@@ -19,7 +19,8 @@ from typing import Optional
 from .datfile import DatGame, parse_dat, parse_dat_header
 from .settings import app_base_dir
 
-CACHE_FILENAME = "dat_parse_cache.pkl"
+CACHE_FILENAME = "dat_parse_cache.pkl"     # stary MONOLIT (migrowany → katalog)
+CACHE_DIRNAME = "dat_parse_cache"          # v3+: OSOBNY plik per DAT (obok exe)
 CACHE_VERSION = 3      # v3: DatGame.cloneof/romof + DatRom.merge (MAME)
 
 REPORT_CACHE_FILENAME = "report_state_cache.pkl"   # stary format: jeden plik
@@ -29,6 +30,17 @@ REPORT_CACHE_VERSION = 4      # v4: + archive_names_ok (zła nazwa w archiwum)
 
 def cache_path() -> Path:
     return app_base_dir() / CACHE_FILENAME
+
+
+def cache_dir() -> Path:
+    """Katalog cache sparsowanych DAT-ów (jeden plik na DAT) — obok exe."""
+    return app_base_dir() / CACHE_DIRNAME
+
+
+def _cache_file(dirpath: Path, dat_key: str) -> Path:
+    import hashlib
+    h = hashlib.sha1(os.path.normcase(dat_key).encode("utf-8")).hexdigest()[:20]
+    return dirpath / f"{h}.pkl"
 
 
 def report_cache_path() -> Path:
@@ -103,11 +115,17 @@ def _migrate_legacy(d: Path) -> None:
         _write_report_file(d, key, games, saved_at)
 
 
-def load_report_states(path: Optional[Path] = None):
+def load_report_states(path: Optional[Path] = None, known_keys=None):
     """Zwraca (saved_at, {dat_abspath: {gra: {rom_lower: status}}}) albo
     (None, {}). status = lekki obiekt z polami state/source_path/member/
     via_chd (do kolorów i planu naprawy). `saved_at` = najnowszy zapis.
-    Pliki DAT-ów, których już nie ma na dysku, są pomijane."""
+
+    `known_keys` — zbiór abspath AKTUALNIE odkrytych DAT-ów (z pamięci): stany
+    DAT-ów spoza niego są pomijane. NIE sprawdzamy istnienia plików DAT na
+    dysku — DAT-y leżą na NAS, a `isfile` per plik (600+) to ~45 s seryjnych
+    rund SMB na wątku GUI (zamrażało start, przerwanie i koniec skanu).
+    Bez `known_keys` zwracamy wszystko (nieaktualne klucze są nieszkodliwe —
+    nikt ich nie odpyta, bo lookup idzie po kluczach bieżących DAT-ów)."""
     d = Path(path) if path else report_cache_path()
     if path is None:
         _migrate_legacy(d)
@@ -116,6 +134,8 @@ def load_report_states(path: Optional[Path] = None):
     from types import SimpleNamespace
 
     from .matcher import RomState
+    known = ({os.path.normcase(k) for k in known_keys}
+             if known_keys is not None else None)
     out: dict[str, dict] = {}
     newest = None
     for fp in d.glob("*.pkl"):
@@ -127,7 +147,7 @@ def load_report_states(path: Optional[Path] = None):
         if not isinstance(blob, dict) or blob.get("version") != REPORT_CACHE_VERSION:
             continue
         key = blob.get("dat") or ""
-        if not key or not os.path.isfile(key):
+        if not key or (known is not None and os.path.normcase(key) not in known):
             continue
         out[key] = {
             g: {rn: SimpleNamespace(
@@ -151,75 +171,124 @@ def _sig(path: Path) -> tuple[int, int]:
 
 
 class DatParseCache:
-    """Wczytuje/zapisuje sparsowane DAT-y; parsuje tylko zmienione."""
+    """Cache sparsowanych DAT-ów — OSOBNY plik na DAT (obok exe).
 
-    def __init__(self, path: Optional[Path] = None):
-        self.path = Path(path) if path else cache_path()
-        self._data: dict[str, dict] = {}
-        self._dirty = False
-        self._load()
+    Dawniej jeden monolit ``dat_parse_cache.pkl`` (~315 MB): zmiana JEDNEGO
+    DAT-a przepisywała całość, a start odpicklowywał wszystko naraz. Teraz
+    każdy DAT ma własny ``<hash(abspath)>.pkl`` = {sig, dat, name, games}:
+    zmiana dotyka tylko swojego pliku, a wczytanie bierze wyłącznie realnie
+    potrzebne DAT-y. Zapis jest natychmiastowy (``put``), więc ``save`` to
+    no-op (zgodność API). Stary monolit jest jednorazowo rozbijany na pliki
+    per DAT i usuwany (odzysk ~315 MB; cache i tak się regeneruje).
 
-    def _load(self) -> None:
-        if not self.path.is_file():
+    `path` (opcjonalne, głównie testy) wskazuje KATALOG cache; None = obok exe.
+    """
+
+    def __init__(self, path: Optional[Path] = None, log=None):
+        self.dir = Path(path) if path else cache_dir()
+        self._migrate_monolith(log)
+
+    def _migrate_monolith(self, log=None) -> None:
+        legacy = self.dir.parent / CACHE_FILENAME
+        if not legacy.is_file():
             return
+        # już zmigrowane (katalog ma pliki) → tylko posprzątaj monolit
+        if self.dir.is_dir() and any(self.dir.glob("*.pkl")):
+            legacy.unlink(missing_ok=True)
+            return
+        if log:
+            log("Migruję cache DAT-ów na format per-plik (jednorazowo po "
+                "aktualizacji, chwilę to potrwa)…")
         try:
-            with open(self.path, "rb") as f:
+            with open(legacy, "rb") as f:
                 blob = pickle.load(f)
-            if isinstance(blob, dict) and blob.get("version") == CACHE_VERSION:
-                self._data = blob.get("entries", {})
         except (OSError, pickle.PickleError, EOFError, AttributeError):
-            self._data = {}       # uszkodzony/stary cache — zignoruj
-
-    def get(self, dat: Path) -> Optional[tuple[str, list[DatGame]]]:
-        """Zwraca (name, games) z cache, jeśli plik niezmieniony."""
-        key = str(Path(os.path.abspath(dat)))
-        rec = self._data.get(key)
-        if rec is None:
-            return None
-        try:
-            if tuple(rec["sig"]) != _sig(dat):
-                return None
-        except OSError:
-            return None
-        return rec["name"], rec["games"]
-
-    def put(self, dat: Path, name: str, games: list[DatGame]) -> None:
-        key = str(Path(os.path.abspath(dat)))
-        try:
-            sig = _sig(dat)
-        except OSError:
             return
-        self._data[key] = {"sig": sig, "name": name, "games": games}
-        self._dirty = True
+        if not isinstance(blob, dict) or blob.get("version") != CACHE_VERSION:
+            legacy.unlink(missing_ok=True)     # stara wersja — i tak do wyrzucenia
+            return
+        n = 0
+        for key, rec in (blob.get("entries") or {}).items():
+            try:
+                self._write(key, rec["sig"], rec["name"], rec["games"])
+                n += 1
+            except (KeyError, TypeError):
+                continue
+        legacy.unlink(missing_ok=True)
+        if log:
+            log(f"Migracja cache DAT-ów zakończona ({n} plików) — kolejne starty "
+                f"będą szybkie.")
 
-    def parse(self, dat: Path) -> tuple[str, list[DatGame]]:
-        """Nazwa + gry DAT-a — z cache albo świeżo sparsowane (i dołożone)."""
-        hit = self.get(dat)
+    def _write(self, key: str, sig, name: str, games: list[DatGame]) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        dst = _cache_file(self.dir, key)
+        tmp = dst.with_suffix(".pkl.tmp")
+        try:
+            with open(tmp, "wb") as f:
+                pickle.dump({"version": CACHE_VERSION, "sig": tuple(sig),
+                             "dat": key, "name": name, "games": games},
+                            f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, dst)
+        except (OSError, pickle.PickleError):
+            tmp.unlink(missing_ok=True)
+
+    def get(self, dat: Path, sig=None) -> Optional[tuple[str, list[DatGame]]]:
+        """Zwraca (name, games) z cache, jeśli plik DAT-a niezmieniony.
+        `sig` (mtime_ns, size) można podać z zewnątrz (discover robi jeden
+        RÓWNOLEGŁY przebieg stat na NAS), żeby uniknąć stat per rekord."""
+        key = str(Path(os.path.abspath(dat)))
+        fp = _cache_file(self.dir, key)
+        if not fp.is_file():
+            return None
+        if sig is None:
+            try:
+                sig = _sig(dat)
+            except OSError:
+                return None
+        try:
+            with open(fp, "rb") as f:
+                blob = pickle.load(f)
+        except (OSError, pickle.PickleError, EOFError, AttributeError):
+            return None
+        if not isinstance(blob, dict) or blob.get("version") != CACHE_VERSION:
+            return None
+        if tuple(blob.get("sig", ())) != tuple(sig):
+            return None
+        return blob["name"], blob["games"]
+
+    def put(self, dat: Path, name: str, games: list[DatGame], sig=None) -> None:
+        key = str(Path(os.path.abspath(dat)))
+        if sig is None:
+            try:
+                sig = _sig(dat)
+            except OSError:
+                return
+        self._write(key, sig, name, games)
+
+    def parse(self, dat: Path, sig=None) -> tuple[str, list[DatGame]]:
+        """Nazwa + gry DAT-a — z cache albo świeżo sparsowane (i zapisane)."""
+        hit = self.get(dat, sig=sig)
         if hit is not None:
             return hit
         name = (parse_dat_header(dat).get("name") or dat.stem)
         games = list(parse_dat(dat))
-        self.put(dat, name, games)
+        self.put(dat, name, games, sig=sig)
         return name, games
 
     def prune(self, present: set[str]) -> None:
-        """Usuwa z cache wpisy DAT-ów, których już nie ma (present = zbiór
-        aktualnych abspath)."""
-        stale = [k for k in self._data if k not in present]
-        for k in stale:
-            del self._data[k]
-            self._dirty = True
+        """Usuwa pliki cache DAT-ów, których już nie ma (present = zbiór
+        aktualnych abspath). Rusza WYŁĄCZNIE pliki o kształcie per-DAT
+        (`<20 hex>.pkl`) — inne pliki w tym katalogu (np. `dat_sha1_cache.pkl`)
+        zostają nietknięte."""
+        import re
+        if not self.dir.is_dir():
+            return
+        shaped = re.compile(r"^[0-9a-f]{20}\.pkl$")
+        keep = {_cache_file(self.dir, str(Path(os.path.abspath(k)))).name
+                for k in present}
+        for fp in self.dir.glob("*.pkl"):
+            if shaped.match(fp.name) and fp.name not in keep:
+                fp.unlink(missing_ok=True)
 
     def save(self) -> None:
-        if not self._dirty:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".pkl.tmp")
-        try:
-            with open(tmp, "wb") as f:
-                pickle.dump({"version": CACHE_VERSION, "entries": self._data},
-                            f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp, self.path)
-            self._dirty = False
-        except (OSError, pickle.PickleError):
-            tmp.unlink(missing_ok=True)
+        return       # zapis per-DAT jest natychmiastowy (put) — nic do zrobienia

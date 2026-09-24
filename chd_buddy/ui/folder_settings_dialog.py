@@ -57,10 +57,12 @@ class FolderSettingsDialog(QDialog):
         form = QFormLayout()
         lay.addLayout(form)
 
-        self.chk_parent = QCheckBox(tr("wszystkie DAT-y tego katalogu są RODZICAMI "
-                                    "swoich platform (trzymają pliki fizyczne)"))
-        self.chk_parent.setChecked(bool(cur.get("parent_priority", False)))
-        form.addRow(tr("Rola:"), self.chk_parent)
+        # wymuszenie: DAT-y tego katalogu nigdy nie linkują (kolejność =
+        # hierarchia z drzewa; to tylko wyjątek od linkowania)
+        self.chk_physical = QCheckBox(tr("zawsze kopie fizyczne (bez linków do "
+                                      "DAT-ów wyżej)"))
+        self.chk_physical.setChecked(not bool(cur.get("dedup_copies", True)))
+        form.addRow(tr("Wymuszenie:"), self.chk_physical)
 
         # ROLA wszystkich DAT-ów w katalogu: kolekcja albo pula tłumaczeń
         self.cmb_role = QComboBox()
@@ -137,7 +139,7 @@ class FolderSettingsDialog(QDialog):
 
     def _save(self) -> None:
         updates = {
-            "parent_priority": self.chk_parent.isChecked(),
+            "dedup_copies": not self.chk_physical.isChecked(),
             "format": self.cmb_format.currentData(),
             "naming": self.cmb_naming.currentData(),
             "rom_root": self.e_root.text().strip(),

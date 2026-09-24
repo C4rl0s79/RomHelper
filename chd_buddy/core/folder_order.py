@@ -12,10 +12,8 @@ Plik ``_kolejnosc.json`` w katalogu DAT-ów (obok ``_reguly.json``)::
 
 Klucz = ścieżka katalogu-rodzica względem dat_root („" = korzeń, separator
 „/"), wartość = kolejność jego podkatalogów. Katalogi spoza listy stoją za
-wymienionymi — najpierw oznaczone jako rodzice (reguła ``parent_priority``,
-dotychczasowy mechanizm), potem alfabetycznie. Dzięki temu bez zapisanej
-kolejności wszystko działa jak dawniej, a pierwsze przesunięcie startuje od
-kolejności, którą użytkownik widzi. Porównanie nazw bez wielkości liter.
+wymienionymi, alfabetycznie. Pierwsze przesunięcie startuje od kolejności,
+którą użytkownik widzi. Porównanie nazw bez wielkości liter.
 """
 from __future__ import annotations
 
@@ -63,21 +61,17 @@ def save_order(dat_root, order: dict) -> Path:
     return p
 
 
-def sibling_index(order: dict, parent_key: str, name: str, is_parent=None):
-    """Klucz sortowania podkatalogu `name` wśród rodzeństwa.
-
-    Wymienione w kolejności: (pozycja,); pozostałe: za nimi, rodzice
-    (`is_parent(ścieżka)`) przed resztą, dalej alfabetycznie."""
+def sibling_index(order: dict, parent_key: str, name: str):
+    """Klucz sortowania podkatalogu `name` wśród rodzeństwa: wymienione w
+    kolejności, pozostałe za nimi alfabetycznie."""
     lst = order.get(_norm(parent_key), [])
     n = _norm(name)
     if n in lst:
-        return (lst.index(n), 0, "")
-    path = f"{parent_key}/{name}" if parent_key else name
-    flag = 0 if (is_parent is not None and is_parent(path)) else 1
-    return (len(lst), flag, n)
+        return (lst.index(n), "")
+    return (len(lst), n)
 
 
-def folder_rank(dat_path, dat_root, order: dict, is_parent=None) -> tuple:
+def folder_rank(dat_path, dat_root, order: dict) -> tuple:
     """Klucz sortowania DAT-a wg kolejności jego katalogów (od korzenia w dół).
 
     Dłuższa ścieżka nie przegrywa z krótszą tylko przez długość — porównanie
@@ -90,13 +84,12 @@ def folder_rank(dat_path, dat_root, order: dict, is_parent=None) -> tuple:
     out = []
     parent = ""
     for part in parts:
-        out.append(sibling_index(order, parent, part, is_parent))
+        out.append(sibling_index(order, parent, part))
         parent = f"{parent}/{part}" if parent else part
     return tuple(out)
 
 
-def move_folder(dat_root, folder_key: str, delta: int, siblings,
-                is_parent=None) -> bool:
+def move_folder(dat_root, folder_key: str, delta: int, siblings) -> bool:
     """Przesuwa katalog `folder_key` („ROMS" albo „ROMS/Sony") o `delta` pozycji
     wśród rodzeństwa. `siblings` = nazwy podkatalogów tego samego rodzica
     OBECNE w drzewie (do uzupełnienia listy). Zwraca True gdy coś się zmieniło.
@@ -113,7 +106,7 @@ def move_folder(dat_root, folder_key: str, delta: int, siblings,
     names = {_norm(s): s for s in siblings}
     names.setdefault(_norm(name), name)
     current = sorted(names, key=lambda n: sibling_index(
-        order, parent, names[n], is_parent))
+        order, parent, names[n]))
     i = current.index(_norm(name))
     j = i + int(delta)
     if not 0 <= j < len(current):
@@ -126,8 +119,8 @@ def move_folder(dat_root, folder_key: str, delta: int, siblings,
     return True
 
 
-def position_label(dat_root, folder_key: str, siblings, order: dict | None = None,
-                   is_parent=None) -> int:
+def position_label(dat_root, folder_key: str, siblings,
+                   order: dict | None = None) -> int:
     """Numer pozycji (od 1) katalogu wśród rodzeństwa — do etykiety w drzewie."""
     parts = [p for p in str(folder_key).replace("\\", "/").split("/") if p]
     if not parts:
@@ -137,5 +130,5 @@ def position_label(dat_root, folder_key: str, siblings, order: dict | None = Non
     names = {_norm(s): s for s in siblings}
     names.setdefault(_norm(parts[-1]), parts[-1])
     current = sorted(names, key=lambda n: sibling_index(
-        order, parent, names[n], is_parent))
+        order, parent, names[n]))
     return current.index(_norm(parts[-1])) + 1

@@ -38,7 +38,9 @@ class DatGame:
     name: str
     roms: List[DatRom] = field(default_factory=list)
     cloneof: str = ""    # MAME: nazwa gry-RODZICA (klon), np. darkseal1→darkseal
-    romof: str = ""      # MAME: skąd dziedziczy ROM-y (zwykle == cloneof)
+    romof: str = ""      # MAME: skąd dziedziczy ROM-y (zwykle == cloneof;
+                         # dla gry zależnej od BIOS-u wskazuje set BIOS, np. pgm)
+    isbios: bool = False # MAME: to set BIOS (isbios="yes"), np. pgm/neogeo/skns
 
     @property
     def media(self) -> MediaType:
@@ -213,7 +215,9 @@ def parse_dat(path: Path):
             # MAME: relacje rodzic/klon (świadomość merged/split/non-merged)
             yield DatGame(name=name, roms=roms,
                           cloneof=(elem.get("cloneof") or "").strip(),
-                          romof=(elem.get("romof") or "").strip())
+                          romof=(elem.get("romof") or "").strip(),
+                          isbios=(elem.get("isbios") or "").strip().lower()
+                          == "yes")
         elem.clear()  # zwolnij pamięć
 
 

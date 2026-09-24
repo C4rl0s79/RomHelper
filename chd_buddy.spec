@@ -4,6 +4,13 @@
 
 block_cipher = None
 
+# Wszystkie submoduły pakietu jawnie — `main.py` importuje UI LENIWIE (w funkcji),
+# więc analiza statyczna PyInstallera bywała gubiona przy zaśmieconym cache `build/`
+# (efekt: niekompletny exe „No module named chd_buddy.ui.suite_window"). Jawna
+# lista jest odporna na to niezależnie od stanu cache.
+from PyInstaller.utils.hooks import collect_submodules
+_hidden = collect_submodules("chd_buddy")
+
 a = Analysis(
     ["chd_buddy/main.py"],
     pathex=["."],
@@ -11,7 +18,7 @@ a = Analysis(
     datas=[
         # ("resources", "resources"),  # jeśli dodasz ikony/style
     ],
-    hiddenimports=[],
+    hiddenimports=_hidden,
     hookspath=[],
     excludes=["tkinter", "test", "unittest"],
     cipher=block_cipher,

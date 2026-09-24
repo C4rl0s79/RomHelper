@@ -223,8 +223,12 @@ class ProgressDialog(QDialog):
     def _cancel(self) -> None:
         self.cancel_event.set()
         self.btn_cancel.setEnabled(False)
-        self.lbl_op.setText(tr("Przerywam po bieżącej operacji… (postęp zapisany)"))
-        self.append_log(tr("== ŻĄDANIE PRZERWANIA — kończę bieżącą operację =="))
+        self.lbl_op.setText(tr("Przerywam: kończę bieżące gry, nie biorę nowych… "
+                               "(postęp zapisany)"))
+        self.append_log(tr("== ŻĄDANIE PRZERWANIA — dokańczam gry będące w "
+                           "trakcie, nie zaczynam nowych; po ich zakończeniu "
+                           "stop. Zrobione jest zapisane, wznowienie dokończy "
+                           "resztę. =="))
 
     def _tick(self) -> None:
         s = int(time.monotonic() - self._t0)

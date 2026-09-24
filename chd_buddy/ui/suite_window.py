@@ -82,6 +82,43 @@ def _pulse(log: Callable[[str], None], progress=None, total: int = 0,
     return cb
 
 
+def scan_paths(idx, paths, *, settings, full, prober, grand, log, progress,
+               detail, slot, cancel, cap_for=None, oversize_to=None,
+               base=None, skip=None) -> int:
+    """WSPÓLNY rdzeń skanu dla WSZYSTKICH przycisków skanujących (raport kolekcji,
+    „Wymuś pełny skan", skan indeksu). „Skan to skan": jedna ścieżka kodu →
+    zawsze te same własności — RÓWNOLEGŁE hashowanie wg nośnika (NAS/SSD wiele,
+    HDD 1), sloty postępu, size-cap per katalog (przez `cap_for`), oversize→ToSort.
+
+    `cap_for(path) -> int|None` zwraca limit rozmiaru NOWYCH plików surowych dla
+    danego katalogu (None = bez limitu). `base` [int] akumuluje licznik na wspólny
+    pasek (zerowany na wejściu — każde wywołanie liczy własne `grand`). Zwraca
+    łączną liczbę widzianych wpisów."""
+    from ..core.storage import storage_kind, workers_for_kind
+    if base is None:
+        base = [0]
+    base[0] = 0
+    seen_total = 0
+    for r in paths:
+        if cancel.is_set():
+            break
+        cap = cap_for(r) if cap_for is not None else None
+        kind = storage_kind(r, settings.storage_overrides)
+        wk = workers_for_kind(kind, settings.scan_workers_nas,
+                              settings.scan_workers_ssd, 1)
+        log(f"Skan: {r}  [{kind}, {wk} wątk.]"
+            + (f"  limit {cap / 2**20:.1f} MiB" if cap else ""))
+        st = idx.scan(Path(r), full=full, chd_prober=prober, max_size=cap,
+                      oversize_to=oversize_to, workers=wk,
+                      on_file=_pulse(log, progress, total=grand, base=base),
+                      detail=detail, slot_progress=slot, cancel=cancel,
+                      skip_dirs=skip)
+        base[0] += st.seen
+        seen_total += st.seen
+        log(f"  {st.summary()}")
+    return seen_total
+
+
 def _chd_prober(settings, log):
     """Prober SHA-1 zawartości CHD z nagłówka (chdman info) — tani, DVD."""
     from ..core.chdman import CHDMan, CHDManNotFound
@@ -415,9 +452,11 @@ class SuiteWindow(QMainWindow):
                 self._cancel_event.set()
             active = self.pool.activeThreadCount()
             if active:
+                # krótko (wątek GUI stoi w tym czasie) — resztę ucina twarde
+                # wyjście w main() po zamknięciu okna
                 self._log(f"Zamykanie: czekam na {active} zadań w tle "
-                          f"(do 10 s), by czysto zwolnić pliki…")
-                self.pool.waitForDone(10000)
+                          f"(do 3 s)…")
+                self.pool.waitForDone(3000)
                 still = self.pool.activeThreadCount()
                 if still:
                     self._log(f"UWAGA: {still} zadań wciąż działa — może to "
@@ -438,7 +477,7 @@ class SuiteWindow(QMainWindow):
         try:
             from ..core import ramdisk
             letter = (self.settings.ramdisk_letter or "R")[:1]
-            ramdisk.remove(letter=letter, log=self._log)
+            ramdisk.remove(letter=letter, log=self._log, attempts=2)
         except Exception:
             pass
         super().closeEvent(event)
@@ -447,7 +486,11 @@ class SuiteWindow(QMainWindow):
         if not ws:
             return
         if not Path(ws).is_dir():
-            self._log(f"Warsztat: katalog {ws} nie istnieje.")
+            self._log(f"Warsztat (pole „Warsztat (katalog główny)” na górze "
+                      f"okna): „{ws}” nie jest istniejącym katalogiem — "
+                      f"zignorowano. To pole wskazuje JEDEN katalog-matkę "
+                      f"(z podkatalogami Emulatory/roms/bios/dat/to sort); "
+                      f"zostaw puste, jeśli ścieżki ustawiasz osobno.")
             return
         for msg in self.settings.apply_workspace(ws):
             self._log(f"Warsztat — {msg}")
@@ -464,6 +507,108 @@ class SuiteWindow(QMainWindow):
 
     def _log(self, msg: str) -> None:
         self.log.appendPlainText(msg)
+        # KOPIA DO PLIKU: gdy trwa operacja z otwartym logiem (skan/rebuild/…),
+        # każda linia trafia też na dysk ze znacznikiem czasu. Awaria I/O nie
+        # może ubić GUI — logujemy tylko do widżetu.
+        fh = getattr(self, "_logf", None)
+        if fh is not None:
+            try:
+                from datetime import datetime
+                fh.write(f"{datetime.now():%H:%M:%S}  {msg}\n")
+                fh.flush()
+            except (OSError, ValueError):
+                pass
+
+    def _open_log_file(self, title: str) -> None:
+        """Otwiera NOWY, datowany plik logu dla operacji (osobny dla skanu i dla
+        rebuildu). Nazwa: <slug tytułu>_RRRR-MM-DD_GG-MM-SS.log w <baza>/logs.
+        Data w nazwie = moment ROZPOCZĘCIA. Błąd I/O = pracujemy bez pliku."""
+        self._close_log_file()
+        self._logf = None
+        self._logf_path = None
+        try:
+            import re as _re
+            from datetime import datetime
+            from ..core.settings import app_base_dir
+            slug = _re.sub(r"[^\w]+", "_", title.strip().lower()).strip("_") or "log"
+            d = app_base_dir() / "logs"
+            d.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now()
+            p = d / f"{slug}_{ts:%Y-%m-%d_%H-%M-%S}.log"
+            fh = open(p, "w", encoding="utf-8")
+            fh.write(f"# {title}\n# start: {ts:%Y-%m-%d %H:%M:%S}\n\n")
+            fh.flush()
+            self._logf = fh
+            self._logf_path = p
+        except OSError:
+            self._logf = None
+            self._logf_path = None
+
+    def _close_log_file(self) -> None:
+        fh = getattr(self, "_logf", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        self._logf = None
+
+    def _export_lists(self) -> None:
+        """Eksport gier z OSTATNIEGO raportu do trzech datowanych plików .txt
+        w <baza>/logs: have (komplet), do_naprawy, brak. Każda linia:
+        'DAT :: gra   [stan]   ścieżka'. Wymaga wcześniejszego skanu/raportu."""
+        reports = getattr(self, "_reports", None)
+        if not reports:
+            QMessageBox.information(
+                self, tr("Kombajn"),
+                tr("Najpierw uruchom „Skanuj i raportuj” albo „Znajdź naprawy”."))
+            return
+        from ..core.matcher import RomState
+        rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
+                RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+                RomState.CREATABLE: 2, RomState.HAVE: 1, RomState.HAVE_CHD: 1}
+        have: list[str] = []
+        tofix: list[str] = []
+        miss: list[str] = []
+        for rep in reports:
+            dat = rep.entry.name
+            worst: dict = {}
+            for s in rep.statuses:
+                cur = worst.get(s.game)
+                if cur is None or rank[s.state] > rank[cur.state]:
+                    worst[s.game] = s
+            for gname, s in sorted(worst.items()):
+                st = s.state
+                if st in (RomState.HAVE, RomState.HAVE_CHD):
+                    have.append(f"{dat} :: {gname}\t{s.source_path or s.canonical_path}")
+                elif st in (RomState.WRONG_NAME, RomState.ELSEWHERE,
+                            RomState.CREATABLE):
+                    where = s.source_path or "(konwersja ze źródła)"
+                    tofix.append(f"{dat} :: {gname}\t[{st.name}]\t"
+                                 f"{where} -> {s.canonical_path}")
+                else:
+                    miss.append(f"{dat} :: {gname}\t[{st.name}]")
+        try:
+            from datetime import datetime
+            from ..core.settings import app_base_dir
+            d = app_base_dir() / "logs"
+            d.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            paths = []
+            for name, rows in (("have", have), ("do_naprawy", tofix),
+                               ("brak", miss)):
+                p = d / f"{name}_{ts}.txt"
+                p.write_text(f"# {name}: {len(rows)} gier ({ts})\n\n"
+                             + "\n".join(rows) + "\n", encoding="utf-8")
+                paths.append(p)
+            self._log(f"Eksport list: HAVE={len(have)}, do naprawy={len(tofix)}, "
+                      f"brak={len(miss)} → {d}")
+            QMessageBox.information(
+                self, tr("Kombajn"),
+                tr("Zapisano listy:") + "\n" + "\n".join(str(p) for p in paths))
+        except OSError as e:
+            self._log(f"BŁĄD eksportu list: {e}")
+            QMessageBox.warning(self, tr("Kombajn"), str(e))
 
     def _save_setting(self, name: str, value: object) -> None:
         setattr(self.settings, name, value)
@@ -511,6 +656,10 @@ class SuiteWindow(QMainWindow):
         self.progress.setFormat(tr("pracuję…"))
         cancel = threading.Event()
         self._cancel_event = cancel
+        # ZAPIS LOGU DO PLIKU: osobny, datowany plik per operacja (skan vs
+        # rebuild rozróżnia tytuł). Otwieramy tylko dla operacji nazwanych.
+        if title:
+            self._open_log_file(title)
         dlg = None
         if title:
             from .progress_dialog import ProgressDialog
@@ -548,10 +697,17 @@ class SuiteWindow(QMainWindow):
                 dlg.finish(err)
             if err:
                 self._log(f"BŁĄD: {err}")
+            elif cancel.is_set():
+                self._log("Operacja PRZERWANA — postęp zapisany, można wznowić.")
+            # DOMKNIJ PLIK LOGU (po zapisaniu ostatnich linii: błąd/przerwanie)
+            _lp = getattr(self, "_logf_path", None)
+            if _lp is not None:
+                self._log(f"Log zapisany: {_lp}")
+                self._close_log_file()
+                self._logf_path = None
+            if err:
                 QMessageBox.warning(self, tr("Kombajn"), tr("Operacja nie powiodła się:") + f"\n{err}")
                 return
-            if cancel.is_set():
-                self._log("Operacja PRZERWANA — postęp zapisany, można wznowić.")
             on_done(result)
 
         worker.signals.log.connect(self._log)
@@ -649,6 +805,14 @@ class SuiteWindow(QMainWindow):
         form = QFormLayout(dlg)
         chk_en = QCheckBox(tr("Używaj RAM dysku (ImDisk) do wypakowania/przepakowania"))
         chk_en.setChecked(bool(self.settings.ramdisk_enabled))
+        chk_admin = QCheckBox(tr(
+            "Uruchamiaj CAŁY program jako administrator (UAC przy starcie)"))
+        chk_admin.setChecked(bool(getattr(self.settings, "auto_elevate", True)))
+        chk_admin.setToolTip(tr(
+            "Potrzebne do SYMLINKÓW, gdy tryb dewelopera Windows jest wyłączony "
+            "(ten sam przełącznik co „uruchamiaj jako administrator (auto)” w "
+            "pasku). Bez admina RAM dysk tworzony jest osobnym promptem UAC. "
+            "Zmiana działa po restarcie programu."))
         sp_size = QSpinBox()
         sp_size.setRange(2, 512)
         sp_size.setSuffix(" GB")
@@ -674,6 +838,7 @@ class SuiteWindow(QMainWindow):
             "po restarcie programu.")
         note.setWordWrap(True)
         form.addRow(chk_en)
+        form.addRow(chk_admin)
         form.addRow(tr("Rozmiar:"), sp_size)
         form.addRow(tr("Litera dysku:"), e_letter)
         form.addRow(e_scratch)
@@ -685,6 +850,7 @@ class SuiteWindow(QMainWindow):
         form.addRow(bb)
         if dlg.exec():
             self.settings.ramdisk_enabled = chk_en.isChecked()
+            self.settings.auto_elevate = chk_admin.isChecked()
             self.settings.ramdisk_size_gb = int(sp_size.value())
             self.settings.ramdisk_letter = (e_letter.text().strip() or "R")[:1].upper()
             self.settings.scratch_dir = e_scratch.path
@@ -898,11 +1064,17 @@ class SuiteWindow(QMainWindow):
             "mogą zostać w zipach). Stary plik podmieniany dopiero po "
             "pełnej weryfikacji (createcd + round-trip).")
         self.btn_cue_rebuild.clicked.connect(self._rebuild_chds_cue)
+        self.btn_export = QPushButton(tr("📄 Eksport list…"))
+        self.btn_export.setToolTip(tr(
+            "Zapisuje trzy pliki (have / do_naprawy / brak) z ostatniego "
+            "skanu/raportu do podkatalogu logs — do przejrzenia poza programem."))
+        self.btn_export.clicked.connect(self._export_lists)
         for b in (self.btn_load_dats, self.btn_report, self.btn_find,
                   self.btn_fix):
             btns.addWidget(b)
         btns.addWidget(self.btn_cue_rebuild)
         btns.addWidget(self.btn_force_scan)
+        btns.addWidget(self.btn_export)
         btns.addWidget(QLabel(tr("naprawa:")))
         btns.addWidget(self.cmb_fix)
         btns.addWidget(self.chk_clean)
@@ -944,9 +1116,11 @@ class SuiteWindow(QMainWindow):
         self.chk_admin_auto = QCheckBox(tr("uruchamiaj jako administrator (auto)"))
         self.chk_admin_auto.setChecked(bool(self.settings.auto_elevate))
         self.chk_admin_auto.setToolTip(tr(
-            "Przy każdym starcie program prosi o podniesienie uprawnień (UAC), "
-            "aby móc tworzyć symlinki bez trybu dewelopera. Odmowa UAC = "
-            "program działa dalej bez admina. Zmiana od następnego startu."))
+            "Przy każdym starcie program prosi o podniesienie uprawnień (UAC) — "
+            "potrzebne do tworzenia SYMLINKÓW, gdy tryb dewelopera Windows jest "
+            "wyłączony. Odmowa UAC = program działa bez admina (symlinki nie "
+            "powstaną; RAM dysk utworzy się osobnym promptem UAC). Zmiana od "
+            "następnego startu."))
         self.chk_admin_auto.toggled.connect(
             lambda on: self._save_setting("auto_elevate", on))
         srow.addWidget(self.chk_links)
@@ -1098,20 +1272,14 @@ class SuiteWindow(QMainWindow):
     @staticmethod
     def _display_order(items, dat_root: Path, key):
         """Kolejność WYŚWIETLANIA katalogów = ich PRIORYTET (_kolejnosc.json):
-        katalog wyżej ma pierwszeństwo nad niższymi. Bez zapisanej kolejności
-        katalogi-rodzice (parent_priority) stoją na górze, reszta alfabetycznie
+        katalog wyżej ma pierwszeństwo nad niższymi, niewymienione alfabetycznie
         — dokładnie tak, jak są przetwarzane. W katalogu DAT-y alfabetycznie."""
-        from ..core.dirrules import DirRules
         from ..core.folder_order import folder_rank, load_order
         order = load_order(dat_root)
-        rules = DirRules(dat_root) if Path(dat_root).is_dir() else None
-
-        def is_parent(path: str) -> bool:
-            return bool(rules and rules.for_key(path).get("parent_priority"))
 
         def sort_key(x):
             entry = key(x)
-            return (folder_rank(entry.dat_path, dat_root, order, is_parent),
+            return (folder_rank(entry.dat_path, dat_root, order),
                     entry.name.lower())
         return sorted(items, key=sort_key)
 
@@ -1581,7 +1749,8 @@ class SuiteWindow(QMainWindow):
         # STARE pliki tej gry w docelowym (z ostatniego raportu — HAVE/WRONG)
         old_files: list = []
         st_map = (self._rom_statuses_for(entry) or {}).get(game.name, {})
-        tprefix = os.path.normcase(str(entry.target_dir)).rstrip("\\/") + os.sep
+        from ..core.paths import dir_prefix
+        tprefix = dir_prefix(entry.target_dir)
         for s in st_map.values():
             sp = getattr(s, "source_path", "") or ""
             if sp and os.path.normcase(sp).startswith(tprefix) and Path(sp).is_file():
@@ -1690,13 +1859,20 @@ class SuiteWindow(QMainWindow):
             return
         roms = self.row_roms.path or dats
 
-        def job(log: Callable[[str], None], progress):
+        def job(log: Callable[[str], None], progress, cancel):
             from ..core.datstore import DatStore
             from ..core.dirrules import DirRules, apply_rule_targets
+            # cancel wpięty → zamknięcie programu przerywa wczytywanie z NAS
+            # (inaczej proces wisiał do końca parsowania — minuty).
             entries = DatStore(dats, roms).discover(
-                log=log, on_progress=lambda i, n, t:
+                log=log, cancel=cancel, on_progress=lambda i, n, t:
                     progress(i, n, f"wczytuję DAT: {t}"))
+            if cancel.is_set():
+                return entries
             rules = DirRules(dats)
+            from ..core.dirrules import pop_notices
+            for _m in pop_notices():
+                log(_m)
             # skip NIE usuwa DAT-a z drzewa — zostaje SZARY z odznaczonym
             # checkboxem (inaczej nie da się go z powrotem włączyć!);
             # ze skanowania wyklucza go dopiero raport.
@@ -1705,17 +1881,31 @@ class SuiteWindow(QMainWindow):
             log(f"Wczytano {len(entries)} DAT-ów"
                 + (f" (wyłączonych skip: {len(skipped)} — szare, "
                    f"zaznacz checkbox by włączyć)" if skipped else ""))
-            return entries
+            # stany ostatniego skanu wczytujemy TU (wątek tła), nie w GUI —
+            # 1,8 mln wpisów to kilka sekund, które zamrażały okno po starcie
+            from ..core.datcache import load_report_states
+            log("Wczytuję wynik ostatniego skanu…")
+            saved = load_report_states(known_keys={
+                str(Path(os.path.abspath(e.dat_path))) for e in entries})
+            return entries, saved
 
         self._run(job, self._fill_dats_loaded)
 
-    def _fill_dats_loaded(self, entries) -> None:
+    def _fill_dats_loaded(self, result) -> None:
         """Wczytanie bez skanu: lewy panel DAT-ów; kliknij DAT → gry → pliki.
-        Jeśli jest zapamiętany raport — pokaż ostatni znany stan (kolory)."""
+        Jeśli jest zapamiętany raport — pokaż ostatni znany stan (kolory).
+        `result` = (entries, (saved_at, states)) z wątku tła; lista entries
+        (np. przerwane wczytywanie) → stany doczytujemy tu (bez NAS)."""
+        if isinstance(result, tuple):
+            entries, (self._saved_at, self._saved_states) = result
+        else:
+            entries = result or []
+            from ..core.datcache import load_report_states
+            # klucze z PAMIĘCI (bez isfile na NAS — to było ~45 s zamrożenia)
+            self._saved_at, self._saved_states = load_report_states(
+                known_keys={self._dat_key(e) for e in entries})
         self._reports_by_id = {}
         self._entries = entries
-        from ..core.datcache import load_report_states
-        self._saved_at, self._saved_states = load_report_states()
         has_saved = bool(self._saved_states)
         self._fill_dats(entries, with_stats=has_saved)
         extra = (f" Pokazuję ostatni skan z {self._saved_at} — Skanuj i "
@@ -1802,8 +1992,6 @@ class SuiteWindow(QMainWindow):
             a_folder = menu.addAction(tr("⚙ Ustawienia katalogu") + f" {data} "
                                       + tr("(wszystkie DAT-y)…"))
             a_folder.triggered.connect(lambda: self._folder_settings(data))
-            a_parent = menu.addAction(tr("⭐ Wszystkie DAT-y tu = rodzice platform"))
-            a_parent.triggered.connect(lambda: self._folder_all_parents(data))
             menu.addSeparator()
             a_up = menu.addAction(tr("⬆ Wyżej — wyższy priorytet (Ctrl+↑)"))
             a_up.triggered.connect(lambda: self._move_folder(data, -1))
@@ -1859,11 +2047,9 @@ class SuiteWindow(QMainWindow):
             if (len(rel) > len(parent)
                     and [p.lower() for p in rel[:len(parent)]] == parent):
                 siblings.setdefault(rel[len(parent)].lower(), rel[len(parent)])
-        rules = DirRules(dat_root)
         try:
             changed = move_folder(
-                dat_root, folder_key, delta, list(siblings.values()),
-                is_parent=lambda p: bool(rules.for_key(p).get("parent_priority")))
+                dat_root, folder_key, delta, list(siblings.values()))
         except OSError as e:
             self._log(f"BŁĄD zapisu kolejności: {e}")
             return
@@ -1910,17 +2096,6 @@ class SuiteWindow(QMainWindow):
         if dlg.exec():
             self._log(f"Ustawienia katalogu {folder_key} zapisane "
                       f"(_reguly.json). Skanuj i raportuj, by zastosować.")
-
-    def _folder_all_parents(self, folder_key: str) -> None:
-        from ..core.dirrules import save_rule
-        try:
-            save_rule(Path(self.row_dats.path), folder_key,
-                      {"parent_priority": True})
-        except OSError as e:
-            self._log(f"BŁĄD zapisu: {e}")
-            return
-        self._log(f"Katalog {folder_key}: wszystkie DAT-y = rodzice swoich "
-                  f"platform. Skanuj i raportuj, by zastosować.")
 
     def _dat_settings_for(self, entry) -> None:
         from .dat_settings_dialog import DatSettingsDialog
@@ -1980,7 +2155,7 @@ class SuiteWindow(QMainWindow):
         db = self.settings.index_db_path or None
         settings = self.settings
 
-        def job(log: Callable[[str], None], progress, cancel, detail):
+        def job(log: Callable[[str], None], progress, cancel, detail, slot):
             from ..core.chdman import CHDMan, CHDManNotFound
             from ..core.chdrebuild import rebuild_bad_chds
             from ..core.cuelib import CueLibrary
@@ -2002,11 +2177,16 @@ class SuiteWindow(QMainWindow):
                 return rebuild_bad_chds(entries, lib, chd, settings, idx,
                                         extra_roots=extra, log=log,
                                         on_progress=progress, detail=detail,
-                                        cancel=cancel)
+                                        cancel=cancel, slot=slot)
 
         def done(st) -> None:
             if st is not None:
                 self._log(f"[ODBUDOWA CHD] {st.summary()}")
+                if getattr(st, "rebuilt", 0):
+                    self._log("[ODBUDOWA CHD] Indeks zaktualizowany (kontenery "
+                              "DVD, bad_container=0). Uruchom Skanuj/dopasuj, aby "
+                              "odswiezyc liczby 'do naprawy' - biezacy raport "
+                              "jest sprzed odbudowy.")
 
         self._run(job, done, title=tr("Odbudowa CHD wg cue"))
 
@@ -2037,18 +2217,24 @@ class SuiteWindow(QMainWindow):
         db = self.settings.index_db_path or None
         settings = self.settings
 
-        def job(log: Callable[[str], None], progress, cancel, detail):
+        def job(log: Callable[[str], None], progress, cancel, detail, slot):
             from ..core.fileindex import FileIndex, count_files
             with FileIndex(Path(db) if db else None) as idx:
                 prober = _chd_prober(settings, log)
                 progress(0, 0, tr("liczenie plików…"))
                 grand = count_files(Path(d), cancel=cancel)
                 log(f"Do przeliczenia: {grand} plików")
-                st = idx.scan(Path(d), full=True, chd_prober=prober,
-                              on_file=_pulse(log, progress, total=grand),
-                              detail=detail, cancel=cancel)
-                log(f"PEŁNY skan {d}: {st.summary()}")
-                return st.summary()
+                # „skan to skan" — ten sam wspólny rdzeń co raport kolekcji:
+                # równoległe hashowanie wg nośnika, sloty. full=True (przelicz
+                # WSZYSTKO), bez size-capa (wymuszamy pełne czytanie).
+                scan_paths(idx, [d], settings=settings, full=True, prober=prober,
+                           grand=grand or 1, log=log, progress=progress,
+                           detail=detail, slot=slot, cancel=cancel)
+                st = idx.stats()
+                summary = (f"wpisów {st['total']}, linki {st['links']}, "
+                           f"brakujące {st['missing']}")
+                log(f"PEŁNY skan {d}: {summary}")
+                return summary
 
         self._run(job, lambda s: self._log(f"[PEŁNY SKAN] {s}"),
                   title=f"Pełny skan: {d}")
@@ -2223,7 +2409,8 @@ class SuiteWindow(QMainWindow):
                 prober = (_chd_prober(settings, log)
                           if chd_mode in ("header", "deep") else None)
                 progress(0, 0, "wczytywanie DAT-ów…")
-                all_entries = DatStore(dats, roms).discover(log=log)
+                all_entries = DatStore(dats, roms).discover(log=log,
+                                                            cancel=cancel)
                 from ..core.dirrules import DirRules, apply_rule_targets
                 rules = DirRules(dats)
                 apply_rule_targets(all_entries, rules, roms, log=log)
@@ -2242,9 +2429,27 @@ class SuiteWindow(QMainWindow):
                 # PS1/PS2) nie są ruszane. Dopasowanie i tak jest po TREŚCI, a
                 # pozostałe platformy mają raport z indeksu (trwały) — skanujemy
                 # je, gdy je włączysz.
-                from ..core.dirrules import platform_scan_roots
+                from ..core.dirrules import platform_scan_roots, stray_dirs
                 from ..core.datstore import effective_platform_key
+                # Te fazy robią sprawdzenia katalogów na NAS (is_dir/scandir per
+                # DAT) — na SMB to setki cichych rund. Logujemy, żeby nie
+                # wyglądało na zawieszenie („nic nie widać w log").
+                log("Ustalam katalogi platform do skanu (sprawdzam na NAS)…")
+                progress(0, 0, tr("ustalam katalogi platform…"))
                 roots = platform_scan_roots(enabled, rules, roms, tosorts)
+                # FOLDERY-SIEROTY (np. stary output `commodore64` gdy DAT celuje w
+                # `c64`): SKANUJEMY ich treść, żeby DAT ją dopasował po sumach, a
+                # naprawa przeniosła pliki do skonfigurowanego targetu (folder
+                # output DAT-u jest edytowalny). Sieroty liczymy z WSZYSTKICH DAT-ów
+                # (też wyłączonych), by nie wciągać folderu tylko odznaczonej
+                # platformy. Skan z limitem globalnym (mogą trzymać cokolwiek).
+                log("Szukam folderów-sierot pod rom_root (skan NAS)…")
+                progress(0, 0, tr("szukam folderów-sierot…"))
+                _seen_roots = {os.path.normcase(r) for r in roots}
+                for _sd in stray_dirs(all_entries, rules, roms):
+                    if os.path.normcase(_sd) not in _seen_roots:
+                        roots.append(_sd)
+                        _seen_roots.add(os.path.normcase(_sd))
                 from ..core.fileindex import count_files
 
                 def _count(paths, skip_nc=None) -> int:
@@ -2269,7 +2474,9 @@ class SuiteWindow(QMainWindow):
                 # zostają). Wymaga wczytania DAT-ów; i tak są potrzebne do
                 # dopasowania (cache w e).
                 from ..core.dirrules import platform_scan_dirs as _psd
-                progress(0, 0, tr("analiza rozmiarów DAT-ów…"))
+                log(f"Analizuję rozmiary i katalogi {len(enabled)} DAT-ów "
+                    f"(limity per katalog; sprawdzenia na NAS)…")
+                progress(0, len(enabled), tr("analiza rozmiarów DAT-ów…"))
 
                 def _entry_max(e) -> int:
                     m = 0
@@ -2281,7 +2488,12 @@ class SuiteWindow(QMainWindow):
 
                 root_caps: dict[str, int] = {}
                 global_max = 0
-                for e in enabled:
+                for _i, e in enumerate(enabled):
+                    if cancel.is_set():
+                        break
+                    if _i % 25 == 0:
+                        progress(_i, len(enabled),
+                                 f"analiza DAT-ów {_i}/{len(enabled)}")
                     try:
                         e.load()
                     except Exception:
@@ -2311,32 +2523,21 @@ class SuiteWindow(QMainWindow):
                 # inny wolumin → zostają (kopiowanie byłoby wolne). Decyduje scan().
                 _primary_tosort = settings.tosort_dir or None
 
+                def _cap_for(r):
+                    # size-cap per katalog: platformowy limit, ToSort bez limitu,
+                    # reszta = limit globalny. `base` reset i licznik → scan_paths.
+                    k = os.path.normcase(str(Path(r)))
+                    return None if k in tosort_nc else root_caps.get(k, global_cap)
+
                 def _scan_list(paths, grand, skip=None) -> None:
-                    # licznik paska liczony jest WZGLĘDEM `grand` tego wywołania
-                    # (Faza 1 = wybrana platforma, Faza 2 = reszta) — a `grand`
-                    # dla każdej fazy jest OSOBNY. Dlatego zerujemy akumulator na
-                    # wejściu: bez tego numerator z Fazy 2 startował od liczby
-                    # plików Fazy 1 i przebijał mianownik (np. 128159/90143).
-                    base[0] = 0
-                    for r in paths:
-                        if cancel.is_set():
-                            break
-                        k = os.path.normcase(str(Path(r)))
-                        cap = None if k in tosort_nc else root_caps.get(k, global_cap)
-                        kind = storage_kind(r, _ov)
-                        wk = workers_for_kind(kind, settings.scan_workers_nas,
-                                              settings.scan_workers_ssd, 1)
-                        log(f"Skan: {r}  [{kind}, {wk} wątk.]"
-                            + (f"  limit {cap / 2**20:.1f} MiB" if cap else ""))
-                        st = idx.scan(Path(r), full=full, chd_prober=prober,
-                                      max_size=cap, oversize_to=_primary_tosort,
-                                      workers=wk,
-                                      on_file=_pulse(log, progress, total=grand,
-                                                     base=base),
-                                      detail=detail, slot_progress=slot,
-                                      cancel=cancel, skip_dirs=skip)
-                        base[0] += st.seen
-                        log(f"  {st.summary()}")
+                    # „skan to skan" — jeden wspólny rdzeń (scan_paths). `grand`
+                    # jest OSOBNY per faza; base zerowany w scan_paths (bez tego
+                    # numerator Fazy 2 startował od liczby plików Fazy 1).
+                    scan_paths(idx, paths, settings=settings, full=full,
+                               prober=prober, grand=grand, log=log,
+                               progress=progress, detail=detail, slot=slot,
+                               cancel=cancel, cap_for=_cap_for,
+                               oversize_to=_primary_tosort, base=base, skip=skip)
 
                 # PODMIANY na tłumaczenia (translations.json) = źródło prawdy:
                 # gry z zapisanym wyborem są SPEŁNIONE tłumaczeniem (nie „brak").
@@ -2453,66 +2654,49 @@ class SuiteWindow(QMainWindow):
                     # (na NAS 100k+ lexists w ciszy potrafiło „zawiesić" skan).
                     idx.prune_ghosts(log, skip_roots=roots)
                     if not cancel.is_set():
-                        # Przy ZAZNACZONEJ platformie identyfikacja CHD dotyczy
-                        # tylko jej DAT-ów. Faza 2 doskanowuje resztę, bo pliki
-                        # zaznaczonej platformy mogą leżeć gdzie indziej — ale
-                        # ekstrakcja CHD innych (tylko włączonych) platform to
-                        # nie jest to, o co prosi zaznaczenie: z zaznaczoną pulą
-                        # [T-En] (nigdy „kompletną") mieliło CHD PS1/PS2.
-                        _deep_probe_gui(idx, sel_entries or enabled, settings,
+                        # Faza 2 sonduje CHD pod PEŁNYM zestawem włączonych DAT-ów
+                        # (NIE tylko zaznaczonej platformy). To KLUCZOWE: identyfikacja
+                        # pomija pliki, których `data_sha1` jest już w DAT (linia
+                        # „data_sha1 in known") — więc gotowe CHD innych platform (np.
+                        # 3DO zrobione wcześniej) są POMIJANE, bez ekstrakcji. Gdy
+                        # zawężaliśmy do `sel_entries`, ich odcisk NIE był w wąskim
+                        # `known` → sondowane przeciw obcemu DAT-owi → „brak
+                        # dopasowania" i fałszywy `deep_fail` (regresja: zaznaczasz
+                        # PS2, a 3DO/SAT/PSX lecą w ekstrakcję i są znaczone jako
+                        # nierozpoznane). Pełny `enabled` naprawia to i przy okazji
+                        # usuwa dawne mielenie [T-En]→PS1/PS2 (też skutek zawężenia).
+                        _deep_probe_gui(idx, enabled, settings,
                                         chd_mode, roots,
                                         log, cancel=cancel, on_progress=progress,
                                         detail=detail, slot=slot)
                 log(f"DAT-ów: {len(enabled)} włączonych z {len(all_entries)}")
-                # PRZERWANY SKAN: dopasowanie z cache jest SZYBKIE (sekundy), więc
-                # i tak je wykonujemy — użytkownik od razu widzi, co już zebrano
-                # (inaczej przerwanie dawało pusty raport). Czyścimy flagę, by
-                # pętla dopasowania nie ubiła się na pierwszym DAT-cie; ponowne
-                # przerwanie w trakcie dopasowania nadal działa.
-                interrupted = cancel.is_set()
-                if interrupted:
-                    log("⏹ PRZERWANO SKAN — dopasowuję to, co już zebrano "
-                        "(z cache; dla wielkiej kolekcji do ~30 s). Możesz "
-                        "przerwać ponownie, by pominąć i to.")
-                    try:
-                        cancel.clear()
-                    except Exception:
-                        pass
-                # DOPASOWANIE Z CACHE W PAMIĘCI: wczytujemy indeks raz do RAM
-                # (słowniki po sumach) — inaczej matching całej kolekcji to
-                # dziesiątki tysięcy SELECT-ów (minuty). Z cache: sekundy.
+                # PRZERWANIE = STOP. Dawniej po przerwaniu skanu czyściliśmy flagę
+                # i MIMO TO odpalaliśmy pełne dopasowanie po WSZYSTKICH DAT-ach
+                # (z trwałego indeksu) — a to potrafiło mielić minuty w czystym
+                # Pythonie NAWET gdy nic nie przeskanowano (użytkownik: „nie ma
+                # czego dopasowywać"), i blokowało zamknięcie programu. Teraz
+                # przerwanie kończy pracę od razu; poprzedni wynik zostaje, a
+                # odświeżenie dopasowania z indeksu (bez skanu plików) robi
+                # szybki przycisk „Znajdź naprawy".
+                if cancel.is_set():
+                    log("⏹ PRZERWANO — zatrzymuję (nie przeliczam dopasowania po "
+                        "wszystkich DAT-ach). Poprzedni wynik zostaje; „Znajdź "
+                        "naprawy” odświeży dopasowanie z indeksu, gdy zechcesz.")
+                    return all_entries, None
+                # SKAN DOKOŃCZONY → dopasowanie z indeksu (RAM-cache po sumach —
+                # inaczej matching całej kolekcji to dziesiątki tysięcy SELECT-ów).
                 if not cache_ready:
                     progress(0, 0, tr("wczytywanie indeksu do pamięci…"))
-                    idx.build_match_cache()
-                # etykieta fazy — jasno, że to dopasowanie PO przerwaniu skanu
-                _mlabel = ("⏹ przerwano — dopasowuję zebrane"
-                           if interrupted else "dopasowanie")
-                progress(0, len(enabled), _mlabel)      # pasek widoczny od razu
-                reports = []
-                for i, e in enumerate(enabled):
-                    if cancel.is_set():
-                        log(f"PRZERWANO dopasowanie na {i}/{len(enabled)} "
-                            f"DAT-ów — wyniki cząstkowe zachowane.")
-                        break
-                    progress(i, len(enabled), f"{_mlabel}: {e.name}")
-                    # dopasowanie per gra z PODPOSTĘPEM (pasek szczegółowy) —
-                    # wielkie DAT-y (PS2/PSX/MSU-1) grinduje tysiące gier, bez
-                    # tego pasek „stał" na jednym % i wyglądał na zawieszony.
-                    e.load()
-                    games = e.games
-                    ng = len(games) or 1
-                    if ng > 300:
-                        log(f"  dopasowanie: {e.name} — {ng} gier…")
-                    rep = DatReport(e)
-                    for gi, g in enumerate(games):
-                        if cancel.is_set():
-                            break
-                        if gi % 300 == 0:
-                            detail(gi, ng, f"{e.name}: gra {gi}/{ng}")
-                        rep.statuses.extend(match_game(e, g, idx, _tsub))
-                    detail(ng, ng, f"{e.name}: {ng}/{ng}")
-                    reports.append(rep)
-                idx.drop_match_cache()
+                from ..core.matcher import match_reports
+                progress(0, len(enabled), "dopasowanie")
+                reports = match_reports(
+                    enabled, idx, subs=_tsub, log=log,
+                    on_progress=lambda i, n, t: progress(i, n, t),
+                    detail=detail, cancel=cancel, label="dopasowanie",
+                    build_cache=not cache_ready, drop_cache=True)
+                if cancel.is_set():        # przerwano W TRAKCIE dopasowania → stop
+                    log("⏹ PRZERWANO dopasowanie — poprzedni wynik zostaje.")
+                    return all_entries, None
                 progress(len(reports), len(enabled), "dopasowanie")
                 return all_entries, reports
 
@@ -2522,8 +2706,24 @@ class SuiteWindow(QMainWindow):
         """Wypełnia lewy panel DAT-ami ZE STATYSTYKAMI. Wyłączone DAT-y są
         widoczne (bez statystyk), włączone — z liczbami komplet/naprawa/brak."""
         all_entries, reports = result
-        self._reports_by_id = {id(r.entry): r for r in reports}
         self._entries = all_entries
+        # PRZERWANY SKAN (reports is None): NIE nadpisujemy wyniku. Odświeżamy
+        # tylko drzewo DAT-ów (mogły się zmienić) z kolorami z OSTATNIEGO
+        # zapisanego skanu; poprzedni przepis w pamięci zostaje. „Znajdź naprawy"
+        # przeliczy dopasowanie z indeksu, gdy użytkownik zechce.
+        if reports is None:
+            # stany z ostatniego skanu są JUŻ w pamięci (wczytane przy starcie) —
+            # nie przeładowujemy (ponowny odczyt = zbędna praca na wątku GUI).
+            if not self._saved_states:
+                from ..core.datcache import load_report_states
+                self._saved_at, self._saved_states = load_report_states(
+                    known_keys={self._dat_key(e) for e in all_entries})
+            self._fill_dats(all_entries, with_stats=bool(self._reports_by_id
+                                                         or self._saved_states))
+            self._log("Skan przerwany — zachowano poprzedni wynik. „Znajdź "
+                      "naprawy” odświeży dopasowanie z indeksu (bez skanu plików).")
+            return
+        self._reports_by_id = {id(r.entry): r for r in reports}
         # PRZEPIS dla naprawy: pełne raporty zostają w pamięci, więc „Napraw"
         # NIE skanuje niczego ponownie — parsuje tylko to, co tu policzone.
         self._reports = reports
@@ -2551,7 +2751,8 @@ class SuiteWindow(QMainWindow):
         try:
             from ..core.datcache import load_report_states, save_report_states
             save_report_states(reports)
-            self._saved_at, self._saved_states = load_report_states()
+            self._saved_at, self._saved_states = load_report_states(
+                known_keys={self._dat_key(e) for e in all_entries})
         except Exception as e:      # zapis cache nie może ubić raportu
             self._saved_states = {}
             self._log(f"UWAGA: nie zapisano cache raportu: {e}")
@@ -2699,15 +2900,12 @@ class SuiteWindow(QMainWindow):
             QMessageBox.warning(self, tr("Kombajn"),
                                 tr("Sprzątanie nieznanych wymaga katalogu ToSort."))
             return
-        # C: naprawa NIE skanuje — parsuje PRZEPIS z ostatniego skanu.
-        reports = self._reports
-        if not reports:
-            QMessageBox.information(
-                self, tr("Brak przepisu"),
-                tr("Najpierw uruchom: Skanuj i raportuj. Naprawa korzysta z "
-                "wyników tego skanu (co gdzie leży, jakie ma sumy) i sama "
-                "niczego nie skanuje."))
-            return
+        # Naprawa NIE skanuje plików — odtwarza PRZEPIS z INDEKSU (dopasowanie
+        # w locie, sekundy). Dzięki temu: (1) po restarcie wystarczy kliknąć
+        # Napraw (indeks jest trwały), (2) ponowne dopasowanie widzi to, co już
+        # naprawiono (indeks zapisywany per operacja) → WZNAWIA od miejsca, gdzie
+        # stanęło, (3) łapie zmieniony DAT. Skan plików potrzebny tylko gdy
+        # zmieniły się PLIKI (osobny przycisk). Przepis budujemy w wątku (ma idx).
         entries = self._entries or []
         # Nieistniejące katalogi bazowe: literówka ALBO celowo wyczyszczony
         # układ (user przenosi wszystko do ToSort i każe programowi odtworzyć
@@ -2758,15 +2956,24 @@ class SuiteWindow(QMainWindow):
                 rules = DirRules(dats)
                 if rules.error:
                     log(f"UWAGA: {rules.error}")
+                # DAT-y: z pamięci (jeśli wczytane), inaczej odkryj TERAZ (cache
+                # per DAT → sekundy). Pozwala kliknąć Napraw od razu po starcie.
+                _ents = entries
+                if not _ents:
+                    from ..core.datstore import DatStore
+                    from ..core.dirrules import apply_rule_targets
+                    progress(0, 0, tr("wczytywanie DAT-ów…"))
+                    _ents = DatStore(dats, roms).discover(log=log, cancel=cancel)
+                    apply_rule_targets(_ents, rules, roms, log=log)
                 # BEZPIECZNIK: nieistniejący rom_root => naprawa przeniosłaby
                 # całą kolekcję. Przerywamy PRZED dotknięciem plików.
-                bad = missing_roots(entries, rules, roms)
+                bad = missing_roots(_ents, rules, roms)
                 if bad:
                     log("PRZERWANO — nieistniejące katalogi bazowe (rom_root):")
                     for name, path in bad:
                         log(f"   {path}   (reguła dla: {name})")
                     return None
-                sroots = scan_roots(entries, rules, roms, tosorts)
+                sroots = scan_roots(_ents, rules, roms, tosorts)
                 if not dry:
                     from ..core.convert import purge_temp_artifacts
                     from ..core.linker import remove_broken_links
@@ -2798,8 +3005,25 @@ class SuiteWindow(QMainWindow):
                                               cancel=cancel)
                     if n_b:
                         log(f"Usunięto {n_b} zerwanych symlinków.")
+                # PRZEPIS Z INDEKSU (bez skanu plików): dopasowanie w locie.
+                # Włączone DAT-y (skip=false); wynik odzwierciedla stan indeksu,
+                # więc gry już naprawione (HAVE) wypadają → WZNAWIANIE.
+                _enabled = [e for e in _ents if not rules.for_entry(e)["skip"]]
+                try:
+                    from ..core.translations import TranslationStore
+                    _tsub = TranslationStore(
+                        Path(settings.rom_root) / TranslationStore.FILENAME).subs
+                except Exception:
+                    _tsub = {}
+                from ..core.matcher import match_reports
+                progress(0, 0, tr("dopasowanie z indeksu…"))
+                reports = match_reports(
+                    _enabled, idx, subs=_tsub, log=log,
+                    on_progress=lambda i, n, t: progress(i, n, t),
+                    detail=detail, cancel=cancel, label=tr("dopasowanie"))
                 log(f"{'PODGLĄD' if dry else 'NAPRAWA'} z przepisu: "
-                    f"{len(reports)} DAT-ów (bez ponownego skanowania).")
+                    f"{len(reports)} DAT-ów (dopasowanie z indeksu, bez skanu "
+                    f"plików).")
                 dedup_roots = ([Path(r) for r in sroots] if dedup else [])
                 # „usuń z ToSort pliki już na miejscu" działa dla WSZYSTKICH
                 # katalogów ToSort (kopia potwierdzona gdzie indziej = zbędna)
@@ -2810,6 +3034,9 @@ class SuiteWindow(QMainWindow):
                                detail=detail, zip_level=settings.zip_level,
                                zip_method=getattr(settings, "zip_method",
                                                   "deflate"))
+                # dedup wg hierarchii DAT-ów (wszystkie, także pominięte — ich katalogi
+                # trzymają kopie fizyczne): kopia u rodzica → dziecko linkuje
+                rb.set_hierarchy(_ents, rules)
 
                 def _make_tools():
                     from ..core.convert import detect_dolphintool
@@ -2861,6 +3088,10 @@ class SuiteWindow(QMainWindow):
 
                 done_reports: list = []
                 ntot = len(reports)
+                # (platforma, odcisk) → plik finalny, WSPÓLNE dla wszystkich
+                # katalogów: dziecko linkuje do CHD zrobionego przez rodzica
+                # wcześniej w tej samej naprawie
+                _finals: dict = {}
                 for rep_i, rep in enumerate(reports):
                     if cancel.is_set():
                         log(f"PRZERWANO naprawę na katalogu {rep_i}/{ntot} — "
@@ -2894,10 +3125,14 @@ class SuiteWindow(QMainWindow):
                                 detail=detail, on_progress=progress,
                                 on_converted=rb.add_canonical,
                                 delete_roots=del_from, make_links=make_links,
-                                slot=slot)
+                                slot=slot, hierarchy=rb.hierarchy,
+                                finals=_finals)
                         if converted_games:
                             log(f"   konwersja ze źródła: {cst0.summary()} "
                                 f"({len(converted_games)} gier).")
+                        # źródła do skasowania po domknięciu katalogu —
+                        # sprzątanie ich nie przenosi do ToSort
+                        rb.add_pending_purge(src_to_purge)
 
                     # fallback-konwersja „w miejscu" PO placemencie (dla gier,
                     # których nie dało się zrobić prosto ze źródła).
@@ -2931,7 +3166,7 @@ class SuiteWindow(QMainWindow):
                                 [rep.entry], _lib, _chd, settings, idx,
                                 extra_roots=_extra, dry_run=dry, log=log,
                                 on_progress=progress, detail=detail,
-                                cancel=cancel)
+                                cancel=cancel, slot=slot)
                             if _rst.rebuilt or _rst.verify_failed or _rst.errors:
                                 log(f"   naprawa kontenera CHD: {_rst.summary()}")
                         except Exception as _e:
@@ -2956,6 +3191,25 @@ class SuiteWindow(QMainWindow):
                     rb.finalize_global(done_reports, dedup_roots=dedup_roots,
                                        delete_placed_from=del_from,
                                        rules=rules.for_entry, cancel=cancel)
+                # ── SIEROTY: katalogi/pliki BEZ DAT-a (np. MAME) → ToSort. Bez
+                #    tego katalog docelowy trzymał na zawsze nieznane foldery.
+                #    Używa WSZYSTKICH odkrytych DAT-ów (`entries` = self._entries),
+                #    więc platforma tylko WYŁĄCZONA (odznaczona) NIE jest ruszana.
+                #    Tylko gdy włączone „sprzątanie" i bez przerwania (pełny obraz).
+                if clean and not rb.cancelled and tosort:
+                    progress(0, 0, tr("finał: nieznane pliki → ToSort…"))
+                    from ..core.dirrules import stray_dirs as _stray
+                    _strays = _stray(_ents, rules, roms)
+                    n_orph = rb.sweep_orphans(_strays, [Path(roms)])
+                    if n_orph:
+                        log(f"Nieznane (brak DAT-a) → ToSort: {n_orph} plików "
+                            f"(treść niepasująca do żadnego DAT-u; pasujące "
+                            f"przeniesiono do targetów).")
+                # przenieś flagę przerwania na STATS — done() po niej rozpoznaje
+                # przerwanie i POMIJA auto-odświeżenie skanem (deep). Bez tego
+                # (flaga była tylko na Rebuilderze) każde przerwanie naprawy
+                # kończyło się pełnym, głębokim skanem całej kolekcji.
+                rb.stats.cancelled = rb.cancelled or cancel.is_set()
                 return rb.stats
 
         def done(stats) -> None:
@@ -3000,8 +3254,8 @@ class SuiteWindow(QMainWindow):
             "Zakładka ZAAWANSOWANA — indeks to wewnętrzna baza sum kontrolnych "
             "(zwykle nie musisz jej ustawiać ręcznie; przycisk Skanuj i "
             "raportuj na zakładce Kolekcja robi to sam).\n"
-            "Katalogi poniżej służą do skanu na żądanie i deduplikacji "
-            "(kolejność = priorytet kopii fizycznej):")))
+            "Katalogi poniżej służą do skanu na żądanie (deduplikację robi "
+            "Naprawa wg hierarchii DAT-ów):")))
         self.roots_list = QListWidget()
         for r in self.settings.index_roots:
             self.roots_list.addItem(r)
@@ -3031,13 +3285,7 @@ class SuiteWindow(QMainWindow):
         row3 = QHBoxLayout()
         self.btn_dupes = QPushButton(tr("👥 Pokaż duplikaty"))
         self.btn_dupes.clicked.connect(self._index_dupes)
-        self.btn_dedup_dry = QPushButton(tr("🔗 Dedup (podgląd)"))
-        self.btn_dedup_dry.clicked.connect(lambda: self._index_dedup(dry=True))
-        self.btn_dedup = QPushButton(tr("🔗 Dedup (wykonaj)"))
-        self.btn_dedup.clicked.connect(lambda: self._index_dedup(dry=False))
         row3.addWidget(self.btn_dupes)
-        row3.addWidget(self.btn_dedup_dry)
-        row3.addWidget(self.btn_dedup)
         row3.addStretch()
         lay.addLayout(row3)
 
@@ -3074,8 +3322,9 @@ class SuiteWindow(QMainWindow):
         db = self.settings.index_db_path or None
         chdman_path = self.settings.chdman_path or None
 
-        def job(log: Callable[[str], None], progress, cancel, detail):
+        def job(log: Callable[[str], None], progress, cancel, detail, slot):
             from ..core.fileindex import FileIndex, count_files
+            settings = self.settings
             prober = None
             if with_chd:
                 from ..core.chdman import CHDMan
@@ -3088,17 +3337,12 @@ class SuiteWindow(QMainWindow):
                 progress(0, 0, tr("liczenie plików…"))
                 grand = sum(count_files(Path(r), cancel=cancel) for r in roots)
                 log(f"Do przeskanowania: {grand} plików")
-                base = [0]
-                for i, r in enumerate(roots):
-                    if cancel.is_set():
-                        break
-                    log(f"Skanuję: {r}")
-                    st = idx.scan(Path(r), full=full, chd_prober=prober,
-                                  log=log, detail=detail,
-                                  on_file=_pulse(log, progress, total=grand,
-                                                 base=base), cancel=cancel)
-                    base[0] += st.seen
-                    log(f"  {st.summary()}")
+                # „skan to skan" — wspólny rdzeń (równoległe hashowanie wg nośnika,
+                # sloty). Jeden `grand` na wszystkie korzenie, base akumuluje.
+                scan_paths(idx, roots, settings=settings, full=full,
+                           prober=prober, grand=grand or 1, log=log,
+                           progress=progress, detail=detail, slot=slot,
+                           cancel=cancel, base=[0])
                 return idx.stats()
 
         def done(stats: dict) -> None:
@@ -3127,32 +3371,6 @@ class SuiteWindow(QMainWindow):
             n, wasted = res
             self._log(f"Duplikatów: {n} grup, do odzyskania "
                       f"{wasted / 2**30:.2f} GiB (Dedup zastąpi je symlinkami).")
-
-        self._run(job, done)
-
-    def _index_dedup(self, dry: bool) -> None:
-        prefer = self._index_roots()
-        if not dry:
-            ok = QMessageBox.question(
-                self, tr("Deduplikacja"),
-                tr("Duplikaty zostaną zastąpione symlinkami do jednej kopii "
-                "fizycznej (odwracalna podmiana, nic nie jest kasowane "
-                "bezpowrotnie).")
-                + "\n\n" + tr("Wykonać?"))
-            if ok != QMessageBox.StandardButton.Yes:
-                return
-        db = self.settings.index_db_path or None
-
-        def job(log: Callable[[str], None], progress):
-            from ..core.fileindex import FileIndex
-            from ..core.linker import apply_dedup, plan_dedup
-            with FileIndex(Path(db) if db else None) as idx:
-                actions = plan_dedup(idx, prefer_roots=prefer)
-                return apply_dedup(actions, index=idx, dry_run=dry, log=log)
-
-        def done(stats) -> None:
-            mode = "PODGLĄD" if dry else "WYKONANO"
-            self._log(f"[{mode}] {stats.summary()}")
 
         self._run(job, done)
 
@@ -3545,8 +3763,8 @@ class SuiteWindow(QMainWindow):
     @property
     def _action_buttons(self) -> list[QPushButton]:
         return [self.btn_load_dats, self.btn_report, self.btn_find,
-                self.btn_force_scan, self.btn_cue_rebuild,
-                self.btn_fix, self.btn_scan, self.btn_dupes, self.btn_dedup_dry,
-                self.btn_dedup, self.btn_icons, self.btn_lnk, self.btn_m3u,
+                self.btn_force_scan, self.btn_cue_rebuild, self.btn_export,
+                self.btn_fix, self.btn_scan, self.btn_dupes,
+                self.btn_icons, self.btn_lnk, self.btn_m3u,
                 self.btn_bios_install, self.btn_upd_check, self.btn_upd_go,
                 self.btn_upd_force]

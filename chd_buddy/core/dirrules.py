@@ -17,7 +17,8 @@ NADPISUJE ogólniejszy (jak w RomVaulcie: „descendant wins").
 Obsługiwane reguły:
   only_complete  (bool) — buduj tylko kompletne gry (domyślnie true),
   skip           (bool) — pomiń DAT całkowicie (nie raportuj, nie buduj),
-  dedup_copies   (bool) — kopie potwierdzonych plików → symlinki (domyślnie true),
+  dedup_copies   (bool) — linki do DAT-ów wyżej w hierarchii (domyślnie true);
+                          false = ZAWSZE kopie fizyczne (wymuszenie),
   target         (str)  — katalog docelowy DAT-a względem rom_root (zamiast
                           nazwy z nagłówka), np. "ps2" dla układu
                           EmulationStation/RetroBat.
@@ -56,13 +57,15 @@ DEFAULT_RULES: dict[str, Any] = {
     "role": "collection",
     # Format przechowywania (patrz FORMATS).
     "format": "keep",
+    # FORMAT ZESTAWÓW ARCADE (tylko DAT-y z logiką parent/clone — cloneof/merge):
+    # "split" (domyślny; klon = tylko ROM-y unikalne), "merged" (klon w rodzicu),
+    # "non-merged" (każdy set kompletny). Ignorowany dla DAT-ów bez parent/clone.
+    "arcade_format": "split",
     # Konwencja nazw katalogów per system (patrz NAMINGS).
     "naming": "dat",
     # Nadpisanie bazowego katalogu ROM-ów (pusty = główny rom_root). Pozwala
     # np. dzieciom platformy lądować na innym dysku/roocie niż rodzic.
     "rom_root": "",
-    # DAT-y tego katalogu są RODZICAMI swoich platform (prawy klik na folderze).
-    "parent_priority": False,
     # RĘCZNE przypięcie DAT-a do innej platformy (klucz platform_key albo
     # nazwa DAT-a rodzica). Np. "FinalBurn Neo - SNES Games" →
     # "nintendo super nintendo entertainment system": DAT staje się DZIECKIEM
@@ -150,7 +153,8 @@ def suggest_format(system_short: str) -> str:
 
 
 # Reguły tekstowe (reszta jest boolowska).
-_STR_RULES = {"target", "format", "naming", "rom_root", "platform", "role"}
+_STR_RULES = {"target", "format", "naming", "rom_root", "platform", "role",
+              "arcade_format"}
 
 
 def _coerce(name: str, value):
@@ -218,11 +222,79 @@ def resolve_format(fmt: str, entry) -> str:
     return "zip"               # kartridż → ZIP
 
 
+# komunikaty jednorazowych migracji (GUI wypisuje je do logu po wczytaniu DAT-ów)
+_NOTICES: list[str] = []
+
+
+def pop_notices() -> list[str]:
+    out = list(_NOTICES)
+    _NOTICES.clear()
+    return out
+
+
+def migrate_parent_priority(dat_root: Path) -> str:
+    """JEDNORAZOWA migracja wycofanej reguły `parent_priority` („wszystkie DAT-y
+    katalogu = rodzice"). Hierarchię wyznacza kolejność katalogów
+    (_kolejnosc.json), a wymuszenie kopii fizycznych — `dedup_copies=false`:
+    - parent_priority=true → dedup_copies=false (dalej zawsze fizycznie),
+    - katalog-rodzic spoza zapisanej kolejności → dopisany za wymienionymi
+      (tam stał dotąd: po wymienionych, przed resztą),
+    - klucz parent_priority usuwany. Zwraca opis zmian ("" = nic)."""
+    p = Path(dat_root) / RULES_FILENAME
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    keys = sorted((k for k, v in data.items()
+                   if isinstance(v, dict) and "parent_priority" in v),
+                  key=str.lower)
+    if not keys:
+        return ""
+    from .folder_order import _load_raw, _norm, save_order
+    order = _load_raw(dat_root)
+    order_changed = False
+    parents: list[str] = []
+    for k in keys:
+        rule = data[k]
+        if bool(rule.pop("parent_priority")):
+            rule["dedup_copies"] = False
+            parents.append(k)
+            if k != "*" and (Path(dat_root) / k).is_dir():
+                parts = [x for x in str(k).replace("\\", "/").split("/") if x]
+                parent = "/".join(parts[:-1])
+                okey = next((x for x in order if _norm(x) == _norm(parent)),
+                            parent)
+                lst = list(order.get(okey, []))
+                if _norm(parts[-1]) not in [_norm(x) for x in lst]:
+                    lst.append(parts[-1])
+                    order[okey] = lst
+                    order_changed = True
+        if not rule:
+            data.pop(k)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                 encoding="utf-8")
+    if order_changed:
+        save_order(dat_root, order)
+    msg = (f"Migracja reguł: „rodzic” wycofany — {', '.join(parents) or '—'} "
+            f"→ „zawsze kopie fizyczne”"
+            + (" + dopisane do kolejności katalogów" if order_changed else "")
+            + ".")
+    _NOTICES.append(msg)
+    return msg
+
+
 class DirRules:
     def __init__(self, dat_root: Path):
         self.dat_root = Path(os.path.abspath(dat_root))
         self.raw: dict[str, dict] = {}
         self.error = ""
+        self.notice = ""
+        try:
+            self.notice = migrate_parent_priority(self.dat_root)
+        except OSError as e:
+            self.error = f"{RULES_FILENAME}: migracja: {e}"
         p = self.dat_root / RULES_FILENAME
         if p.is_file():
             try:
@@ -412,6 +484,68 @@ def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list
     return out
 
 
+def stray_dirs(entries, rules: DirRules, rom_root) -> list[str]:
+    """Foldery-SIEROTY pod rom_root: rodzeństwo zarządzanych platform, które NIE
+    jest targetem/kandydatem (ES/Redump) ani przodkiem żadnego DAT-u.
+
+    Folder OUTPUT DAT-u jest EDYTOWALNY i często różni się od nazwy z DAT-u — a to
+    dalej ten sam DAT (np. Commodore 64 z output `c64`, a pliki leżą w starym
+    `commodore64`). Takie foldery trzeba SKANOWAĆ, żeby DAT dopasował ich treść po
+    sumach; naprawa przeniesie pliki do skonfigurowanego targetu (zwykły move), a
+    to, co nie pasuje do ŻADNEGO DAT-u, dopiero wtedy trafia do ToSort.
+
+    `entries` powinny być WSZYSTKIE odkryte (także wyłączone) — inaczej folder
+    platformy tylko odznaczonej na ten przebieg zostałby uznany za sierotę.
+    NIE schodzimy w target/kandydata ani w tier-przodka; katalogi pomocnicze i
+    systemowe pomijamy."""
+    ncase = os.path.normcase
+    base = Path(os.path.abspath(str(rom_root)))
+    base_n = ncase(str(base))
+    managed: set[str] = set()
+    anc_norm: set[str] = set()
+    anc_paths: dict[str, Path] = {}
+    for e in entries:
+        eff = rules.for_entry(e)
+        rbase = Path(eff["rom_root"]) if eff.get("rom_root") else base
+        cands = []
+        t = getattr(e, "target_dir", None)
+        if t:
+            cands.append(Path(os.path.abspath(str(t))))
+        cands.append(rbase / folder_name(e, "dat"))
+        cands.append(rbase / folder_name(e, "es"))
+        for pp in cands:
+            pp = Path(os.path.abspath(str(pp)))
+            managed.add(ncase(str(pp)))
+            for a in pp.parents:
+                an = ncase(str(a))
+                anc_norm.add(an)
+                anc_paths.setdefault(an, a)
+    SKIP = {"cues", "support files", "system", "$recycle.bin",
+            "system volume information", "found.000"}
+    parents = [p for an, p in anc_paths.items()
+               if an == base_n or an.startswith(base_n.rstrip("\\/") + os.sep)]
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in sorted(parents, key=lambda p: len(str(p))):
+        if not d.is_dir():
+            continue
+        try:
+            kids = list(os.scandir(d))
+        except OSError:
+            continue
+        for ent in kids:
+            if not ent.is_dir():
+                continue
+            cn = ncase(os.path.abspath(ent.path))
+            if cn in managed or cn in anc_norm or cn == base_n or cn in seen:
+                continue
+            if ent.name.lower() in SKIP:
+                continue
+            seen.add(cn)
+            out.append(str(Path(os.path.abspath(ent.path))))
+    return out
+
+
 def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
     """Wylicza katalog docelowy każdego DAT-a z reguł (kaskada global→
     katalog→DAT):
@@ -459,6 +593,16 @@ def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
             e.target_dir = base / rel / leaf
         e.subdir_per_game = bool(eff.get("subdir_per_game", True))
         e.store_format = resolve_format(eff.get("format", "keep"), e)
+        # FORMAT ZESTAWÓW ARCADE (split/merged/non-merged) — używany przez matcher
+        # i rebuilder TYLKO dla DAT-ów z logiką parent/clone (sprawdzane tam po
+        # entry.games). Cache nazw gier zerujemy — mógł być z innego formatu.
+        e.arcade_format = str(eff.get("arcade_format", "split") or "split")
+        for _attr in ("_game_names", "_game_by_name", "_is_arcade", "_arc_sig"):
+            if hasattr(e, _attr):
+                try:
+                    delattr(e, _attr)
+                except Exception:
+                    pass
 
     # Format PER PLATFORMA: bierzemy JAWNĄ regułę formatu (folder/DAT)
     # KTÓREGOKOLWIEK DAT-a platformy — rodzic ma pierwszeństwo (entries są

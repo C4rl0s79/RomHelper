@@ -166,24 +166,21 @@ _EN: dict[str, str] = {
     "Zakładka ZAAWANSOWANA — indeks to wewnętrzna baza sum kontrolnych "
     "(zwykle nie musisz jej ustawiać ręcznie; przycisk Skanuj i "
     "raportuj na zakładce Kolekcja robi to sam).\n"
-    "Katalogi poniżej służą do skanu na żądanie i deduplikacji "
-    "(kolejność = priorytet kopii fizycznej):":
+    "Katalogi poniżej służą do skanu na żądanie (deduplikację robi "
+    "Naprawa wg hierarchii DAT-ów):":
         "ADVANCED tab — the index is an internal checksum database "
         "(you normally don't set it by hand; the Scan and report button on "
         "the Collection tab does it for you).\n"
-        "The folders below are for on-demand scanning and deduplication "
-        "(order = physical-copy priority):",
+        "The folders below are for on-demand scanning (deduplication is "
+        "done by Fix, following the DAT hierarchy):",
     "➕ Dodaj katalog": "➕ Add folder",
     "➖ Usuń zaznaczony": "➖ Remove selected",
     "🔍 Skanuj przyrostowo": "🔍 Incremental scan",
     "pełny re-skan (licz sumy od nowa)": "full re-scan (recompute checksums)",
     "SHA-1 zawartości CHD (chdman)": "SHA-1 of CHD contents (chdman)",
     "👥 Pokaż duplikaty": "👥 Show duplicates",
-    "🔗 Dedup (podgląd)": "🔗 Dedup (preview)",
-    "🔗 Dedup (wykonaj)": "🔗 Dedup (apply)",
     "Katalog do indeksu": "Folder to index",
     "Dodaj przynajmniej jeden katalog.": "Add at least one folder.",
-    "Deduplikacja": "Deduplication",
 
     # --- zakładka Ikony i skróty ---
     "Katalog gier:": "Games folder:",
@@ -294,11 +291,9 @@ _EN: dict[str, str] = {
     "obowiązuje wszystkie DAT-y "
     "w tym katalogu; pojedynczy DAT może nadpisać.":
         "applies to all DATs in this folder; an individual DAT can override.",
-    "wszystkie DAT-y tego katalogu są RODZICAMI "
-    "swoich platform (trzymają pliki fizyczne)":
-        "all DATs in this folder are PARENTS of their platforms "
-        "(they hold the physical files)",
-    "Rola:": "Role:",
+    "zawsze kopie fizyczne (bez linków do DAT-ów wyżej)":
+        "always physical copies (no links to DATs higher up)",
+    "Wymuszenie:": "Override:",
     "zostaw jak jest": "keep as is",
     "Format przechowywania:": "Storage format:",
     "z DAT-a (<header><name>, np. Sony - PlayStation 2)":
@@ -389,8 +384,6 @@ _EN: dict[str, str] = {
     "zaznaczonych DAT-ów…": "selected DATs…",
     "⚙ Ustawienia katalogu": "⚙ Folder settings",
     "(wszystkie DAT-y)…": "(all DATs)…",
-    "⭐ Wszystkie DAT-y tu = rodzice platform":
-        "⭐ All DATs here = platform parents",
     "⚙ Ustawienia DAT-a…": "⚙ DAT settings…",
     "⚙ Zależności (rodzic/dziecko)…": "⚙ Dependencies (parent/child)…",
     "🔄 Wymuś pełny skan katalogu tego DAT-a":
@@ -705,11 +698,6 @@ _EN: dict[str, str] = {
         "Details in the log and the progress window. If the plan looks good — "
         "click: Fix (apply).",
     "Dodaj przynajmniej jeden katalog.": "Add at least one folder.",
-    "Duplikaty zostaną zastąpione symlinkami do jednej kopii "
-    "fizycznej (odwracalna podmiana, nic nie jest kasowane "
-    "bezpowrotnie).":
-        "Duplicates will be replaced with symlinks to one physical copy "
-        "(reversible swap, nothing is deleted permanently).",
     "Wskaż istniejący katalog gier.": "Point to an existing games folder.",
     "Wskaż katalog gier i katalog emulatorów.":
         "Point to the games folder and the emulators folder.",
