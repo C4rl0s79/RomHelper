@@ -44,6 +44,8 @@ class Hierarchy:
     def __init__(self, entries: Iterable = (), rules=None):
         self._by_id: dict[int, DatNode] = {}
         self._by_dir: dict[str, DatNode] = {}
+        self._all_by_dir: dict[str, list] = {}   # wszystkie DAT-y katalogu
+        self._content: dict[int, tuple] = {}     # id(entry) → (sha1, crc+size)
         self._eff = _eff_fn(rules)
         for e in entries or ():
             self.add(e)
@@ -72,7 +74,84 @@ class Hierarchy:
                        physical_only=not eff.get("dedup_copies", True))
         self._by_id[id(entry)] = node
         self._by_dir.setdefault(d, node)   # wspólny katalog → pierwszy (wyższy)
+        self._all_by_dir.setdefault(d, []).append(node)
         return node
+
+    def _has_content(self, entry, sha1: str, crc: str, size: int) -> bool:
+        c = self._content.get(id(entry))
+        if c is None:
+            shas, crcs = set(), set()
+            try:
+                games = entry.load().games
+            except Exception:
+                games = []
+            for g in games:
+                for r in g.roms:
+                    if r.sha1:
+                        shas.add(r.sha1.lower())
+                    if r.crc and r.size:
+                        crcs.add((r.crc.lower().zfill(8), int(r.size)))
+            c = self._content[id(entry)] = (shas, crcs)
+        # SHA-1 ALBO CRC+rozmiar: DAT-y bez SHA-1 (FinalBurn Neo, MAME — same
+        # CRC) też „mają" treść. Dawniej przy znanym SHA-1 sprawdzaliśmy TYLKO
+        # SHA-1 → DAT z samymi CRC nigdy nie był właścicielem i naprawa kasowała
+        # jego pliki (przepakowanie FBNeo → No-intro/T-En, 29.09).
+        if sha1 and sha1.lower() in c[0]:
+            return True
+        return bool(crc and size) and (crc.lower().zfill(8), int(size)) in c[1]
+
+    def must_keep_source(self, entry, src, dest, rom) -> bool:
+        """Czy plik `src` NALEŻY do innego DAT-u, który po zabraniu go NIE
+        dostanie linku — wtedy `entry` ma zrobić własną KOPIĘ, a nie przenieść
+        (albo przepakować i skasować) źródło.
+
+        Przykład: te same ROM-y MSX w „Microsoft - MSX" (ROMS\\msx, nazwa
+        „10-Yard Fight (Japan)") i „FinalBurn Neo - MSX 1 Games" (nazwa
+        „10yard"). Różne platformy = osobne pliki fizyczne; dawniej każda
+        naprawa ZABIERAŁA zip drugiemu DAT-owi (przepakowanie + skasowanie
+        źródła) i następna oddawała go z powrotem — tysiące przepakowań w kółko.
+        Źródło w katalogu DAT-u tej samej platformy NIŻEJ (np. 1G1R → ROMS)
+        wolno przenieść: tamten DAT zlinkuje do nowej kopii."""
+        me = self.node(entry)
+        owner = self.dat_at(src)
+        if me is None or owner is None or owner.dir == me.dir:
+            return False
+        sha1 = (getattr(rom, "sha1", "") or "")
+        crc = (getattr(rom, "crc", "") or "")
+        size = getattr(rom, "size", 0) or 0
+        owners = [n for n in self._all_by_dir.get(owner.dir, [owner])
+                  if not (sha1 or (crc and size))
+                  or self._has_content(n.entry, sha1, crc, size)]
+        if not owners:
+            return False            # żaden DAT tamtego katalogu tej gry nie ma
+        return not all(self.should_link(n.entry, dest) for n in owners)
+
+    def owned_above(self, entry, path, rom) -> bool:
+        """`path` leży w katalogu DAT-u WYŻEJ (ta sama platforma) I któryś DAT
+        tego katalogu MA tę treść (ROM `rom`) — dopiero wtedy to jego kopia
+        fizyczna, do której `entry` robi link. Plik, którego żaden DAT tamtego
+        katalogu nie zna, NIE jest kopią rodzica: fizyczna kopia powstaje w
+        najwyższym DAT-cie, który tę grę ma (user: „jeśli nie ma w hierarchii
+        wyżej, fizyczny plik powstaje niżej, a linki dopiero pod nim").
+        Katalog bywa wspólny dla kilku DAT-ów (ROMS\\pc98: „NEC - PC-98" i
+        „NEC - PC-98 (HardDisk)") — liczy się każdy z nich."""
+        if not self.above(entry, path):
+            return False
+        owner = self.dat_at(path)
+        if owner is None:
+            return False
+        sha1 = (getattr(rom, "sha1", "") or "")
+        crc = (getattr(rom, "crc", "") or "")
+        size = getattr(rom, "size", 0) or 0
+        if not (sha1 or (crc and size)):
+            return True            # bez sum nie rozstrzygniemy — jak dotąd
+        me = self.node(entry)
+        for n in self._all_by_dir.get(owner.dir, [owner]):
+            if me is not None and (n.platform != me.platform or n.rank >= me.rank):
+                continue
+            if self._has_content(n.entry, sha1, crc, size):
+                return True
+        return False
 
     def node(self, entry) -> Optional[DatNode]:
         return self._by_id.get(id(entry))

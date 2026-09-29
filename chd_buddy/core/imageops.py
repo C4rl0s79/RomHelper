@@ -59,8 +59,12 @@ def is_safe_single_data_track(info: CueTrackInfo) -> bool:
 
 
 def bin_to_iso(bin_path: Path, sector_size: int, iso_out: Path,
-               chunk_sectors: int = 4096) -> Path:
-    """Tworzy .iso (2048 B/sektor) z .bin. Dla 2048 to kopia, dla 2352 deframing."""
+               chunk_sectors: int = 4096, hasher=None) -> Path:
+    """Tworzy .iso (2048 B/sektor) z .bin. Dla 2048 to kopia, dla 2352 deframing.
+
+    hasher — opcjonalny obiekt hashlib: dostaje ZAPISYWANE bajty (suma .iso w
+    locie). Dawniej SHA-1 obrazu liczono osobno przez `iso.read_bytes()` —
+    drugi pełny odczyt i cały obraz PS2 (do 8 GB) w pamięci programu naraz."""
     if sector_size == _MODE1_USER:
         # Już 2048 — wystarczy przeniesienie/kopiowanie zawartości.
         with bin_path.open("rb") as src, iso_out.open("wb") as dst:
@@ -68,16 +72,29 @@ def bin_to_iso(bin_path: Path, sector_size: int, iso_out: Path,
                 buf = src.read(chunk_sectors * _MODE1_USER)
                 if not buf:
                     break
+                if hasher is not None:
+                    hasher.update(buf)
                 dst.write(buf)
         return iso_out
 
     if sector_size == _CD_RAW:
+        # PACZKAMI ramek (nie ramka po ramce — 2 mln wywołań read/write na PS2);
+        # niepełna ramka na końcu jest pomijana jak dotąd.
         with bin_path.open("rb") as src, iso_out.open("wb") as dst:
             while True:
-                frame = src.read(_CD_RAW)
-                if len(frame) < _CD_RAW:
+                buf = src.read(chunk_sectors * _CD_RAW)
+                n = len(buf) // _CD_RAW
+                if n == 0:
                     break
-                dst.write(frame[_MODE1_HEADER:_MODE1_HEADER + _MODE1_USER])
+                mv = memoryview(buf)
+                out = b"".join(
+                    mv[o:o + _MODE1_USER]
+                    for o in range(_MODE1_HEADER, n * _CD_RAW, _CD_RAW))
+                if hasher is not None:
+                    hasher.update(out)
+                dst.write(out)
+                if n < chunk_sectors:
+                    break
         return iso_out
 
     raise ValueError(f"Nieobsługiwany rozmiar sektora: {sector_size}")

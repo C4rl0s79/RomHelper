@@ -77,6 +77,27 @@ def _write_report_file(dirpath: Path, key: str, games: dict, saved_at: str) -> N
         tmp.unlink(missing_ok=True)
 
 
+STALE_MARKER = ".nieaktualny"     # naprawa zmieniła indeks, a stan nie przeliczony
+
+
+def mark_report_states_stale(path: Optional[Path] = None) -> None:
+    """Naprawa zaczyna zmieniać pliki/indeks → zapamiętany stan przestaje być
+    prawdą. Znacznik zdejmuje dopiero zapis stanu przeliczonego z indeksu
+    (`save_report_states`). Gdy program zamknięto w trakcie naprawy, start
+    widzi znacznik i przelicza stan z indeksu (bez skanu plików)."""
+    d = Path(path) if path else report_cache_path()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / STALE_MARKER).write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def report_states_stale(path: Optional[Path] = None) -> bool:
+    d = Path(path) if path else report_cache_path()
+    return (d / STALE_MARKER).is_file()
+
+
 def save_report_states(reports, path: Optional[Path] = None) -> None:
     """Zapisuje ZWARTY stan raportu — OSOBNY plik dla KAŻDEGO DAT-u:
     {gra: {rom_lower: (kod_stanu, source_path, member, via_chd, …)}}. Pozwala
@@ -95,6 +116,11 @@ def save_report_states(reports, path: Optional[Path] = None) -> None:
     for rep in reports:
         key = str(Path(os.path.abspath(rep.entry.dat_path)))
         _write_report_file(d, key, _compact(rep), now)
+    # stan policzony z AKTUALNEGO indeksu → znacznik „nieaktualny" zdjęty
+    try:
+        (d / STALE_MARKER).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _migrate_legacy(d: Path) -> None:

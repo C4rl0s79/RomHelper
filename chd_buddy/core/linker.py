@@ -92,8 +92,14 @@ def _same_volume(a: Path, b: Path) -> bool:
     return bool(da) and os.path.normcase(da) == os.path.normcase(db)
 
 
+# błędy oznaczające „hardlink tu NIEMOŻLIWY" (a nie chwilową awarię):
+# 1 ERROR_INVALID_FUNCTION, 17 ERROR_NOT_SAME_DEVICE, 50 ERROR_NOT_SUPPORTED,
+# 1142 ERROR_TOO_MANY_LINKS
+_NO_HARDLINK_WINERR = {1, 17, 50, 1142}
+
+
 def create_link(link_path: Path, target: Path, is_dir: bool,
-                *, prefer_hardlink: bool = True) -> None:
+                *, prefer_hardlink: bool = True) -> str:
     """Łączy `link_path` z treścią `target`.
 
     Dla PLIKÓW na tym samym woluminie preferujemy HARDLINK (`os.link`): nie
@@ -106,19 +112,31 @@ def create_link(link_path: Path, target: Path, is_dir: bool,
     `prefer_hardlink=False` wymusza symlink — dla mirror_tree (RetroBat), które
     polega na semantyce reparse pointa: bezpiecznie usuwa TYLKO stworzone przez
     siebie linki (is_link), nie tykając prawdziwych plików usera, i z założenia
-    wskazuje drzewo na INNYM woluminie (serwer)."""
+    wskazuje drzewo na INNYM woluminie (serwer).
+
+    Zwraca "hard" albo "sym". Zajęta ścieżka / brak katalogu → FileExistsError /
+    FileNotFoundError od razu (bez zbędnej próby symlinku)."""
     if prefer_hardlink and not is_dir and _same_volume(link_path, target):
         try:
             os.link(str(target), str(link_path))
-            return
-        except OSError:
-            pass                    # cross-volume / brak wsparcia → symlink niżej
+            return "hard"
+        except OSError as e:
+            # TEN SAM wolumin = TYLKO hardlink. Symlink wolno wyłącznie, gdy
+            # system JAWNIE nie obsługuje hardlinków (inny wolumin mimo litery,
+            # brak funkcji). Dawniej KAŻDY błąd (np. chwilowa czkawka SMB przy
+            # równoległych linkach) po cichu robił symlink — a user chce w
+            # kolekcji wyłącznie hardlinki (29.09).
+            import errno as _errno
+            if (getattr(e, "winerror", None) not in _NO_HARDLINK_WINERR
+                    and e.errno not in (_errno.EXDEV, _errno.EMLINK)):
+                raise
     try:
         os.symlink(str(target), str(link_path), target_is_directory=is_dir)
     except OSError as e:
         if getattr(e, "winerror", None) == 1314:
             raise LinkPrivilegeError(_PRIVILEGE_HINT) from e
         raise
+    return "sym"
 
 
 def remove_link(path: Path) -> bool:
@@ -167,6 +185,16 @@ def remove_broken_links(roots, index=None, log: Optional[LogCB] = None,
         return True
 
     if index is not None:
+        # ZNANE SYMLINKI z indeksu → RÓWNOLEGLE (NAS przez internet: jedna
+        # runda SMB na link szeregowo = minuty). Każdy symlink:
+        #  - cel NIE istnieje → usuń (zerwany),
+        #  - cel istnieje na TYM SAMYM woluminie → zamień na HARDLINK (w
+        #    kolekcji mają być wyłącznie hardlinki — user 29.09; symlink na SMB
+        #    to zależność od celu i rundy NAS przy każdym dopasowaniu),
+        #  - inny wolumin → zostaw.
+        # I/O w wątkach, indeks tylko w wątku wołającym (SQLite jednowątkowe).
+        from concurrent.futures import ThreadPoolExecutor
+        paths: list = []
         seen: set = set()
         for root in roots:
             if not root or not Path(root).is_dir():
@@ -176,23 +204,84 @@ def remove_broken_links(roots, index=None, log: Optional[LogCB] = None,
             except Exception:
                 rows = []
             for row in rows:
-                if cancel is not None and cancel.is_set():
-                    return removed
                 try:
                     if not row["is_link"]:
                         continue
                 except (KeyError, IndexError):
                     continue
-                p = Path(row["path"])
-                k = os.path.normcase(str(p))
-                if k in seen:
-                    continue
-                seen.add(k)
+                k = os.path.normcase(row["path"])
+                if k not in seen:
+                    seen.add(k)
+                    paths.append(Path(row["path"]))
+        if log and paths:
+            log(f"Symlinki w kolekcji: {len(paths)} — zerwane usuwam, pozostałe "
+                f"zamieniam na hardlinki…")
+
+        def _one(p: Path):
+            if cancel is not None and cancel.is_set():
+                return ("skip", p, None)
+            tgt = link_target(p)
+            if tgt is None:
+                return ("skip", p, None)
+            if not os.path.lexists(tgt):
+                try:
+                    remove_link(p)
+                    return ("removed", p, None)
+                except OSError as e:
+                    return ("error", p, e)
+            if not _same_volume(p, Path(tgt)) or os.path.isdir(tgt):
+                return ("skip", p, None)
+            # BEZ uprawnień administratora (program działa bez nich — hardlinki
+            # ich nie wymagają): hardlink pod nazwą tymczasową, potem ATOMOWA
+            # podmiana w miejsce symlinku. Żadnej chwili bez pliku i żadnej
+            # próby tworzenia symlinku przy błędzie.
+            tmp = Path(str(p) + ".rh_hardlink_tmp")
+            try:
+                if os.path.lexists(tmp):
+                    os.unlink(tmp)
+                os.link(tgt, str(tmp))
+            except OSError as e:
+                return ("error", p, e)          # symlink zostaje nietknięty
+            try:
+                os.replace(str(tmp), str(p))
+                return ("hard", p, tgt)
+            except OSError as e:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return ("error", p, e)
+
+        converted = 0
+        with ThreadPoolExecutor(16) as ex:
+            for kind, p, info in ex.map(_one, paths):
                 checked += 1
                 if log and checked % 2000 == 0:
-                    log(f"  …sprawdzono {checked} linków (zerwanych: {removed})")
-                if link_is_broken(p):       # po CELU (readlink), nie po podążaniu
-                    _drop(p)
+                    log(f"  …sprawdzono {checked} linków (zerwanych: {removed}, "
+                        f"zamienionych: {converted})")
+                if kind == "removed":
+                    removed += 1
+                    if index is not None:
+                        try:
+                            index.remove_path(p)
+                        except Exception:
+                            pass
+                    if log:
+                        log(f"USUNIĘTO zerwany link: {p}")
+                elif kind == "hard":
+                    converted += 1
+                    try:
+                        index.remove_path(p)          # wpis symlinku precz
+                        index.record_hardlink(p, info)  # hardlink z danymi celu
+                    except Exception:
+                        pass
+                    if log:
+                        log(f"ZAMIENIONO symlink → hardlink: {p}")
+                elif kind == "error" and log:
+                    log(f"nie obsłużono linku {p}: {info}")
+        if log and paths:
+            log(f"Symlinki: usunięto zerwanych {removed}, zamieniono na "
+                f"hardlinki {converted}.")
         return removed
 
     # BEZ indeksu: pełny os.walk (rzadka ścieżka), też z cancel

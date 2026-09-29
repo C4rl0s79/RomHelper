@@ -98,13 +98,35 @@ def _mk_detail(detail, name: str):
     return dp
 
 
+def _mk_slot_dp(slot, idx: int, name: str, what: str):
+    """Adapter paska RÓWNOLEGŁEGO (slot): konwencja chdman on_progress(pct, msg)
+    → set_slot(idx, done, total, text). Dawniej _rb_build podawał chdmanowi
+    callback o sygnaturze (done, total, text) — do paska trafiał TEKST jako
+    `total`, obsługa w UI się wywracała i własne paski nigdy się nie pokazały
+    (wszystko widać było tylko na wspólnym pasku pobierania/wysyłki)."""
+    def dp(pct: float, msg: str = "") -> None:
+        if pct is not None and pct >= 0:
+            slot(idx, int(pct), 100,
+                 f"{what} {name}: {msg or f'{int(pct)}%'}")
+        else:
+            slot(idx, 0, 0, f"{what} {name}: {msg}".rstrip(": "))
+    return dp
+
+
 def _place_final(new: Path, dst: Path, detail=None) -> None:
     """Przenosi gotowy plik na miejsce; os.replace na tym samym dysku
-    (atomowo), kopia blokami z postępem między dyskami (RAM → fizyczny)."""
+    (atomowo), kopia blokami z postępem między dyskami (RAM → fizyczny).
+
+    STARY plik NIE jest kasowany przed wysyłką: nowy trafia obok jako
+    `*.chdbuddy_move_tmp` i dopiero KOMPLETNY zastępuje stary (os.replace).
+    Dawniej `dst.unlink()` przed wysyłką zostawiał przez całą (przez internet
+    — godzinną) wysyłkę JEDYNĄ kopię gry na ulotnym RAM-dysku."""
+    from . import netguard
     from .fileops import move_with_progress
-    dst.unlink(missing_ok=True)
-    move_with_progress(new, dst, on_progress=detail,
-                       label=f"przenoszę {dst.name}")
+    # zerwany NAS (uśpienie laptopa, restart routera) → czekaj i powtórz
+    netguard.call(lambda: move_with_progress(new, dst, on_progress=detail,
+                                             label=f"przenoszę {dst.name}"),
+                  new, dst, what=f"wysyłka {dst.name}")
 
 
 def _chd_cd_tracks(chd, path: Path) -> int:
@@ -151,21 +173,50 @@ def _rb_gather(payload):
     """I/O: scratch + ekstrakcja CHD + deframe/split + weryfikacja SHA-1."""
     chd = payload["chd"]
     log = payload["log"]
-    dp = _mk_detail(payload["detail"], payload["chd_path"].name)
+    # równoległe pobierania → KAŻDE na własnym pasku (slot nadaje potok)
+    gidx = payload.get("_gather_slot")
+    slot = payload.get("slot")
+    if slot is not None and gidx is not None:
+        dp = _mk_slot_dp(slot, gidx, payload["chd_path"].name, "pobieranie")
+    else:
+        dp = _mk_detail(payload["detail"], payload["chd_path"].name)
+    try:
+        return _rb_gather_run(payload, chd, log, dp)
+    finally:
+        if slot is not None and gidx is not None:
+            slot(gidx, -1, 0, "")               # zwolnij pasek pobierania
+
+
+def _rb_gather_run(payload, chd, log, dp):
+    """ETAP POBIERANIA = TYLKO kopia CHD z NAS na RAM. Rozpakowanie (chdman
+    extractcd — jednowątkowe, ~1–1,5 min na grę PS2) robi etap PRZERÓBKI: przez
+    internet (Tailscale, ~7 MB/s) łącze jest wąskim gardłem, więc następne
+    pobranie ma ruszać zaraz po skopiowaniu, a nie po rozpakowaniu."""
     tmp = _scratch_tmp(payload["chd_path"], payload["need"], log,
                        fallback=payload["fallback"])
     if tmp is None:
         payload["outcome"] = "skipped_space"
         return None
     payload["scratch"] = tmp
+    local = _local_source(payload["chd_path"], tmp, dp, log)
+    payload["local"] = local
+    return local
+
+
+def _rb_prepare(payload, chd, log, dp):
+    """Rozpakowanie pobranej kopii + deframe/podział + weryfikacja SHA-1 (etap
+    przeróbki). Zwraca źródło do createdvd/createcd albo None (outcome ustawiony)."""
+    tmp = payload["scratch"]
+    local = payload.get("local")
     if payload["kind"] == "dvd":
         src, oc = _prep_dvd(payload["chd_path"], payload["game_name"],
-                            payload["iso_rom"], tmp, chd, log, dp)
+                            payload["iso_rom"], tmp, chd, log, dp, local=local)
         payload["split"] = src.parent if src else None
     else:
         src, split, oc = _prep_cd(payload["chd_path"], payload["game_name"],
                                   payload["data"], payload["cue_rom"],
-                                  payload["cue_bytes"], tmp, chd, log, dp)
+                                  payload["cue_bytes"], tmp, chd, log, dp,
+                                  local=local)
         payload["split"] = split
     if oc:
         payload["outcome"] = oc
@@ -183,15 +234,46 @@ def _rb_build(payload, gathered):
     sidx = payload.get("_pipe_slot")
     slot = payload.get("slot")
     if slot is not None and sidx is not None:
-        def dp(d, t, txt=""):
-            slot(sidx, d, t, f"CHD {payload['chd_path'].name}: {txt or ''}")
+        dp = _mk_slot_dp(slot, sidx, payload["chd_path"].name, "CHD")
     else:
         dp = _mk_detail(payload["detail"], payload["chd_path"].name)
     media = MediaType.DVD if payload["kind"] == "dvd" else MediaType.CD
+    # ROZPAKOWANIE pobranej kopii (gdy etap pobierania tylko kopiował)
+    if "local" in payload and "src" not in payload:
+        if slot is not None and sidx is not None:
+            dpx = _mk_slot_dp(slot, sidx, payload["chd_path"].name,
+                              "rozpakowanie")
+        else:
+            dpx = dp
+        try:
+            gathered = _rb_prepare(payload, payload["chd"], log, dpx)
+        except Exception:
+            if slot is not None and sidx is not None:
+                slot(sidx, -1, 0, "")
+            raise
+        if gathered is None:
+            if slot is not None and sidx is not None:
+                slot(sidx, -1, 0, "")
+            return None
+    # WĄTKI chdman liczone TUŻ PRZED kompresją: pula / ile przeróbek trwa (z tą).
+    # Sama gra → cała pula (8); dwie → po 4 itd. (extractcd/verify w chdman są
+    # zawsze jednowątkowe — tego nie przyspieszymy, kompresję tak).
+    settings = payload["settings"]
+    pool = payload.get("threads_pool") or 0
+    _afn = payload.get("_pipe_active_fn")
+    act = (_afn() if callable(_afn) else 0) or payload.get("_pipe_active") or 0
+    if pool and act:
+        import dataclasses as _dc
+        nth = max(1, pool // act)
+        try:
+            settings = _dc.replace(settings, threads=nth)
+        except Exception:
+            pass
+        log(f"   kompresja: {nth} wątków chdman (trwa {act} kompresji naraz)")
     try:
         out = fixer.create_from_source(
             payload["chd"], gathered, media, payload["split"],
-            payload["settings"], compression=payload["comp"],
+            settings, compression=payload["comp"],
             log=lambda m: log(f"   {m}"), cancel_event=None, on_progress=dp)
     finally:
         if slot is not None and sidx is not None:
@@ -349,9 +431,12 @@ def rebuild_bad_chds(
                     finalize=lambda p, r: _rb_finalize(p, r, index, log),
                     release=_release_and_tick,
                     ram_budget=_budget, log=log, cancel=None,
-                    build_workers=_bw, ordered=False)
+                    build_workers=_bw, ordered=False,
+                    gather_workers=max(1, int(getattr(
+                        settings, "download_workers", 1) or 1)))
                 _pipe.start()
                 log(f"Odbudowa CHD: potok WŁ (do {_bw} równoległych, "
+                    f"{_pipe._gather_workers} pobierań naraz, "
                     f"{_total_threads} wątków dzielonych między równoległe, "
                     f"budżet RAM {_budget/1024**3:.1f} GB); przerwanie dokańcza "
                     f"rozpoczęte.")
@@ -385,6 +470,8 @@ def rebuild_bad_chds(
         Zwraca True, gdy zadanie ODDANO DO POTOKU (licznik `done` podbije release);
         False, gdy obsłużone seryjnie albo pominięte na pre-checku (licznik
         podbija wtedy pętla od razu)."""
+        from . import netguard
+        netguard.checkpoint(cancel)          # NAS padł → czekaj na powrót
         if _pipe is None:
             if kind == "dvd":
                 _rebuild_dvd_one(chd_path, game_name, data[0], chd, settings,
@@ -431,8 +518,9 @@ def rebuild_bad_chds(
                 st.no_cue += 1
                 log(f"BRAK CUE w bibliotece: {game_name}")
                 return False
-        log(f"ODBUDOWA {'CD→DVD' if kind == 'dvd' else 'kontenera'} → potok: "
-            f"{chd_path.name} [{game_name}]")
+        # SKĄD → DOKĄD: pełne ścieżki (odbudowa podmienia plik W MIEJSCU)
+        log(f"ODBUDOWA {'CD→DVD' if kind == 'dvd' else 'kontenera'} (potok): "
+            f"{chd_path}  →  {chd_path} (w miejscu)  [{game_name}]")
         need = int(chd_path.stat().st_size * 3.2)
         # WĄTKI chdman dla TEGO zadania = pula / ile takich zmieści się na raz
         # w budżecie RAM. Duży DVD (need≈budżet) → 1 równolegle → cała pula (8);
@@ -449,6 +537,7 @@ def rebuild_bad_chds(
             "need": need, "comp": comp_dvd if kind == "dvd" else comp,
             "iso_rom": iso_rom, "data": data, "cue_rom": cue_rom,
             "cue_bytes": cue_bytes, "chd": chd, "settings": _sjob,
+            "threads_pool": _total_threads,
             "log": log, "detail": detail, "slot": slot,
             "fallback": getattr(settings, "scratch_dir", "") or None,
             "outcome": None,
@@ -489,8 +578,34 @@ def rebuild_bad_chds(
             return _bad_container(chd_path) == 0
         return _layout_ok(chd_path)
 
+    def _header_verdict(chd_path: Path, hit) -> Optional[bool]:
+        """Werdykt z NAGŁÓWKA zapisanego w indeksie przy skanie (bez NAS):
+        True = kontener/układ zgodny z DAT, False = na pewno do odbudowy,
+        None = nagłówek nieznany (stary wpis — sprawdzi naprawa albo skan)."""
+        if index is None:
+            return None
+        try:
+            trk, cdt = index.chd_header(chd_path)
+        except Exception:
+            return None
+        kind, _g, data, _cue = hit
+        if kind == "dvd":
+            return None if cdt < 0 else cdt == 0
+        return None if trk < 0 else trk == len(data)
+
+    def _mark_ok(chd_path: Path, kind: str) -> None:
+        if index is None:
+            return
+        try:
+            index.set_bad_container(chd_path, 0)
+            if kind != "dvd":
+                index.set_layout_ok(chd_path, 1)
+        except Exception:
+            pass
+
     targets: list = []          # (chd_path, game_name, hit)
     skipped_done = 0            # już potwierdzone jako poprawne (bez NAS)
+    unknown = 0                 # podgląd: nagłówek nieznany w indeksie
     for entry in entries:
         # ISTNIENIE <gra>.chd z INDEKSU (jedno zapytanie na katalog), NIE
         # `is_file` per gra: PSX = ~4600 gier z DAT-u → ~3 min szeregowych
@@ -528,6 +643,15 @@ def rebuild_bad_chds(
                 skipped_done += 1
                 st.ok_layout += 1
                 continue
+            verdict = _header_verdict(chd_path, hit)
+            if verdict is True:                  # zgodny wg nagłówka z indeksu
+                _mark_ok(chd_path, hit[0])
+                skipped_done += 1
+                st.ok_layout += 1
+                continue
+            if verdict is None and dry_run:      # podgląd NIE czyta nagłówków
+                unknown += 1
+                continue
             targets.append((chd_path, game.name, hit))
     # ToSort: zidentyfikowane CHD leżące jeszcze poza targetem (kontener w miejscu)
     for root in (extra_roots or []):
@@ -539,11 +663,22 @@ def rebuild_bad_chds(
             if hit is None:
                 continue
             chd_path = Path(p)
-            if not chd_path.is_file():
+            # istnienie z INDEKSU (identified_chds_under = missing=0); NAS
+            # pytamy tylko w realnej naprawie — podgląd nie dotyka dysku
+            if not dry_run and not chd_path.is_file():
                 continue
             if _already_ok(chd_path, hit[0]):
                 skipped_done += 1
                 st.ok_layout += 1
+                continue
+            verdict = _header_verdict(chd_path, hit)
+            if verdict is True:
+                _mark_ok(chd_path, hit[0])
+                skipped_done += 1
+                st.ok_layout += 1
+                continue
+            if verdict is None and dry_run:
+                unknown += 1
                 continue
             targets.append((chd_path, hit[1].name, hit))
 
@@ -555,6 +690,8 @@ def rebuild_bad_chds(
         f"układem — linie „ODBUDOWA”)"
         + (f"; {skipped_done} już potwierdzonych jako OK — pominięte"
            if skipped_done else "")
+        + (f"; {unknown} bez zapisanego nagłówka — sprawdzi je naprawa "
+           f"(albo najbliższy skan)" if unknown else "")
         + (f" w {len(_bydir)} katalogach:" if _bydir else "."))
     for d, n in sorted(_bydir.items(), key=lambda kv: -kv[1]):
         log(f"  {n:5}  {d}")
@@ -568,6 +705,18 @@ def rebuild_bad_chds(
             on_progress(_prog["done"], _prog["total"] or 1,
                         f"CHD wg cue: {game_name}")
         kind, _g, data, cue_rom = hit
+        if dry_run:
+            # PODGLĄD z indeksu (nagłówek zapisany przy skanie) — bez NAS
+            st.checked += 1
+            st.rebuilt += 1
+            trk, _cdt = (index.chd_header(chd_path) if index is not None
+                         else (-1, -1))
+            what = ("CD→DVD" if kind == "dvd"
+                    else f"(ścieżki w CHD: {trk}, w DAT: {len(data)})")
+            log(f"ODBUDOWA {what}: {chd_path}  →  {chd_path} (w miejscu)  "
+                f"[{game_name}] (podgląd)")
+            _tick(game_name)
+            continue
         fed = _dispatch(chd_path, game_name, kind, data, cue_rom)
         if not fed:                  # seryjnie/pominięte → licznik od razu
             _tick(game_name)         # (oddane do potoku podbije release)
@@ -581,15 +730,66 @@ def rebuild_bad_chds(
     return st
 
 
+def _local_source(chd_path: Path, tmp: Path, dp, log: LogCB) -> Path:
+    """Kopia CAŁEGO CHD do scratchu (RAM) jednym strumieniem, dużymi blokami —
+    ZANIM chdman go rozpakuje. chdman czyta CHD kawałkami (hunk po hunku), a przez
+    internet (Tailscale, 33 ms na odczyt) to 39 MB/s wyjścia zamiast 101 MB/s
+    lokalnie (pomiar na PS2). Kopia na NAS-owym dysku lokalnym i tak nic nie
+    kosztuje. Gdy kopia się nie uda (poza zerwaniem NAS, które netguard przeczeka)
+    — czytamy wprost z NAS jak dawniej. Budżet `need` (×3,2) mieści kopię: znika
+    zaraz po ekstrakcji, przed powstaniem obrazu i nowego CHD."""
+    from . import netguard
+    from .fileops import copy_parallel
+    local = tmp / ("src_" + chd_path.name)
+
+    def _cb(done, total, label):
+        if dp is not None:
+            dp((done * 100.0 / total) if total else -1, label)
+    try:
+        netguard.call(lambda: copy_parallel(
+            chd_path, local, _cb, f"pobieram {chd_path.name}"),
+            chd_path, what=f"pobieranie {chd_path.name}")
+        return local
+    except OSError as e:
+        log(f"   kopia lokalna nieudana ({e}) — czytam wprost z NAS")
+        local.unlink(missing_ok=True)
+        return chd_path
+
+
+def _drop_local(src: Path, chd_path: Path) -> None:
+    """Usuń lokalną kopię CHD (zwolnij RAM przed kolejnymi etapami)."""
+    if src != chd_path:
+        src.unlink(missing_ok=True)
+
+
+def _sha1_file(path: Path) -> str:
+    """SHA-1 pliku strumieniowo (nie `read_bytes()` — cały tor w pamięci)."""
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(1 << 22)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
 def _prep_dvd(chd_path: Path, game_name: str, iso_rom, tmp: Path, chd, log: LogCB,
-              dp) -> tuple:
+              dp, local: Optional[Path] = None) -> tuple:
     """Ekstrakcja CHD (CD-typed) → deframe 2352→2048 → weryfikacja SHA-1 obrazu
     z DAT-em. Zwraca (iso_path w tmp/split | None, outcome): outcome '' = OK,
     'errors' / 'verify_failed'. NIE podaje cancel do chdman — rozpoczęta operacja
     ma się DOKOŃCZYĆ (przerwanie zatrzymuje dopiero start następnej gry)."""
     from . import imageops
     raw = tmp / (game_name + ".cue")
-    res = chd.extract("extractcd", chd_path, raw, cancel_event=None, on_progress=dp)
+    # `local` — kopia pobrana już w etapie POBIERANIA potoku; bez niej (tryb
+    # seryjny) pobieramy tutaj
+    src = local if local is not None else _local_source(chd_path, tmp, dp, log)
+    try:
+        res = chd.extract("extractcd", src, raw, cancel_event=None,
+                          on_progress=dp)
+    finally:
+        _drop_local(src, chd_path)
     if not res.ok:
         log("   ekstrakcja nieudana")
         return None, "errors"
@@ -604,8 +804,13 @@ def _prep_dvd(chd_path: Path, game_name: str, iso_rom, tmp: Path, chd, log: LogC
     split = tmp / "split"
     split.mkdir(exist_ok=True)
     iso = split / iso_rom.name
-    imageops.bin_to_iso(cue.bin_path, cue.sector_size, iso)
-    got = hashlib.sha1(iso.read_bytes()).hexdigest()
+    # SHA-1 obrazu W LOCIE przy deframingu (bez drugiego odczytu i bez całego
+    # obrazu w pamięci programu), surowy .bin kasowany od razu — zwalnia RAM
+    # przed createdvd
+    h = hashlib.sha1()
+    imageops.bin_to_iso(cue.bin_path, cue.sector_size, iso, hasher=h)
+    cue.bin_path.unlink(missing_ok=True)
+    got = h.hexdigest()
     if got != iso_rom.sha1.lower():
         log("   SHA-1 obrazu po deframe nie zgadza się z DAT-em — pomijam")
         return None, "verify_failed"
@@ -613,16 +818,20 @@ def _prep_dvd(chd_path: Path, game_name: str, iso_rom, tmp: Path, chd, log: LogC
 
 
 def _prep_cd(chd_path: Path, game_name: str, data, cue_rom, cue_bytes: bytes,
-             tmp: Path, chd, log: LogCB, dp) -> tuple:
+             tmp: Path, chd, log: LogCB, dp, local: Optional[Path] = None) -> tuple:
     """Ekstrakcja CHD (extractcd -sb) → podział wg DAT-a + weryfikacja SHA-1 +
     cue z biblioteki. Zwraca (cue_path | None, split_dir | None, outcome).
     NIE podaje cancel do chdman (patrz `_prep_dvd`)."""
     raw = tmp / (game_name + ".cue")
-    res = chd.extract("extractcd", chd_path, raw, cancel_event=None,
-                      extra_args=["-sb"], on_progress=dp)
-    if not res.ok:
-        res = chd.extract("extractcd", chd_path, raw, cancel_event=None,
-                          on_progress=dp)
+    src = local if local is not None else _local_source(chd_path, tmp, dp, log)
+    try:
+        res = chd.extract("extractcd", src, raw, cancel_event=None,
+                          extra_args=["-sb"], on_progress=dp)
+        if not res.ok:
+            res = chd.extract("extractcd", src, raw, cancel_event=None,
+                              on_progress=dp)
+    finally:
+        _drop_local(src, chd_path)
     if not res.ok:
         log("   ekstrakcja nieudana")
         return None, None, "errors"
@@ -631,10 +840,11 @@ def _prep_cd(chd_path: Path, game_name: str, data, cue_rom, cue_bytes: bytes,
     split.mkdir(exist_ok=True)
     if len(bins) == 1:
         tracks = _write_split_by_dat(bins[0], data, split, log)
+        bins[0].unlink(missing_ok=True)       # sklejony bin zbędny — zwolnij RAM
     elif len(bins) == len(data):
         tracks = []
         for b, rom in zip(bins, data):
-            h = hashlib.sha1(b.read_bytes()).hexdigest()
+            h = _sha1_file(b)
             if h != rom.sha1.lower():
                 tracks = None
                 log(f"   {b.name}: suma nie zgadza się z DAT-em")
@@ -673,7 +883,8 @@ def _rebuild_dvd_one(chd_path: Path, game_name: str, iso_rom, chd, settings,
             except Exception:
                 pass
         return
-    log(f"ODBUDOWA CD→DVD: {chd_path.name} [{game_name}]")
+    log(f"ODBUDOWA CD→DVD: {chd_path}  →  {chd_path} (w miejscu)  "
+        f"[{game_name}]")
     if dry_run:
         st.rebuilt += 1
         return
@@ -749,7 +960,7 @@ def _rebuild_one(chd_path: Path, game_name: str, data, cue_rom, lib, chd,
         log(f"BRAK CUE w bibliotece: {game_name}")
         return
     log(f"ODBUDOWA (ścieżki w CHD: {n_chd}, w DAT: {len(data)}): "
-        f"{chd_path.name} [{game_name}]")
+        f"{chd_path}  →  {chd_path} (w miejscu)  [{game_name}]")
     if dry_run:
         st.rebuilt += 1
         return

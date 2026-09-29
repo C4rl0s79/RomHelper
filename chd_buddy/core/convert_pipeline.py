@@ -8,10 +8,19 @@ Zasady bezpieczeństwa (twarde):
   rodzic→dziecko: rodzic sfinalizowany przed dzieckiem).
 - FINALIZACJA (zapisy do indeksu/SQLite, kasowanie źródeł, callbacki) wykonuje
   WYŁĄCZNIE wątek WŁAŚCICIELA (feed/wait/drain) — SQLite jest jednowątkowe.
-- BUDŻET RAM (bajty): feed() blokuje, aż zwolni się miejsce; miejsce zwalnia
-  finalizacja (plik zszedł na NAS, katalog roboczy skasowany). Aby uniknąć
-  zakleszczenia, feed() W TRAKCIE czekania FINALIZUJE gotowe zadania (to one
-  zwalniają budżet).
+- BUDŻET RAM (bajty) rezerwuje WĄTEK POBIERANIA w chwili, gdy BIERZE zadanie
+  (nie feed() przy zleceniu). Dawniej gry czekające w kolejce do jedynego wątku
+  pobierania trzymały już swój budżet → nowe zlecenia stały, choć RAM był pusty
+  (log PS2: 5 min przestoju). Miejsce zwalnia finalizacja (plik zszedł na NAS,
+  katalog roboczy skasowany).
+- KOLEJKA ZLECEŃ ograniczona LICZBĄ (nie RAM-em): feed() blokuje, gdy czeka już
+  `gather_workers + 1` niepobranych zadań, i w trakcie czekania FINALIZUJE gotowe
+  (to one zwalniają budżet) — brak zakleszczenia.
+- POBIERANIE: domyślnie JEDNO naraz (`gather_workers=1`, ustawienie
+  `download_workers`) — potok „na zakładkę": plik N+1 pobiera się, gdy N się
+  przerabia, a N-1 wysyła. Kilka wątków pobierania jest możliwe, ale dzieli
+  łącze. W trybie `ordered` zawsze 1 (FIFO — inaczej późniejsze zadanie mogłoby
+  zająć budżet przed głową kolejki = zakleszczenie).
 
 Koordynator jest GENERYCZNY (bez wiedzy o chdman/NAS) — operacje wstrzykiwane
 jako funkcje, więc daje się w całości przetestować na atrapach.
@@ -36,6 +45,7 @@ class _Job:
     result: Any = None
     failed_stage: str = ""
     error: str = ""
+    reserved: bool = False          # budżet zarezerwowany przez wątek pobierania
     done: threading.Event = field(default_factory=threading.Event)
 
 
@@ -55,7 +65,8 @@ class StagePipeline:
     def __init__(self, *, gather: Callable, build: Callable, upload: Callable,
                  finalize: Callable, release: Optional[Callable] = None,
                  ram_budget: int = 0, log: Optional[Callable] = None,
-                 cancel=None, build_workers: int = 1, ordered: bool = True):
+                 cancel=None, build_workers: int = 1, ordered: bool = True,
+                 gather_workers: int = 1):
         self._gather = gather
         self._build = build
         self._upload = upload
@@ -72,6 +83,14 @@ class StagePipeline:
         self._build_workers = max(1, int(build_workers))
         self._ordered = bool(ordered)
         self._build_live = self._build_workers
+        self._build_active = 0             # kompresje TRWAJĄCE teraz (wątki chdman)
+        # RÓWNOLEGŁE POBIERANIE — tylko bez zależności kolejnościowych (patrz
+        # docstring modułu: ordered + wiele pobierających = zakleszczenie budżetu)
+        self._gather_workers = (1 if self._ordered
+                                else max(1, int(gather_workers)))
+        self._gather_live = self._gather_workers
+        self._queued = 0                   # zlecone, jeszcze nie wzięte do pobrania
+        self._max_backlog = self._gather_workers + 1
 
         self._q_in: "Queue" = Queue()      # feed → gather
         self._q_gb: "Queue" = Queue()      # gather → build (N konsumentów)
@@ -91,9 +110,10 @@ class StagePipeline:
         if self._started:
             return
         self._started = True
-        # gather (1) + N × build (każdy z własnym SLOTEM 0..N-1 na osobny pasek
+        # M × gather + N × build (każdy z własnym SLOTEM 0..N-1 na osobny pasek
         # postępu) + upload (1)
-        targets = [self._gather_loop]
+        targets = [lambda i=i: self._gather_loop(i)
+                   for i in range(self._gather_workers)]
         targets += [lambda i=i: self._build_loop(i)
                     for i in range(self._build_workers)]
         targets.append(self._upload_loop)
@@ -103,27 +123,36 @@ class StagePipeline:
             self._threads.append(t)
 
     def feed(self, payload: Any, cost: int = 0) -> _Job:
-        """Zgłasza zadanie (w kolejności). Blokuje, aż budżet RAM zmieści `cost`
-        (w międzyczasie finalizuje gotowe zadania, by zwolnić miejsce)."""
+        """Zgłasza zadanie (w kolejności). Blokuje, gdy kolejka niepobranych
+        zadań jest pełna (w międzyczasie finalizuje gotowe — to one zwalniają
+        budżet RAM, na który czekają wątki pobierania). Budżet `cost`
+        rezerwuje dopiero wątek pobierania (`_admit`)."""
         if not self._started:
             self.start()
         job = _Job(seq=self._seq, payload=payload, cost=max(0, int(cost)))
         self._seq += 1
         with self._cv:
             self._pending.append(job)
-        self._reserve(job.cost)
+            while (self._queued >= self._max_backlog
+                   and not self._is_cancelled()):
+                if not self._drain_ready_locked():
+                    self._cv.wait(timeout=0.5)
+            self._queued += 1
+            self._drain_ready_locked()     # przy okazji: domknij gotowe
         self._q_in.put(job)
         return job
 
-    def _reserve(self, cost: int) -> None:
+    def _admit(self, job: _Job) -> None:
+        """WĄTEK POBIERANIA: czekaj, aż budżet RAM zmieści zadanie, i zarezerwuj.
+        „Zawsze wpuść jedno" (used == 0) — zadanie większe niż budżet idzie samo.
+        Budżet zwalnia finalizacja w wątku właściciela (feed/wait/drain)."""
         with self._cv:
             while (self._ram_budget > 0 and self._used > 0
-                   and self._used + cost > self._ram_budget
+                   and self._used + job.cost > self._ram_budget
                    and not self._is_cancelled()):
-                # finalizuj gotowe (zwalnia budżet); jeśli nic gotowe — czekaj
-                if not self._drain_ready_locked():
-                    self._cv.wait(timeout=0.5)
-            self._used += cost
+                self._cv.wait(timeout=0.5)
+            self._used += job.cost
+            job.reserved = True
 
     def _free_locked(self, cost: int) -> None:
         self._used = max(0, self._used - cost)
@@ -168,40 +197,48 @@ class StagePipeline:
                     self._log(f"release: BŁĄD {e}")
             finally:
                 self._cv.acquire()
-            self._free_locked(job.cost)
+            if job.reserved:
+                self._free_locked(job.cost)
+            else:
+                self._cv.notify_all()
             did = True
         return did
 
     def wait(self, job: _Job) -> None:
         """Blokuje, aż DANE zadanie przejdzie upload, i finalizuje po kolei do
-        niego włącznie (zależność rodzic→dziecko)."""
-        job.done.wait()
+        niego włącznie (zależność rodzic→dziecko). W międzyczasie finalizuje
+        KAŻDE gotowe — dane zadanie może czekać na budżet RAM trzymany przez
+        zadania już ukończone, a niesfinalizowane (inaczej zakleszczenie)."""
         with self._cv:
-            self._drain_ready_locked()
+            while True:
+                self._drain_ready_locked()
+                if job not in self._pending:
+                    return
+                self._cv.wait(timeout=0.5)
 
     def drain(self) -> None:
-        """Czeka na wszystkie zgłoszone zadania i finalizuje je po kolei."""
-        while True:
-            with self._cv:
-                if not self._pending:
-                    return
-                head = self._pending[0]
-            head.done.wait()
-            with self._cv:
-                self._drain_ready_locked()
+        """Czeka na wszystkie zgłoszone zadania i finalizuje je (ordered — po
+        kolei). NIE czeka na głowę kolejki: bez `ordered` głowa może czekać na
+        budżet RAM, który zwolni dopiero finalizacja zadań za nią."""
+        with self._cv:
+            while self._pending:
+                if not self._drain_ready_locked():
+                    self._cv.wait(timeout=0.5)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._q_in.put(_STOP)
+        for _ in range(self._gather_workers):
+            self._q_in.put(_STOP)
         for t in self._threads:
             t.join(timeout=30)
 
     # --- wątki etapów (FIFO, STOP propaguje łańcuchem) ---------------------
 
     def _run_stage(self, in_q: "Queue", out_q: Optional["Queue"], fn,
-                   stage: str, on_stop: Optional[Callable] = None) -> None:
+                   stage: str, on_stop: Optional[Callable] = None,
+                   on_take: Optional[Callable] = None) -> None:
         while True:
             item = in_q.get()
             if item is _STOP:
@@ -211,6 +248,8 @@ class StagePipeline:
                     out_q.put(_STOP)
                 return
             job = item
+            if on_take is not None:
+                on_take(job)
             if not job.failed_stage and not self._is_cancelled():
                 try:
                     val = fn(job)
@@ -229,23 +268,56 @@ class StagePipeline:
                 with self._cv:
                     self._cv.notify_all()
 
-    def _gather_loop(self) -> None:
+    def _gather_loop(self, gather_idx: int = 0) -> None:
+        def _take(job):
+            # zadanie zeszło z kolejki zleceń → feed() może zlecić następne
+            with self._cv:
+                self._queued = max(0, self._queued - 1)
+                self._cv.notify_all()
+
         def _do(job):
+            self._admit(job)               # budżet RAM dopiero TERAZ
+            if self._is_cancelled():
+                return None
+            # WŁASNY pasek postępu pobierania: numery ZA paskami kompresji
+            # (build ma 0..N-1), więc równoległe pobierania nie piszą na jeden
+            if isinstance(job.payload, dict):
+                job.payload["_gather_slot"] = self._build_workers + gather_idx
             job.gathered = self._gather(job.payload)
             return job.gathered
-        # jeden STOP z feed() → po jednym dla KAŻDEGO wątku build
+        # ostatni żywy wątek pobierania → po jednym STOP dla KAŻDEGO wątku build
         def _on_stop():
-            for _ in range(self._build_workers):
-                self._q_gb.put(_STOP)
-        self._run_stage(self._q_in, self._q_gb, _do, "gather", on_stop=_on_stop)
+            with self._cv:
+                self._gather_live -= 1
+                last = self._gather_live == 0
+            if last:
+                for _ in range(self._build_workers):
+                    self._q_gb.put(_STOP)
+        self._run_stage(self._q_in, self._q_gb, _do, "gather", on_stop=_on_stop,
+                        on_take=_take)
 
     def _build_loop(self, slot_idx: int = 0) -> None:
         def _do(job):
             # przekaż numer SLOTU (pasek postępu) do fazy build przez payload,
             # nie zmieniając generycznego kontraktu build(payload, gathered)
+            # ILE KOMPRESJI TRWA NAPRAWDĘ (z tą) — faza build dzieli pulę wątków
+            # chdman wg tej liczby. Dawniej podział był z góry „na 4 równoległe",
+            # a przy jednym pobraniu naraz przez wolne łącze kompresja szła
+            # zwykle SAMA na 1–2 wątkach (CPU 8%, user).
+            with self._cv:
+                self._build_active += 1
+                active = self._build_active
             if isinstance(job.payload, dict):
                 job.payload["_pipe_slot"] = slot_idx
-            job.built = self._build(job.payload, job.gathered)
+                job.payload["_pipe_active"] = active
+                # liczba trwających W DANEJ CHWILI — faza build pyta tuż przed
+                # samą kompresją (wcześniej robi jednowątkowe rozpakowanie)
+                job.payload["_pipe_active_fn"] = lambda: self._build_active
+            try:
+                job.built = self._build(job.payload, job.gathered)
+            finally:
+                with self._cv:
+                    self._build_active -= 1
             return job.built
         # ostatni żywy wątek build przekazuje STOP do uploadu (tylko raz)
         def _on_stop():

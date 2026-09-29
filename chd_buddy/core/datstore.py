@@ -210,6 +210,36 @@ def group_by_platform(entries: list, rules=None, dat_root=None) -> "dict[str, li
     return out
 
 
+def _find_dats(root: Path, log=None, cancel=None) -> list:
+    """Wszystkie *.dat pod `root` — JEDEN obchód scandir: typ pliku z listingu
+    katalogu (bez `is_file` per plik = runda SMB na DAT), postęp w logu co ~3 s.
+    Wcześniej `rglob` + `is_file` na NAS: ~35 s ciszy przy 609 DAT-ach."""
+    import time
+    out: list = []
+    stack = [str(root)]
+    last = time.monotonic()
+    ndirs = 0
+    while stack:
+        if cancel is not None and cancel.is_set():
+            break
+        d = stack.pop()
+        ndirs += 1
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.name.lower().endswith(".dat") and e.is_file():
+                        out.append(Path(e.path))
+        except OSError:
+            continue
+        if log and time.monotonic() - last >= 3.0:
+            last = time.monotonic()
+            log(f"   …szukam DAT-ów: {len(out)} znalezionych, {ndirs} katalogów "
+                f"(teraz: {d})")
+    return sorted(out)
+
+
 class DatStore:
     """Odkrywa DAT-y w dat_root i mapuje je na katalogi w rom_root."""
 
@@ -262,12 +292,17 @@ class DatStore:
             except OSError:
                 return f, None
 
+        import time as _time
         sigs: dict[Path, tuple] = {}
         if nw > 1 and len(files) > 1:
+            _last = _time.monotonic()
             with ThreadPoolExecutor(max_workers=nw) as ex:
-                for f, s in ex.map(_one, files):
+                for i, (f, s) in enumerate(ex.map(_one, files), 1):
                     if s is not None:
                         sigs[f] = s
+                    if log and _time.monotonic() - _last >= 3.0:
+                        _last = _time.monotonic()
+                        log(f"   …sygnatury DAT-ów: {i}/{len(files)} ({f.name})")
         else:
             for f in files:
                 _, s = _one(f)
@@ -440,7 +475,7 @@ class DatStore:
             raise NotADirectoryError(f"'{self.dat_root}' nie jest katalogiem")
         if log:
             log("Wczytuję DAT-y: szukam plików .dat…")
-        files = [f for f in sorted(self.dat_root.rglob("*.dat")) if f.is_file()]
+        files = _find_dats(self.dat_root, log=log, cancel=cancel)
         if _cancelled():
             return []
 
@@ -527,6 +562,10 @@ class DatStore:
             e.games = games                            # już sparsowane
             e.meta = sidecars.get(str(dat.parent), {}).get(dat.name, {})
             entries.append(e)
+            # DAT-y to miliony obiektów na cały czas życia programu — zamroź
+            # przed pełnym GC (pauza całego programu do ~1,5 s przy starcie)
+            from .gcpause import settle
+            settle()
 
         if cache is not None:
             cache.prune({str(Path(os.path.abspath(f))) for f in files})

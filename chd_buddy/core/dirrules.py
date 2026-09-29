@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 RULES_FILENAME = "_reguly.json"
 
@@ -96,6 +96,10 @@ ES_FOLDER: dict[str, str] = {
 }
 
 # Systemy PŁYTOWE (format auto → CHD, poza GameCube/Wii → RVZ).
+# Płytowe systemy, których emulatory NIE czytają CHD (RPCS3, Xemu, Xenia) —
+# „auto" zostawia obraz jak jest (ISO); zip tylko z jawnej reguły „archiwum".
+NO_CHD_DISC_SYSTEMS = {"PS3", "XBOX", "X360"}
+
 DISC_SYSTEMS = {"PS1", "PS2", "PS3", "PSP", "SATURN", "DC", "NAOMI", "3DO",
                 "PCENGINE", "NEOGEOCD", "SEGACD", "MEGACD", "GCN", "WII"}
 
@@ -145,7 +149,9 @@ def suggest_format(system_short: str) -> str:
     s = (system_short or "").upper()
     if s in ("GCN", "WII"):
         return "rvz"
-    disc = {"PS1", "PS2", "PS3", "PSP", "SATURN", "DC", "NAOMI", "MEGACD",
+    if s in NO_CHD_DISC_SYSTEMS:
+        return "keep"                # ISO — emulator nie czyta CHD ani zipa
+    disc = {"PS1", "PS2", "PSP", "SATURN", "DC", "NAOMI", "MEGACD",
             "SEGACD", "PCECD", "3DO", "NEOGEOCD"}
     if s in disc:
         return "chd"
@@ -215,6 +221,8 @@ def resolve_format(fmt: str, entry) -> str:
     short = _system_short(entry)
     if short in ("GCN", "WII"):
         return "rvz"
+    if short in NO_CHD_DISC_SYSTEMS:
+        return "keep"          # ISO jak jest (RPCS3/Xemu/Xenia bez CHD i zipa)
     if short in DISC_SYSTEMS:
         # system „płytowy", ale DAT może być kartridżowy (PC Engine HuCard) —
         # sprawdź treść: brak plików płytowych → ZIP, nie CHD.
@@ -414,7 +422,38 @@ def scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list[str]:
     return out
 
 
-def platform_scan_dirs(entries, rules: DirRules, rom_root) -> list[str]:
+class DirExists:
+    """Istnienie katalogów z LISTINGU rodzica: jeden `scandir` na katalog
+    nadrzędny (cache na czas zadania) zamiast `is_dir` per kandydat. Kandydatów
+    jest ~3 na DAT (target, Redump, ES) × 600 DAT-ów, a rodziców kilka — na NAS
+    to różnica minut ciszy („Analizuję rozmiary…", „Ustalam katalogi…")."""
+
+    def __init__(self) -> None:
+        self._kids: dict = {}
+
+    def children(self, parent) -> Optional[dict]:
+        """{normcase(nazwa): (nazwa, pełna ścieżka)} podkatalogów; None gdy
+        rodzica nie ma / nieczytelny."""
+        k = os.path.normcase(os.path.abspath(str(parent)))
+        if k not in self._kids:
+            try:
+                with os.scandir(parent) as it:
+                    self._kids[k] = {os.path.normcase(e.name): (e.name, e.path)
+                                     for e in it if e.is_dir()}
+            except OSError:
+                self._kids[k] = None
+        return self._kids[k]
+
+    def is_dir(self, path) -> bool:
+        p = Path(os.path.abspath(str(path)))
+        if p.parent == p:                      # korzeń woluminu
+            return p.is_dir()
+        kids = self.children(p.parent)
+        return kids is not None and os.path.normcase(p.name) in kids
+
+
+def platform_scan_dirs(entries, rules: DirRules, rom_root,
+                       dirs: Optional[DirExists] = None) -> list[str]:
     """Istniejące katalogi-kandydaci dla platform danych `entries`, w OBU
     znanych konwencjach nazw, cel SKONFIGUROWANY pierwszy:
 
@@ -428,6 +467,7 @@ def platform_scan_dirs(entries, rules: DirRules, rom_root) -> list[str]:
     preferencja: gdy nie ma katalogu wybranej konwencji (np. „PS2"), ale jest
     drugiej („Sony - PlayStation 2"), użyty zostanie ten istniejący.
     """
+    dirs = dirs or DirExists()
     out: list[str] = []
     seen: set[str] = set()
 
@@ -436,7 +476,7 @@ def platform_scan_dirs(entries, rules: DirRules, rom_root) -> list[str]:
             return
         path = Path(p)
         key = os.path.normcase(str(path))
-        if key in seen or not path.is_dir():
+        if key in seen or not dirs.is_dir(path):
             return
         seen.add(key)
         out.append(str(path))
@@ -450,7 +490,8 @@ def platform_scan_dirs(entries, rules: DirRules, rom_root) -> list[str]:
     return out
 
 
-def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list[str]:
+def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None,
+                        dirs: Optional[DirExists] = None) -> list[str]:
     """Katalogi do skanu = katalogi WŁĄCZONYCH platform (obie konwencje,
     istniejące) + ToSort + nadpisania rom_root. NIE cały rom_root.
 
@@ -461,7 +502,8 @@ def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list
     że skan używał wyłącznie nieistniejącego target=<nazwa DAT-a>; teraz realne
     katalogi (ps2/psx itd.) są znajdowane wprost, bez przemiatania obcych.
     """
-    out: list[str] = list(platform_scan_dirs(entries, rules, rom_root))
+    dirs = dirs or DirExists()
+    out: list[str] = list(platform_scan_dirs(entries, rules, rom_root, dirs))
     seen: set[str] = {os.path.normcase(p) for p in out}
 
     def add(p) -> None:
@@ -469,7 +511,7 @@ def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list
             return
         path = Path(p)
         key = os.path.normcase(str(path))
-        if key in seen or not path.is_dir():
+        if key in seen or not dirs.is_dir(path):
             return
         seen.add(key)
         out.append(str(path))
@@ -484,7 +526,8 @@ def platform_scan_roots(entries, rules: DirRules, rom_root, tosort=None) -> list
     return out
 
 
-def stray_dirs(entries, rules: DirRules, rom_root) -> list[str]:
+def stray_dirs(entries, rules: DirRules, rom_root,
+               dirs: Optional[DirExists] = None) -> list[str]:
     """Foldery-SIEROTY pod rom_root: rodzeństwo zarządzanych platform, które NIE
     jest targetem/kandydatem (ES/Redump) ani przodkiem żadnego DAT-u.
 
@@ -526,23 +569,19 @@ def stray_dirs(entries, rules: DirRules, rom_root) -> list[str]:
                if an == base_n or an.startswith(base_n.rstrip("\\/") + os.sep)]
     out: list[str] = []
     seen: set[str] = set()
+    dirs = dirs or DirExists()
     for d in sorted(parents, key=lambda p: len(str(p))):
-        if not d.is_dir():
+        kids = dirs.children(d)             # listing z cache (1 scandir)
+        if kids is None:
             continue
-        try:
-            kids = list(os.scandir(d))
-        except OSError:
-            continue
-        for ent in kids:
-            if not ent.is_dir():
-                continue
-            cn = ncase(os.path.abspath(ent.path))
+        for _nk, (name, kpath) in kids.items():
+            cn = ncase(os.path.abspath(kpath))
             if cn in managed or cn in anc_norm or cn == base_n or cn in seen:
                 continue
-            if ent.name.lower() in SKIP:
+            if name.lower() in SKIP:
                 continue
             seen.add(cn)
-            out.append(str(Path(os.path.abspath(ent.path))))
+            out.append(str(Path(os.path.abspath(kpath))))
     return out
 
 
@@ -622,3 +661,19 @@ def apply_rule_targets(entries, rules: DirRules, rom_root, log=None) -> None:
         if fmt:                                        # jawny format platformy
             e.store_format = fmt
         # inaczej zostaje wynik pierwszej pętli (brak reguły => keep)
+        e._fmt_applied = True       # store_format = JEDYNE źródło formatu
+
+
+def effective_format(entry, eff: dict) -> str:
+    """Format DAT-u — TEN SAM dla matchera, rebuildera i konwersji.
+
+    Po `apply_rule_targets` to `entry.store_format` (z formatem PER PLATFORMA:
+    dziecko dziedziczy jawny format rodzica). Wyliczanie od nowa z reguły
+    SAMEGO DAT-u (`resolve_format(eff["format"])`) dawało dzieciom INNY format:
+    np. PSP PSN (Decrypted) z regułą „auto" → zip, a platforma PSP (ROMS\\psp)
+    ma CHD → matcher szukał CHD i planował wypakowanie, a konwersja przepakowanie
+    do zipa (130 gier: pobranie + kompresja + wysyłka zamiast przeniesienia).
+    Bez `apply_rule_targets` (np. testy z samym rules_fn) — z reguły."""
+    if getattr(entry, "_fmt_applied", False):
+        return getattr(entry, "store_format", "keep") or "keep"
+    return resolve_format((eff or {}).get("format", "keep"), entry)

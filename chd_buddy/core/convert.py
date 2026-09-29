@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from . import netguard
 from .fileindex import hash_file
 
 LogCB = Callable[[str], None]
@@ -536,7 +537,7 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
     w formacie docelowym). Weryfikacja w każdej konwersji; źródło kasowane
     dopiero po sukcesie.
     """
-    from .dirrules import resolve_format
+    from .dirrules import effective_format, resolve_format  # noqa: F401
     st = ConvertStats()
     # ODROCZONE kasowanie źródeł: gry WIELOPŁYTOWE współdzielą ścieżki (np. audio
     # CDDA) — konwersja płyty 1 nie może skasować ścieżki, której potrzebuje
@@ -553,7 +554,7 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
         eff = rules_fn(rep.entry)
         if eff.get("skip"):
             continue
-        fmt = resolve_format(eff.get("format", "keep"), rep.entry)
+        fmt = effective_format(rep.entry, eff)
         if fmt in ("keep", "", "extract"):
             continue
         subdir = bool(eff.get("subdir_per_game", True))
@@ -680,7 +681,41 @@ def purge_temp_artifacts(roots, *, dry_run: bool = False,
     return n, size
 
 
-def _gather_track_to_ram(status, ram_dir: Path, log: LogCB) -> Optional[Path]:
+# Archiwa, których skład w INDEKSIE okazał się nieaktualny (członek z indeksu
+# nie istnieje w pliku). Zbierane w wątkach potoku, odświeżane w wątku
+# WŁAŚCICIELA na końcu konwersji katalogu (SQLite jednowątkowe).
+import threading as _threading
+_STALE_ARCHIVES: set = set()
+_STALE_LOCK = _threading.Lock()
+
+
+def _refresh_stale_archives(index, log: LogCB) -> None:
+    with _STALE_LOCK:
+        stale = sorted(_STALE_ARCHIVES)
+        _STALE_ARCHIVES.clear()
+    for a in stale:
+        try:
+            index.reindex_archive(a, full=True)
+            log(f"  indeks odświeżony (nieaktualny skład archiwum): {a}")
+        except OSError as e:
+            log(f"  nie odświeżono indeksu {a}: {e}")
+
+
+def _copy_stream(fi, out, total: int, label: str, progress, chunk: int) -> None:
+    """Kopia strumienia blokami z postępem progress(done, total, label)."""
+    done = 0
+    while True:
+        b = fi.read(chunk)
+        if not b:
+            break
+        out.write(b)
+        done += len(b)
+        if progress is not None:
+            progress(done, total, label)
+
+
+def _gather_track_to_ram(status, ram_dir: Path, log: LogCB,
+                         progress=None) -> Optional[Path]:
     """Kopiuje/wypakowuje JEDNĄ ścieżkę gry ze źródła (ToSort) na RAM i
     weryfikuje SHA-1 z DAT-em. Zwraca ścieżkę na RAM albo None (błąd/niezgoda).
     Docelowy katalog kolekcji NIGDY nie jest dotykany."""
@@ -689,19 +724,36 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB) -> Optional[Path]:
     dst = ram_dir / rom.name
     dst.parent.mkdir(parents=True, exist_ok=True)
     src = Path(status.source_path) if status.source_path else None
-    if src is None or not src.exists():
+    exists = src is not None and src.exists()
+    if src is not None and not exists and not netguard.alive(src):
+        # „nie istnieje", bo NAS zniknął (uśpienie) — czekaj i sprawdź ponownie
+        exists = netguard.wait_until_back([src]) and src.exists()
+    if not exists:
         log(f"  źródło ścieżki {rom.name} nie istnieje")
         return None
-    try:
+
+    _lbl = f"pobieranie {rom.name}"
+
+    def _fetch() -> None:
         if status.member:                       # ścieżka WEWNĄTRZ archiwum
             with zipfile.ZipFile(src) as zf, zf.open(status.member) as fh, \
                     open(dst, "wb") as out:
-                _sh.copyfileobj(fh, out, 4 * 1024 * 1024)
-        else:                                   # luźny plik
-            with open(src, "rb") as fi, open(dst, "wb") as out:
-                _sh.copyfileobj(fi, out, 8 * 1024 * 1024)
+                _copy_stream(fh, out, zf.getinfo(status.member).file_size,
+                             _lbl, progress, 4 * 1024 * 1024)
+        else:                                   # luźny plik — równolegle
+            from .fileops import copy_parallel
+            copy_parallel(src, dst, progress, _lbl)
+    try:
+        # zerwany NAS w trakcie → czekaj na powrót i pobierz od nowa
+        netguard.call(_fetch, src, what=f"pobieranie {rom.name}")
     except (OSError, zipfile.BadZipFile, KeyError) as e:
         log(f"  nie zebrano {rom.name}: {e}")
+        if isinstance(e, KeyError) and status.member:
+            # indeks twierdzi, że archiwum ma tego członka, a plik go nie ma —
+            # skład w indeksie jest stary (np. zip przebudowany bez odświeżenia
+            # członków). Odświeżymy go, żeby następne dopasowanie było trafne.
+            with _STALE_LOCK:
+                _STALE_ARCHIVES.add(str(src))
         return None
     try:
         crc, md5, sha1 = hash_file(dst)
@@ -723,7 +775,7 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB) -> Optional[Path]:
 
 def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
                                    log: LogCB, needed_crc=None,
-                                   kept_shared=None) -> int:
+                                   kept_shared=None, dry_run: bool = False) -> int:
     """Kasuje z ToSort ŹRÓDŁO gry JUŻ zrobionej na CHD (w docelowym): luźne
     pliki ścieżek ORAZ archiwa ZIP/7z zawierające te ścieżki.
 
@@ -733,7 +785,9 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
     (`kept_shared`), resztę kasujemy. Puste podkatalogi po skasowanych torach
     też usuwamy. Symlinki nietknięte. Zwraca ile skasowano.
 
-    Dopasowanie jak w matcherze: po SHA-1, a gdy brak — po CRC32+rozmiar."""
+    Dopasowanie jak w matcherze: po SHA-1, a gdy brak — po CRC32+rozmiar.
+    dry_run — tylko „(podgląd) KASUJ…" (z indeksu, bez NAS): dawniej podgląd
+    w ogóle tego nie pokazywał, więc nie było widać, że zip zostanie."""
     needed_crc = needed_crc or set()
     if kept_shared is None:
         kept_shared = set()
@@ -767,6 +821,12 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
 
         for row in victims:
             p2 = row["path"]
+            if dry_run:
+                n += 1
+                log(f"(podgląd) KASUJ z ToSort ("
+                    f"{'nadmiarowy wspólny tor' if protected else 'gra już na CHD'}"
+                    f"): {p2}")
+                continue
             try:
                 os.unlink(p2)
                 index.remove_path(p2)
@@ -814,6 +874,10 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
                 break
         if protected:
             continue                          # ZIP potrzebny innej grze — zostaw
+        if dry_run:
+            n += 1
+            log(f"(podgląd) KASUJ z ToSort archiwum (gra już na CHD): {ap}")
+            continue
         try:
             os.unlink(ap)
             index.remove_path(ap)
@@ -1062,7 +1126,8 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         dry_run: bool = False, log: LogCB = lambda m: None,
                         cancel=None, on_progress=None, detail=None,
                         on_converted=None, delete_roots=None, make_links=True,
-                        slot=None, hierarchy=None, finals=None):
+                        slot=None, hierarchy=None, finals=None,
+                        only_complete: bool = True):
     """Konwersja PROSTO ZE ŹRÓDŁA na RAM → w docelowym ląduje TYLKO finał.
 
     hierarchy — `Hierarchy` DAT-ów: JEDYNE źródło decyzji „link czy kopia
@@ -1084,7 +1149,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     umie/nie chce ruszyć, zostawia nietknięte (obsłuży zwykły placement +
     stara konwersja) — bezpieczny fallback.
     """
-    from .dirrules import resolve_format
+    from .dirrules import effective_format, resolve_format  # noqa: F401
     from .matcher import RomState
 
     from .datfile import game_profile
@@ -1120,6 +1185,11 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     _needed_sha1: set = set()
     _needed_crc: set = set()
     for _rep in reports:
+        # reguła katalogu nadpisuje opcję globalną (jak w rebuilderze)
+        try:
+            _eff_oc = rules_fn(_rep.entry).get("only_complete", only_complete)
+        except Exception:
+            _eff_oc = only_complete
         _bg: dict = defaultdict(list)
         for _s in _rep.statuses:
             _bg[_s.game].append(_s)
@@ -1127,6 +1197,17 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             unsat = any(_s.state in (RomState.ELSEWHERE, RomState.WRONG_NAME,
                                      RomState.MISSING, RomState.NO_HASH)
                         for _s in _sts)
+            # „TYLKO KOMPLETNE" (opcja naprawy): gra, której brakuje ścieżki
+            # DANYCH (nie ma jej nigdzie), NIGDY nie zostanie zbudowana — jej
+            # tory NIE chronią ToSort. Regresja: Lunar (RE) (50/52 torów
+            # oryginału) blokował skasowanie zipa oryginału, którego treść leży
+            # już w zweryfikowanym CHD. Brak samego cue/gdi się nie liczy (CHD
+            # buduje się z cue w archiwum).
+            if unsat and _eff_oc and any(
+                    _s.state in (RomState.MISSING, RomState.NO_HASH)
+                    and not _s.rom.name.lower().endswith((".cue", ".gdi"))
+                    for _s in _sts):
+                unsat = False
             if unsat:
                 for _s in _sts:
                     if _s.rom.sha1:
@@ -1222,7 +1303,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             _eff = rules_fn(_rep.entry)
             if _eff.get("skip"):
                 continue
-            if resolve_format(_eff.get("format", "keep"), _rep.entry) in (
+            if effective_format(_rep.entry, _eff) in (
                     "keep", "", "extract"):
                 continue
             _pl = _plat_key(_rep.entry)
@@ -1246,28 +1327,30 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             _build_workers = max(1, min(int(_cw), _logical))   # z ustawień
         else:
             _build_workers = max(1, min(8, _logical // 2))     # auto
-        _tools_pipe = tools
-        if _build_workers > 1:
-            _s = tools.get("settings")
-            try:
-                _s2 = _dc.replace(_s, threads=1)   # 1 wątek chdman / zadanie
-                _tools_pipe = dict(tools)
-                _tools_pipe["settings"] = _s2
-            except Exception:
-                _tools_pipe = tools
+        # PULA wątków chdman dzielona w CHWILI startu kompresji wg liczby
+        # faktycznie trwających (`_pipe_active`), nie z góry po 1 na zadanie —
+        # przy jednym pobraniu naraz kompresja zwykle idzie sama i ma dostać
+        # całą pulę (dawniej 1 wątek → CPU 8%).
+        _tools_pipe = dict(tools)
+        _tools_pipe["threads_pool"] = (
+            int(getattr(tools.get("settings"), "threads", 0) or 0)
+            or max(1, min(8, _logical)))
         _pipe = StagePipeline(
-            gather=lambda j: _conv_gather_phase(j, log),
+            gather=lambda j: _conv_gather_phase(j, log, slot),
             build=lambda j, g: _conv_build_phase(j, _tools_pipe, log, detail,
                                                  slot=slot),
             upload=lambda j, b: _conv_upload_phase(j, detail, log),
             finalize=lambda j, r: _conv_finalize_phase(
                 j, r, index, on_converted, st, shared_srcs, deferred, log),
             release=_conv_release, ram_budget=_pipe_ram_budget, log=log,
-            cancel=cancel, build_workers=_build_workers, ordered=False)
+            cancel=cancel, build_workers=_build_workers, ordered=False,
+            gather_workers=max(1, int(getattr(tools.get("settings"),
+                                              "download_workers", 1) or 1)))
         _pipe.start()
         _shared_note = (f"; {len(_shared_profiles)} współdzielonych odcisków "
                         f"seryjnie" if _shared_profiles else "")
-        log(f"Potok konwersji WŁ ({_build_workers} równoległych, budżet RAM "
+        log(f"Potok konwersji WŁ ({_build_workers} równoległych, "
+            f"{_pipe._gather_workers} pobierań naraz, budżet RAM "
             f"{_pipe_ram_budget/1024**3:.1f} GB){_shared_note} — pobieranie i "
             f"wysyłka nakładane na kompresję.")
 
@@ -1277,7 +1360,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
         eff = rules_fn(rep.entry)
         if eff.get("skip"):
             continue
-        fmt = resolve_format(eff.get("format", "keep"), rep.entry)
+        fmt = effective_format(rep.entry, eff)
         if fmt in ("keep", "", "extract"):
             continue
         subdir = bool(eff.get("subdir_per_game", True))
@@ -1300,22 +1383,31 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                     return 0            # źródło w kolekcji → w miejscu (pierwsze)
             return 1                    # ToSort / gdzie indziej / brak → później
 
+        _present = None                 # pliki katalogu (1 listowanie, leniwie)
         for game in sorted(rep.entry.games, key=_in_place_first):
             if cancel is not None and cancel.is_set():
+                break
+            if not netguard.checkpoint(cancel):    # NAS padł → czeka na powrót
                 break
             gi += 1
             sts = by_game.get(game.name, [])
             if not sts:
                 continue
+            if on_progress and (gi % 25 == 0):
+                # widać, która gra i ile zostało — także gdy kolejne gry są
+                # tylko sprawdzane (już na CHD) i nic nie trafia do logu
+                on_progress(gi, n_total, f"konwersja — sprawdzam: {game.name}")
             # POSTĘP PRZERWANEJ NAPRAWY: gra JUŻ ma zweryfikowany <gra>.chd w
             # docelowym (indeks: fizyczny, `data_sha1==game_profile`). Naprawa
             # działa „z przepisu" (raporty z OSTATNIEGO skanu) — po przerwaniu i
             # ponowieniu status bywa nieaktualny („luźna"), więc BEZ tego strażnika
             # budowalibyśmy ten sam CHD od nowa. Indeks jest commitowany na bieżąco
             # (record_file/set_data_sha1), więc żywy check łapie zrobione konwersje.
+            if fmt == "chd" and not dry_run and _present is None:
+                _present = _dir_files(rep.entry.target_dir)
             if (fmt == "chd" and index is not None
                     and _disc_on_verified_chd(game, rep.entry.target_dir,
-                                              index, dry_run)):
+                                              index, dry_run, _present)):
                 done.add(f"{id(rep.entry)}::{game.name}")
                 # KRYTYCZNE: zarejestruj istniejący CHD jako KANONICZNY, inaczej
                 # faza sprzątania (_clean_dir) uzna go za „obcy" i ZMIECIE do
@@ -1323,6 +1415,22 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 # plik. (Regresja 0.6.39: skip bez add_canonical.)
                 if on_converted is not None:
                     on_converted(rep.entry.target_dir / f"{game.name}.chd")
+                # Skrót „już na zweryfikowanym CHD" NIE może pomijać tego, co
+                # robi gałąź HAVE_CHD niżej (regresja: zip Lunara w ToSort nigdy
+                # nie był sprzątany, a CHD nie był rodzicem dla linków 1G1R):
+                # 1) CHD = KEEPER odcisku (dzieci niżej w hierarchii linkują),
+                _prv = game_profile(game.data_roms)
+                if _prv:
+                    final_by_profile.setdefault(
+                        (_plat_key(rep.entry), _prv),
+                        rep.entry.target_dir / f"{game.name}.chd")
+                # 2) źródła tej gry w ToSort są zbędne → sprzątanie (podgląd
+                #    tylko loguje).
+                if del_prefixes:
+                    st.tosort_purged += _purge_redundant_tosort_tracks(
+                        game, index, del_prefixes, _needed_sha1, log,
+                        needed_crc=_needed_crc, kept_shared=_kept_shared,
+                        dry_run=dry_run)
                 continue
             # DYSK w JEDNYM archiwum (cue/gdi + tory) → CHD: buduj CHD WPROST z
             # archiwum jego WŁASNYM cue (nazwy w środku pasują do torów). Ratuje
@@ -1350,7 +1458,19 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                     and len(arch_srcs) == 1
                     and os.path.normcase(_main.source_path)
                     == os.path.normcase(next(iter(arch_srcs))))
-                if (len(arch_srcs) == 1 and miss_cue and _main_ok
+                # KAŻDY tor danych gry musi być DOPASOWANY i leżeć w TYM archiwum.
+                # Inaczej archiwum to INNA płyta dzieląca tory (Lunar (RE) ma 50
+                # z 52 torów oryginału) — dawniej ciągnęliśmy cały zip (430 MB
+                # przez internet) i budowali CHD, który strażnik treści i tak
+                # ODRZUCAŁ — w KAŻDEJ naprawie. Sprawdzenie z indeksu, bez I/O.
+                _arch_nc = (os.path.normcase(next(iter(arch_srcs)))
+                            if len(arch_srcs) == 1 else "")
+                _all_here = bool(_data_sts) and all(
+                    s.state not in (RomState.MISSING, RomState.NO_HASH)
+                    and s.member and s.source_path
+                    and os.path.normcase(s.source_path) == _arch_nc
+                    for s in _data_sts)
+                if (len(arch_srcs) == 1 and miss_cue and _main_ok and _all_here
                         and Path(next(iter(arch_srcs))).suffix.lower()
                         in (".zip", ".7z")):
                     arch = Path(next(iter(arch_srcs)))
@@ -1443,11 +1563,18 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         _needed_sha1, index, log, dry_run)
                 # ALE gdy CHD jest JUŻ w docelowym (HAVE_CHD), a luźne ścieżki
                 # tej gry wciąż leżą w ToSort — posprzątaj je (redundantne).
-                if (del_prefixes and index is not None and not dry_run
-                        and is_havechd):
+                if (del_prefixes and index is not None and is_havechd):
                     st.tosort_purged += _purge_redundant_tosort_tracks(
                         game, index, del_prefixes, _needed_sha1, log,
-                        needed_crc=_needed_crc, kept_shared=_kept_shared)
+                        needed_crc=_needed_crc, kept_shared=_kept_shared,
+                        dry_run=dry_run)
+                continue
+            # DAT „surowy" już W FORMACIE docelowym (np. NKit RVZ: ROM-y to pliki
+            # .rvz z własną sumą) — konwersja nie ma czego robić (RVZ→RVZ dałby
+            # INNE bajty niż w DAT-cie). Nazwa/miejsce/link to robota rebuildera.
+            # Bez tego każda gra GameCube/Wii spoza kanonicznej ścieżki była
+            # pobierana z NAS na RAM (~1,4 GB) tylko po to, by „brak iso — pomijam".
+            if all(r.name.lower().endswith("." + fmt) for r in game.roms):
                 continue
             if all(s.state in (RomState.HAVE, RomState.HAVE_CHD) for s in sts):
                 # NAPRAWA W MIEJSCU: platforma dyskowa (fmt=chd), a KOMPLET gry
@@ -1464,11 +1591,12 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 if not _loose_disc_in_place:
                     # zaspokojona bez konwersji — jeśli przez CHD i luźne kopie
                     # leżą w ToSort, też posprzątaj
-                    if (del_prefixes and index is not None and not dry_run
+                    if (del_prefixes and index is not None
                             and any(s.state == RomState.HAVE_CHD for s in sts)):
                         st.tosort_purged += _purge_redundant_tosort_tracks(
                             game, index, del_prefixes, _needed_sha1, log,
-                            needed_crc=_needed_crc, kept_shared=_kept_shared)
+                            needed_crc=_needed_crc, kept_shared=_kept_shared,
+                            dry_run=dry_run)
                     continue
             if on_progress:
                 on_progress(gi, n_total, f"konwersja (ze źródła): {game.name}")
@@ -1552,7 +1680,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             eff = rules_fn(rep.entry)
             if eff.get("skip"):
                 continue
-            if resolve_format(eff.get("format", "keep"), rep.entry) != "chd":
+            if effective_format(rep.entry, eff) != "chd":
                 continue                 # tylko platformy dyskowe (kanoniczny CHD)
             tdir = rep.entry.target_dir
             _lmap = None                 # mapa luźnych sha1→ścieżki (leniwie, raz)
@@ -1575,6 +1703,8 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     # dopiero KONIEC całej naprawy (po placemencie i fallbacku), żeby żadna
     # współdzielona ścieżka nie zniknęła zanim ktoś jej jeszcze potrzebuje.
     uniq = list({os.path.normcase(str(p)): p for p in deferred}.values())
+    if index is not None and not dry_run:
+        _refresh_stale_archives(index, log)      # wątek właściciela
     return st, done, uniq
 
 
@@ -1599,7 +1729,7 @@ def purge_loose_on_verified_chd(reports, rules_fn, index, *,
         return 0
     from collections import defaultdict
     from .matcher import RomState
-    from .dirrules import resolve_format
+    from .dirrules import effective_format, resolve_format  # noqa: F401
     # OCHRONA `needed_sha1`: NIE kasuj luźnego toru, jeśli potrzebuje go inna gra,
     # która NAPRAWDĘ powstanie w tej naprawie. KLUCZOWE zawężenie: tylko gry
     # BUDOWALNE — takie, które mają WSZYSTKIE tory DANYCH obecne (choćby pod złą
@@ -1656,7 +1786,7 @@ def purge_loose_on_verified_chd(reports, rules_fn, index, *,
         eff = rules_fn(rep.entry)
         if eff.get("skip"):
             continue
-        if resolve_format(eff.get("format", "keep"), rep.entry) != "chd":
+        if effective_format(rep.entry, eff) != "chd":
             continue                          # tylko platformy dyskowe (CHD)
         tdir = rep.entry.target_dir
         lmap = None
@@ -1679,11 +1809,24 @@ def purge_loose_on_verified_chd(reports, rules_fn, index, *,
     return n
 
 
-def _disc_on_verified_chd(game, target_dir, index, dry_run) -> bool:
+def _dir_files(target_dir) -> Optional[set]:
+    """Nazwy (normcase) plików w katalogu — JEDNO listowanie zamiast `is_file`
+    per gra (na NAS: tysiące rund SMB = minuty ciszy przed konwersją PSX).
+    None = nie udało się wylistować (wtedy sprawdzamy plik po pliku)."""
+    try:
+        with os.scandir(target_dir) as it:
+            return {os.path.normcase(e.name) for e in it if e.is_file()}
+    except OSError:
+        return None
+
+
+def _disc_on_verified_chd(game, target_dir, index, dry_run,
+                          present: Optional[set] = None) -> bool:
     """Czy gra JEST na kanonicznym, ZWERYFIKOWANYM CHD w katalogu docelowym:
     `<gra>.chd` w indeksie fizyczny (nie link/missing) i `data_sha1 == game_profile`
     (to NA PEWNO treść tej gry). W realnym biegu dokładamy FIZYCZNY dowód
-    (os.path) — indeks bywa nieaktualny, a kasujemy po tym luźne tory/archiwa."""
+    (os.path) — indeks bywa nieaktualny, a kasujemy po tym luźne tory/archiwa.
+    `present` — nazwy plików katalogu z jednego listowania (`_dir_files`)."""
     if index is None:
         return False
     from .datfile import game_profile
@@ -1695,8 +1838,11 @@ def _disc_on_verified_chd(game, target_dir, index, dry_run) -> bool:
     if (crow is None or crow["is_link"] or crow["missing"]
             or (crow["data_sha1"] or "").lower() != prof.lower()):
         return False
-    if not dry_run and not chd.is_file():
-        return False
+    if not dry_run:
+        if present is not None:
+            return os.path.normcase(chd.name) in present
+        if not chd.is_file():
+            return False
     return True
 
 
@@ -1846,17 +1992,17 @@ def _try_disc_archive_chd(entry, game, archive, tools, index, log, st, detail,
             return False
         target_dir.mkdir(parents=True, exist_ok=True)
         log(f"  finał → {final}")
-        _place_cross(Path(built), final, detail=detail,
-                     label=f"przenoszę {final.name}")
+        crc, md5, sha1 = _hash_then_place(Path(built), final, detail=detail,
+                                          label=f"przenoszę {final.name}")
         try:
             from .datfile import game_profile
-            crc, md5, sha1 = hash_file(final)
-            index.record_file(final, crc, md5, sha1)
-            prof = game_profile(game.data_roms)
-            if prof:
-                index.set_data_sha1(final, prof)
-                if pkey is not None:
-                    final_by_profile[pkey] = final
+            if sha1:
+                index.record_file(final, crc, md5, sha1)
+                prof = game_profile(game.data_roms)
+                if prof:
+                    index.set_data_sha1(final, prof)
+                    if pkey is not None:
+                        final_by_profile[pkey] = final
         except OSError:
             pass
         if on_converted is not None:
@@ -1892,7 +2038,7 @@ def _conv_scratch_for(roms, fmt, target_dir, scratch_override, tools, base, log)
     return sc
 
 
-def _conv_gather_phase(job, log):
+def _conv_gather_phase(job, log, slot=None):
     """ETAP 1 (I/O): źródła NAS→RAM w katalogu roboczym. Zwraca listę zebranych
     plików albo None (niezgodność → fallback placement). Katalog roboczy zawsze
     tworzony (sprząta go `_conv_release`)."""
@@ -1907,15 +2053,26 @@ def _conv_gather_phase(job, log):
     ram_in.mkdir()
     job["work"] = work
     job["ram_in"] = ram_in
+    # WŁASNY pasek pobierania (slot nadaje potok) — równoległe pobierania nie
+    # mogą pisać na jeden wspólny pasek
+    gidx = job.get("_gather_slot") if isinstance(job, dict) else None
+    prog = None
+    if slot is not None and gidx is not None:
+        def prog(done, total, label):
+            slot(gidx, done, total, f"{label} ({job['base']})")
     gathered = []
-    for r in job["roms"]:
-        s = job["st_by_rom"][r.name]
-        _src = s.source_path + (f"::{s.member}" if s.member else "")
-        log(f"  źródło: {_src}")
-        g = _gather_track_to_ram(s, ram_in, log)
-        if g is None:
-            return None
-        gathered.append(g)
+    try:
+        for r in job["roms"]:
+            s = job["st_by_rom"][r.name]
+            _src = s.source_path + (f"::{s.member}" if s.member else "")
+            log(f"  źródło: {_src}")
+            g = _gather_track_to_ram(s, ram_in, log, progress=prog)
+            if g is None:
+                return None
+            gathered.append(g)
+    finally:
+        if prog is not None:
+            slot(gidx, -1, 0, "")               # zwolnij pasek pobierania
     job["gathered"] = gathered
     return gathered
 
@@ -1937,6 +2094,18 @@ def _conv_build_phase(job, tools, log, detail, slot=None):
 
     _sidx = job.get("_pipe_slot") if isinstance(job, dict) else None
     _use_slot = slot is not None and _sidx is not None
+    # wątki chdman: pula / ile kompresji trwa TERAZ (z tą)
+    _pool = tools.get("threads_pool") if isinstance(tools, dict) else None
+    _act = job.get("_pipe_active") if isinstance(job, dict) else None
+    if _pool and _act:
+        import dataclasses as _dc
+        _nth = max(1, int(_pool) // int(_act))
+        try:
+            tools = dict(tools)
+            tools["settings"] = _dc.replace(tools["settings"], threads=_nth)
+            log(f"  kompresja: {_nth} wątków (trwa {_act} kompresji naraz)")
+        except Exception:
+            pass
     if _use_slot:
         def _dtl(d, t, txt):
             slot(_sidx, d, t, txt)
@@ -2014,28 +2183,18 @@ def _conv_build_run(job, tools, log, _dtl, fmt, base, game, gathered, work,
 
 
 def _conv_upload_phase(job, detail, log):
-    """ETAP 3 (I/O): finał RAM→NAS + policz sumy pliku docelowego. Zwraca
-    (crc, md5, sha1); ("","","") gdy przeniesienie OK, ale hash się nie udał."""
+    """ETAP 3 (I/O): sumy ze SCRATCHU (RAM) + finał RAM→NAS + kontrola rozmiaru
+    (`_hash_then_place` — bez ponownego odczytu pliku z NAS). Zwraca
+    (crc, md5, sha1); ("","","") gdy hash/rozmiar się nie zgadza (finalize
+    zostawia wtedy źródła do ponowienia)."""
     final = job["final"]
     built = job["built"]
     if detail is not None:
         detail(0, 0, f"przenoszę: {final.name}")
     final.parent.mkdir(parents=True, exist_ok=True)
     log(f"  finał → {final}")
-    _place_cross(Path(built), final, detail=detail,
-                 label=f"przenoszę {final.name}")
-    # Hash finału bywa blokowany PRZEJŚCIOWO (AV/indekser Windows otwiera świeży
-    # plik zaraz po przeniesieniu). Ponów raz po krótkiej chwili — udany hash
-    # pozwala finalize zapisać wpis w indeksie i BEZPIECZNIE skasować źródła
-    # (inaczej ("","","") → źródła zostają do ponowienia).
-    import time as _time
-    for _attempt in range(2):
-        try:
-            return hash_file(final)
-        except OSError:
-            if _attempt == 0:
-                _time.sleep(1.0)
-    return ("", "", "")
+    return _hash_then_place(Path(built), final, detail=detail,
+                            label=f"przenoszę {final.name}")
 
 
 def _conv_finalize_phase(job, sums, index, on_converted, st, shared_srcs,
@@ -2165,15 +2324,15 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
         _s = st_by_rom.get(r.name)
         if _s and _s.source_path and _s.source_path not in _srcs:
             _srcs.append(_s.source_path)
-    _srctxt = ""
-    if _srcs:
-        _srctxt = f"  [źródło: {_srcs[0]}" + (
-            f" (+{len(_srcs) - 1})" if len(_srcs) > 1 else "") + "]"
+    # SKĄD → DOKĄD w jednej linii (pełne ścieżki)
+    _srctxt = (f"{_srcs[0]}" + (f" (+{len(_srcs) - 1} plików)"
+                                if len(_srcs) > 1 else "")
+               if _srcs else "(brak źródła)") + f"  →  {final}"
 
     # PODGLĄD (dry-run): NIE odpytujemy wolnego miejsca (na NAS to blokujące) —
     # tylko zapowiadamy plan; miejsce sprawdzimy przy faktycznej naprawie.
     if dry_run:
-        log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}{_srctxt}")
+        log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {_srctxt}")
         st.converted += 1
         log(f"  finał → {final} (podgląd)")
         for r in roms:
@@ -2194,7 +2353,7 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
     if scratch is None:
         return None
     job["scratch"] = scratch
-    log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {base}{_srctxt}")
+    log(f"KONWERSJA(ze źródła)→{fmt.upper()}: {_srctxt}")
     try:
         if _conv_gather_phase(job, log) is None:
             return None                         # niezgodność → fallback placement
@@ -2210,12 +2369,41 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
         _conv_release(job)
 
 
+def _hash_then_place(built: Path, final: Path, detail=None,
+                     label: str = "") -> tuple:
+    """Sumy gotowego pliku liczone ze SCRATCHU (RAM), PRZED wysyłką, potem
+    umieszczenie na miejscu i kontrola ROZMIARU na NAS (jedno stat).
+
+    Dawniej sumy liczono z pliku docelowego PO wysyłce = ponowny odczyt całego
+    CHD/RVZ z NAS — przez internet (Tailscale) podwójny transfer każdej gry.
+    Treść na RAM jest ta sama i już zweryfikowana (round-trip/verify). Zwraca
+    (crc, md5, sha1); ("","","") gdy hash się nie udał albo rozmiar na NAS się
+    nie zgadza — wtedy wołający NIE kasuje źródeł (plik niepotwierdzony)."""
+    built = Path(built)
+    try:
+        sums = hash_file(built)
+        size = built.stat().st_size
+    except OSError:
+        sums, size = ("", "", ""), -1
+    _place_cross(built, final, detail=detail, label=label)
+    if size >= 0:
+        try:
+            if final.stat().st_size != size:
+                return ("", "", "")
+        except OSError:
+            return ("", "", "")
+    return sums
+
+
 def _place_cross(new: Path, dst: Path, detail=None, label: str = "") -> None:
     """Przenosi gotowy plik na miejsce: os.replace (ten sam dysk, atomowo)
     albo kopia blokami z postępem (między dyskami — RAM → fizyczny)."""
     from .fileops import move_with_progress
     dst.unlink(missing_ok=True)
-    move_with_progress(new, dst, on_progress=detail, label=label)
+    # zerwany NAS (uśpienie laptopa, restart routera) → czekaj i powtórz
+    netguard.call(lambda: move_with_progress(new, dst, on_progress=detail,
+                                             label=label),
+                  new, dst, what=f"wysyłka {dst.name}")
 
 
 def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
@@ -2236,7 +2424,10 @@ def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
         final = target_dir / f"{base}.rvz"
     else:
         return False
-    log(f"KONWERSJA→{fmt.upper()}: {base}")
+    _src0 = files[0] if files else "(brak źródła)"
+    log(f"KONWERSJA→{fmt.upper()}: {_src0}"
+        + (f" (+{len(files) - 1} plików)" if len(files) > 1 else "")
+        + f"  →  {final}")
     if dry_run:
         return True
 
@@ -2355,8 +2546,14 @@ def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
         #    WIELOPŁYTOWYCH współdzielona ścieżka musi zostać dostępna dla
         #    kolejnych płyt zestawu; kasujemy DOPIERO po całej konwersji.
         _dtl(0, 0, f"przenoszę: {final.name}")
-        _place_cross(Path(built), final, detail=detail,
-                     label=f"przenoszę {final.name}")
+        _is_arch = str(final).lower().endswith((".zip", ".7z"))
+        if _is_arch:
+            _place_cross(Path(built), final, detail=detail,
+                         label=f"przenoszę {final.name}")
+            _sums = None
+        else:
+            _sums = _hash_then_place(Path(built), final, detail=detail,
+                                     label=f"przenoszę {final.name}")
         # 2) źródło: odroczone (kasuje convert_reports po WSZYSTKICH grach)
         #    albo natychmiast (gdy wołane bez listy odroczeń).
         if deferred is not None:
@@ -2378,10 +2575,18 @@ def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
                     pass
         if index is not None:
             try:
-                crc, md5, sha1 = hash_file(final)
-                index.record_file(final, crc, md5, sha1)
-                if data_sha1:
-                    index.set_data_sha1(final, data_sha1)
+                if str(final).lower().endswith((".zip", ".7z")):
+                    # ARCHIWUM: plik ORAZ członkowie — sam record_file zostawiał
+                    # STARY skład (np. mario.zip: indeks 15 członków z poprzedniej
+                    # wersji, na dysku 12 nowych) → następne dopasowanie szukało
+                    # w zipie nieistniejących plików („There is no item named…")
+                    index.reindex_archive(final, full=True)
+                elif _sums and _sums[2]:
+                    # sumy policzone na RAM przed wysyłką (bez odczytu z NAS)
+                    crc, md5, sha1 = _sums
+                    index.record_file(final, crc, md5, sha1)
+                    if data_sha1:
+                        index.set_data_sha1(final, data_sha1)
             except OSError:
                 pass
         # zgłoś NOWĄ ścieżkę kanoniczną — inaczej faza sprzątania uznałaby

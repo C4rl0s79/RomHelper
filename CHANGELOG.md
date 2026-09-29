@@ -2,6 +2,422 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.6.84] — 2026-09-29
+
+### Skan: katalogi listowane równolegle
+- Obchód katalogów był szeregowy: każdy `scandir` na NAS to runda sieciowa
+  (~68 ms na katalog przez Tailscale), a kolekcja ma tysiące katalogów gier
+  (bin/cue, ToSort) — minuty samego czekania, nawet gdy nic się nie zmieniło.
+- Teraz katalogi listowane naraz wg nośnika: NAS 16, SSD 8, HDD szeregowo
+  (bez skakania głowicy). Pomiar na NAS usera (na zimno): 68 ms → ~6 ms na
+  katalog (ToSort\other: 146 katalogów w 0,9 s).
+- Te same zasady co dotąd: pomijanie katalogów już przeskanowanych,
+  plików tymczasowych, czekanie na powrót NAS po zaniku sieci.
+
+### Wiedza o CHD: jedno źródło dla wszystkich faz (koniec łatania per miejsce)
+- 0.6.83 poprawiło tylko skan; faza sondy CHD po skanie (`deep_probe_chds`)
+  nadal pytała chdman o 2942 hardlinki REDUMP (PS1, 3DO, Saturn, Dreamcast),
+  plus szeregowe `is_file()` na NAS per plik („20 s bez postępu”).
+- Teraz jedna metoda `FileIndex.fill_from_twins()`: jednym przebiegiem po
+  indeksie (0,4 s, bez NAS) każdy CHD dostaje od bliźniaków (hardlink/kopia,
+  ta sama suma) wszystko, co one wiedzą. Wołana przed sondą CHD oraz na starcie
+  naprawy i „Znajdź naprawy”. Na indeksie usera: 11 107 wpisów uzupełnionych,
+  do chdman zostaje 0 (skan i sonda).
+- Skan ma jedną drogę do wiedzy o CHD (`_know_chd`, plik nowy i znany):
+  bliźniak, a chdman tylko dla tego, co nadal nieznane. Usunięte dwie osobne
+  kopie tej logiki; sonda bez `is_file()` per plik.
+- Sprzątanie: reguła „komplet / do naprawy / brak” w jednym miejscu
+  (`matcher.game_category`, dotąd 3 kopie), indeks gra→statusy w jednym
+  (rebuilder, dotąd 2 kopie).
+
+## [0.6.83] — 2026-09-29
+
+### Skan nie sonduje hardlinków CHD po NAS
+- Hardlinki CHD z naprawy dostawały w indeksie sumy, ale NIE wynik sondy CHD
+  (układ ścieżek, typ CD/DVD, kontener). Skan uznawał je za niezbadane i
+  uruchamiał chdman po NAS na każdym, pojedynczo, w głównej pętli — 1344 CHD
+  PS1/PS2 w REDUMP, mimo że oryginał każdego z nich miał komplet danych.
+- Przyczyna systemowa: każde kopiowanie wpisu z bliźniaka (hardlink z naprawy,
+  hardlink wykryty skanem, plik przeniesiony) miało własną, niepełną listę
+  kolumn. Teraz jedna wspólna lista „kolumn treści” (`_CONTENT_COLS`).
+- Skan, zanim uruchomi chdman, bierze wynik z bliźniaka o tej samej sumie
+  całego pliku (także dla nowych plików i kopii zapisanych przez naprawę).
+  Na indeksie usera: 988 z 988 oczekujących CHD bez chdman.
+
+## [0.6.82] — 2026-09-29
+
+### Liczby NA ŻYWO w trakcie naprawy (jak RomVault)
+- Każda udana operacja (hardlink, przeniesienie, zmiana nazwy, rozpakowanie,
+  konwersja, odbudowa CHD) od razu przestawia stan TEJ gry na „jest", a drzewo
+  DAT-ów przelicza liczby i kolor tylko tego DAT-u. Żadnego dopasowania ani
+  przeliczania — liczba jest wypadkową skanu i wykonanych napraw.
+- Hardlinki równoległe zgłaszają grę dopiero po faktycznym utworzeniu linku;
+  podgląd („Znajdź naprawy") niczego nie przestawia.
+- Po etapie 1 okno wczytuje zapisany stan wszystkich DAT-ów (przepis etapu 2).
+- Indeks gra→statusy per raport: przestawienie gry nie przegląda całego DAT-u.
+
+## [0.6.81] — 2026-09-28
+
+### Program pamięta, co naprawił (bez skanu i bez „Znajdź naprawy")
+- Liczby „komplet / do naprawy / brak" po starcie pochodziły z zapamiętanego
+  wyniku OSTATNIEGO „Skanuj i raportuj". Naprawa aktualizowała indeks po każdej
+  operacji, ale nigdy tego wyniku — po przerwaniu i restarcie znów było
+  „ponad 800 PS2 do naprawy", choć indeks wiedział już o 572.
+- Po naprawie (zakończonej, PRZERWANEJ) stan jest przeliczany z INDEKSU —
+  bez skanu plików (PS2 na kopii indeksu usera: 2,5 s, 572 = wynik skanu)
+  — pokazany i zapamiętany. Dotąd: po przerwaniu komunikat „zrób skan",
+  po zakończeniu pełne „Skanuj i raportuj" po NAS.
+- Podsumowanie zapisywane NA BIEŻĄCO w naprawie: po etapie 1 (przepis etapu 2
+  i tak jest liczony — zapis darmowy) i po każdym DAT-cie etapu 2 (tylko ten
+  DAT, z indeksu, bez NAS). Start programu NICZEGO nie przelicza (natychmiast),
+  po naprawie okno tylko wczytuje zapisane liczby (zamiast ~50 s przeliczania
+  całej kolekcji). Dopasowanie nie pyta NAS o symlinki bez zapisanego celu.
+- „Znajdź naprawy" też odświeża liczby (podgląd liczy stan z indeksu, więc
+  jego wynik to aktualny stan kolekcji).
+
+### Jeden format DAT-u w całym programie (koniec zbędnych przepakowań)
+- Format „per platforma" (DAT-dziecko dziedziczy jawny format rodzica) trafiał
+  do `entry.store_format`, którego używa matcher i rebuilder, ale konwersja
+  liczyła format OD NOWA z reguły samego DAT-u. PSP PSN (Decrypted) z „auto" →
+  zip, platforma PSP → CHD: matcher planował wypakowanie, konwersja
+  przepakowanie zipa — 130 zipów z ToSort z DOKŁADNIE właściwą zawartością
+  miało być pobranych z NAS, przepakowanych i wysłanych z powrotem.
+  Teraz `dirrules.effective_format` = jedno źródło formatu.
+- Podgląd całej kolekcji (kopia indeksu): DAT-y-dzieci dostają HARDLINKI do
+  plików rodzica (68 269; PS2: No-intro ISO→`ROMS\ps2\<gra>.chd`), żadna
+  konwersja nie bierze źródła z kolekcji. Hardlink na Z: (SMB) sprawdzony.
+
+### Naprawa w dwóch etapach: najpierw szybkie operacje we wszystkich katalogach
+- ETAP 1 (wszystkie katalogi): linki (hardlinki dziecko → rodzic),
+  przeniesienia i zmiany nazw na tym samym dysku, spłaszczanie, wypakowania;
+  potem zbędne archiwa i opisy ścieżek bez torów w ToSort. Gry do konwersji są
+  pomijane (lista z podglądu konwersji — z indeksu, bez NAS).
+- ETAP 2 (katalog po katalogu): konwersje, odbudowa złych CHD, sprzątanie,
+  kasowanie źródeł — na przepisie PRZELICZONYM z indeksu po etapie 1.
+- Dawniej wszystko szło katalog po katalogu: przerwanie w ROMS (dni odbudowy
+  PS2 przez internet) zostawiało No-intro i 1G1R bez ani jednego linku
+  (15 logów napraw — 0 linii „LINK").
+- Dziecko linkuje do CHD rodzica odbudowanego W TYM SAMYM przebiegu (stan
+  kontenera z aktualnego indeksu, nie z raportu sprzed naprawy).
+- Wspólny katalog kilku DAT-ów (ROMS\pc98: „NEC - PC-98" i „NEC - PC-98
+  (HardDisk)"): sprzątanie jednego DAT-u zmiatało do ToSort pliki drugiego,
+  do których linkowały No-intro i 1G1R (12 zipów PC-98). Etap 1 rejestruje
+  wszystkie pliki przed sprzątaniem.
+
+### Skan nie przelicza hardlinków
+- Hardlinki z naprawy (przed tą poprawką) trafiały do indeksu z sumami, ale BEZ
+  członków archiwum. Skan przy każdym takim zipie (u usera 26 499) otwierał go
+  na NAS i hashował zawartość (~0,3–0,4 s/plik), choć log pokazywał „policzono
+  0, bez zmian N" — członkowie nie wchodzą w licznik.
+- Teraz członkowie są brani z BLIŹNIAKA w indeksie (ta sama suma i rozmiar
+  całego pliku = te same bajty), bez otwierania zipa (u usera 24 324 z 26 499).
+  Każdy nowy hardlink dostaje członków od razu (`record_hardlink`).
+- Nowa ścieżka będąca hardlinkiem znanego pliku (np. po zmianie katalogów
+  DAT-ów): sumy i członkowie przejęte po identyfikatorze pliku (os.stat, jedna
+  runda SMB) zamiast czytania całego pliku.
+- Indeks bazy po (rozmiar, mtime) — szukanie bliźniaka / przeniesionego pliku
+  przeglądało całą tabelę przy każdym nowym pliku.
+- Członkowie przeżywają zniknięcie pliku-bliźniaka: `remove_path` / nadpisanie
+  przy `rename` przekazują członków pozostałym wpisom o tej samej treści, a
+  skan pożycza je także z wpisów BRAKUJĄCYCH (missing=1 zachowuje członków).
+  Dawniej hardlink, którego cel usunięto, był otwierany na NAS przy skanie
+  (u usera 1373 zipy Mega Drive + 134 ColecoVision po błędzie przerzucania).
+
+### W kolekcji wyłącznie hardlinki
+- Tworzenie linku na tym samym woluminie przy KAŻDYM błędzie hardlinku (np.
+  chwilowa czkawka SMB przy równoległych linkach) po cichu robiło SYMLINK
+  (jako administrator się udawał). U usera 1639 symlinków. Teraz na tym samym
+  woluminie tylko hardlink; symlink wyłącznie gdy system jawnie nie obsługuje
+  hardlinków (inny wolumin, brak funkcji), inaczej błąd jest zgłaszany.
+- Na starcie każdej naprawy (równolegle, 16 wątków): zerwany symlink →
+  usunięty, symlink z celem na tym samym woluminie → zamieniony na HARDLINK
+  (wpis w indeksie z danymi celu, bez pytania NAS).
+- Skan zapisuje cel symlinku (link_of), dopasowanie porównuje z indeksem —
+  dawniej 3 rundy SMB na grę z symlinkiem („20 s bez postępu" w Znajdź naprawy).
+
+### Niezmiennik „nie zabieraj plików innym DAT-om" — sprawdzony na całej kolekcji
+- Skrypt-audytor (niezależny od logiki naprawy): plik, którego treść ma DAT
+  jego katalogu, nie może zniknąć (przeniesienie, przepakowanie z kasowaniem,
+  ToSort, kasowanie), chyba że to miejsce dostaje link. Log naprawy z 28.09:
+  4900 naruszeń w 17 DAT-ach + 8 przeniesień (FDS QD, fbneo). Podgląd obecnym
+  kodem na kopii indeksu usera (603 DAT-y): 0 naruszeń.
+- Poprawione KLASY błędów (nie platformy):
+  - DAT-y z samymi CRC (FinalBurn Neo, MAME) nie były uznawane za właściciela
+    treści (sprawdzany był tylko SHA-1) → inne DAT-y przepakowywały ich zipy
+    z kasowaniem źródła. `Hierarchy._has_content`: SHA-1 ALBO CRC+rozmiar.
+  - Podgląd nie pokazywał linku w miejscu, z którego plik zabrał DAT wyżej
+    (plik „wciąż leżał" w podglądzie). Teraz podgląd = to, co zrobi naprawa.
+  - Sprzątanie sierot (katalog bez DAT-u, np. stary No-intro po przeniesieniu
+    DAT-ów płyt do Redump) wynosiło do ToSort pliki, których treść leży już w
+    kolekcji (7052 hardlinki). Teraz ta sama reguła co w katalogu DAT-u:
+    zbędna kopia/nazwa jest usuwana (przy kasowaniu ułożonych kopii z ToSort).
+- Log przepakowania mówi wprost o losie źródła: „[źródło zostaje: …]" albo
+  „[źródło zostanie skasowane]".
+
+### Koniec przerzucania plików między DAT-ami różnych platform
+- Te same ROM-y w DAT-ach RÓŻNYCH platform pod inną nazwą gry („Microsoft -
+  MSX": „10-Yard Fight (Japan)", „FinalBurn Neo - MSX 1 Games": „10yard"):
+  naprawa brała zip jednego DAT-u, przepakowywała go pod nazwę drugiego i
+  KASOWAŁA źródło; następna naprawa robiła to samo w drugą stronę — te same
+  tysiące PRZEPAKUJ przy każdej naprawie, choć nic się nie zmieniło.
+- Teraz plik należący do innego DAT-u, który po jego zabraniu nie dostałby
+  linku (inna platforma), zostaje u właściciela; ten DAT dostaje własną kopię
+  (`Hierarchy.must_keep_source`). Przeniesienie z DAT-u tej samej platformy
+  NIŻEJ (1G1R → ROMS) dalej jest przeniesieniem + linkiem.
+- Kopia archiwum z INNYMI nazwami wewnętrznymi jest przepakowywana (dawniej
+  kopiowana 1:1 — ze złymi nazwami, więc „do naprawy" w nieskończoność).
+
+### Linki kilka razy szybciej (etap 1 z ~10 h do ~1,5 h)
+- Log naprawy usera: 62 133 linki × 0,6 s = 10,4 h, przeniesienia 10 300 ×
+  0,8 s = 2,3 h. Link robił SZEREGOWO lexists, mkdir (×2), os.link, lstat ×2
+  i dwa commity indeksu — przy 33 ms do NAS każde to runda SMB.
+- Teraz: sam os.link w puli 16 wątków (zajęta ścieżka / „już zlinkowane"
+  rozstrzyga FileExistsError + same_file), katalog tworzony RAZ na przebieg,
+  wpis indeksu z danymi celu bez pytania NAS (`record_hardlink`), commit co
+  500 linków. Pomiar na NAS: 0,54 → 0,08 s/link (serwer i tak szereguje
+  linki w obrębie jednego katalogu — sam os.link szeregowo to 0,13 s).
+- Przeniesienia: bez drugiego mkdir w `move_with_progress` (wołający już
+  zapewnił katalog).
+
+### Licznik złych kontenerów CHD = liczba PLIKÓW
+- Podsumowanie liczyło ten sam CHD osobno w każdym DAT-cie, który na niego
+  wskazuje (ROMS, No-intro, 1G1R): 1162 zamiast 572 realnych plików PS2
+  (503 w ROMS\ps2 + 69 w ToSort).
+
+### Fizyczna kopia w najwyższym DAT-cie, który MA grę
+- Plik leżący w katalogu DAT-u wyżej był uznawany za kopię „rodzica" po samym
+  POŁOŻENIU — nawet gdy żaden DAT tamtego katalogu tej gry nie ma. Dziecko
+  (No-intro) linkowało do niego, a sprzątanie rodzica kasowało jego nazwę
+  (hardlink ratował dane; symlink — inny dysk — zostałby linkiem donikąd).
+- Teraz link tylko wtedy, gdy któryś DAT katalogu wyżej zawiera tę treść
+  (`Hierarchy.owned_above`, po SHA-1/CRC). Inaczej plik PRZENOSI się fizycznie
+  do najwyższego DAT-u z tą grą, a niższe linkują do niego.
+
+### Sprzątanie ToSort i pustych katalogów
+- Opisy ścieżek (`.cue`/`.gdi`/`.toc`) w ToSort bez żadnego toru obok są
+  kasowane — m.in. cue zostawiony po konwersji na CHD (cue ze zrzutu bywa
+  bajtowo inny niż w DAT-cie, więc nie schodził razem z torami). U usera: 329
+  takich plików (CD32 176, Dreamcast 93, Saturn 60), gier nie ma nigdzie.
+- Na koniec naprawy: puste katalogi w ToSort i POD katalogami DAT-ów
+  (równoległy obchód NAS; katalogi docelowe DAT-ów i korzenie zostają).
+  Dotąd sprzątane były tylko katalogi opuszczone w tym przebiegu.
+
+### „auto" dla Xbox, Xbox 360 i PS3 = ISO (bez CHD i zipa)
+- Xenia, Xemu i RPCS3 nie czytają CHD ani obrazu z zipa. „auto" dawało
+  Xbox/X360 zip (7 GB ISO do zipa), a PS3 CHD. Teraz „auto" = keep (ISO jak
+  jest); zip tylko z jawnej reguły „archiwum". Podpowiedź formatu tak samo.
+
+## [0.6.80] — 2026-09-27
+
+### Gry jednoplikowe (CHD/RVZ/ISO) płasko, bez podfolderów
+- Gra z JEDNYM plikiem w podfolderze nazwanym jak gra (`<gra>\<gra>.rvz`,
+  układ z paczek RomVault) nie jest już akceptowana jako „na miejscu" — dostaje
+  „zła nazwa", a Napraw przenosi ją płasko (`<gra>.rvz`) ZMIANĄ NAZWY na tym
+  samym dysku (bez przesyłania danych, indeks bez ponownego liczenia sum)
+  i kasuje pusty folder. Podfolder zostaje tylko dla gier wieloplikowych
+  (bin/cue, gdi — reguła `subdir_per_game`). U usera: 610 RVZ GameCube +
+  1266 Wii (podgląd na kopii indeksu: 1876 × NAZWA, 0 do ToSort, 0 błędów).
+- Plik, którego przeniesienie się nie udało (albo w podglądzie), jest chroniony
+  pod starą ścieżką — sprzątanie nie zmiecie poprawnej gry do ToSort (podgląd
+  pokazywał każdy spłaszczany plik 2×: NAZWA + TOSORT).
+- Dziecko w hierarchii (np. No-intro) linkuje do NOWEJ ścieżki rodzica, gdy
+  rodzic w tym samym przebiegu przeniósł plik — wcześniej celowało w starą
+  ścieżkę ze skanu, której już nie ma (link się nie tworzył).
+
+### Konwersja nie rusza DAT-ów już w formacie docelowym
+- DAT „surowy" (NKit RVZ: ROM-y to pliki `.rvz` z własną sumą) — konwersja
+  ze źródła pomija takie gry. Wcześniej każda gra GameCube/Wii spoza ścieżki
+  kanonicznej (np. kopia dla No-intro) była pobierana z NAS na RAM (~1,4 GB)
+  tylko po to, by skończyć „brak iso — pomijam" (RVZ→RVZ dałby i tak inne
+  bajty niż w DAT-cie). Umieszczenie/link robi rebuilder.
+
+## [0.6.79] — 2026-09-25
+
+### Wysyłka na NAS znów jednym strumieniem (regresja 0.6.78)
+- 0.6.78 wysyłała równolegle (8 zapisów w różne miejsca pliku): na NAS przez
+  internet ~0,1 MB/s wobec 5,4 MB/s zwykłego zapisu (pomiar) — NTFS po drugiej
+  stronie dopełnia zerami wszystko przed miejscem zapisu. Równolegle zostaje
+  tylko POBIERANIE (tam 8 odczytów naraz dawało do 21 MB/s).
+
+### Szybsza wysyłka: robocopy (fallback: Python, blok 64 MB)
+- Pomiar wysyłki 256 MB na NAS (Tailscale): robocopy 12–13 MB/s, Python
+  1 strumień blok 64 MB ~11 MB/s, blok 8 MB (dotąd) ~8 MB/s, CopyFile2
+  6,4 MB/s, zapisy równoległe 6–7 MB/s, rezerwacja rozmiaru przed zapisem —
+  patologicznie wolno (serwer dopełnia zerami).
+- Pliki ≥ 32 MB wysyłane przez robocopy (hardlink źródła pod nazwą tmp
+  w prywatnym katalogu na RAM-dysku → robocopy → os.replace w celu), postęp
+  z procentów robocopy, bez okna konsoli, /R:2 /W:5. Błąd robocopy →
+  ta sama wysyłka w Pythonie blokami 64 MB. Źródło kasowane dopiero po
+  udanej wysyłce, jak dotąd.
+
+### Przebudowa CHD nie kasuje oryginału przed wysyłką
+- `_place_final` kasował stary CHD na NAS PRZED wysyłką nowego — przez całą
+  (przez internet — nawet godzinną) wysyłkę jedyna kopia gry leżała na ulotnym
+  RAM-dysku. Teraz nowy plik idzie obok jako `*.chdbuddy_move_tmp` i dopiero
+  kompletny zastępuje stary (atomowe os.replace). Przerwanie wysyłki = stary
+  plik nietknięty.
+
+## [0.6.78] — 2026-09-25
+
+### Kopiowanie z/na NAS równolegle (8 odczytów/zapisów naraz)
+- Pobieranie i wysyłka szły JEDNYM strumieniem blok po bloku — przez internet
+  (Tailscale, 33 ms na rundę) każdy blok czekał osobno. Pomiar na Z: w czasie
+  trwającej naprawy: jeden strumień 2,2–2,8 MB/s, CopyFile2 (jak Eksplorator)
+  1,4–1,9 MB/s, 8 odczytów naraz do 21 MB/s (Total Commander ~30 MB/s).
+- `fileops.copy_parallel`: 8 wątków, każdy na własnym uchwycie i kawałku pliku,
+  kontrola rozmiaru, pierwszy błąd przerywa całość (nic niepełnego nie zostaje
+  jako „udane"). Użyte przy: pobieraniu CHD w przebudowie, pobieraniu luźnych
+  plików w konwersji ze źródła, wysyłce gotowych plików na NAS.
+
+### Przebudowa CHD: etap pobierania tylko KOPIUJE
+- Rozpakowanie (`extractcd`, jednowątkowe, ~1–1,5 min na grę PS2), deframe i
+  sprawdzenie SHA-1 przeniesione do etapu przeróbki — następne pobranie rusza
+  zaraz po skopiowaniu, łącze nie czeka na rozpakowanie. Wątki chdman liczone
+  tuż przed samą kompresją.
+
+## [0.6.77] — 2026-09-24
+
+### Przebudowa/konwersja CHD „na zakładkę" (jedno pobranie naraz)
+- Zamiast 3 pobrań naraz (0.6.74–0.6.76, dzieliły łącze): pobiera się JEDEN
+  plik; gdy skończy i zaczyna się przerabiać, rusza pobieranie następnego;
+  przerobiony idzie do wysyłki, a w tym czasie kolejne się przerabiają.
+- Ustawienie `download_workers` (domyślnie 1) zastępuje `gather_workers` —
+  stara wartość 3 zapisana w pliku ustawień jest ignorowana (bez edycji pliku).
+- Zostają: budżet RAM rezerwowany przy starcie pobierania, kopia CHD na RAM
+  przed ekstrakcją, osobne paski pobierania/przeróbki.
+
+### Kompresja CHD na 1–2 wątkach (CPU 8%)
+- Wątki chdman były dzielone Z GÓRY „na 4 równoległe" (przebudowa: 8/4 = 2;
+  konwersja ze źródła: sztywno 1). Przy jednym pobraniu naraz przez wolne łącze
+  kompresja idzie zwykle SAMA → 1–2 wątki, reszta procesora stoi.
+- Teraz wątki liczone w CHWILI startu kompresji: pula (8) / ile kompresji
+  faktycznie trwa. Sama gra → 8 wątków, dwie → po 4. W logu linia
+  „kompresja: N wątków chdman (trwa K kompresji naraz)".
+- Rozpakowanie (`extractcd`) i weryfikacja (`verify`) w chdman 0.288 NIE mają
+  `-np` — zawsze jeden wątek na plik; tego nie przyspieszy żadne ustawienie.
+
+## [0.6.76] — 2026-09-24
+
+### Regresja: zip gry już na CHD nie był sprzątany z ToSort (Lunar)
+- Skrót „gra już na ZWERYFIKOWANYM CHD" (wznawianie naprawy) robił `continue`
+  PRZED gałęzią HAVE_CHD — omijał sprzątanie jej źródeł w ToSort i rejestrację
+  CHD jako rodzica (keeper) dla linków dzieci. Teraz skrót robi jedno i drugie.
+- Opcja „buduj tylko kompletne" (i reguła katalogu) trafia do konwersji: gra,
+  której brakuje toru DANYCH (nie ma go nigdzie), nie chroni torów w ToSort
+  (Lunar (RE) — 50/52 torów oryginału — blokował zip oryginału). Przy
+  dozwolonych niekompletnych ochrona zostaje jak była.
+- Podgląd („Znajdź naprawy") POKAZUJE „(podgląd) KASUJ z ToSort … (gra już na
+  CHD)" — dawniej ta część działała tylko przy prawdziwej naprawie.
+- Testy: kasowanie przy „tylko kompletne", zostawienie przy niekompletnych,
+  widoczność w podglądzie.
+
+### GUI: „symlinki" → „hardlinki"
+- Od 0.6.50 program tworzy HARDLINKI (ten sam wolumin, także NAS Z:), symlink
+  tylko awaryjnie. Etykiety i podpowiedzi („kopie potwierdzonych → hardlinki",
+  „twórz hardlinki dla DAT-ów dzieci", okna ustawień DAT i hierarchii)
+  poprawione; komunikaty o adminie/UAC zostają (dotyczą symlinków).
+
+## [0.6.75] — 2026-09-24
+
+### Okno „nie odpowiada" na 0,5–2 s co kilkanaście sekund
+- Przyczyna (pomiar bez GUI: czujnik GIL + gc.callbacks): PEŁNE sprzątanie
+  pamięci Pythona (GC pokolenia 2) przy 2,5–8 mln obiektów w pamięci (DAT-y,
+  cache indeksu, raporty) — 0,5–1,7 s, w tym czasie stoją WSZYSTKIE wątki.
+- `core/gcpause.py`: po zbudowaniu dużych struktur `gc.freeze()` (po każdym
+  DAT-cie, po cache indeksu, po każdym DAT-cie dopasowania; na czas operacji);
+  na końcu operacji odmrożenie i JEDNO zebranie. Podgląd: zatrzymania okna
+  6,9 s → 0,2 s łącznie, najdłuższe 1745 → 243 ms.
+- Log w oknie dopisywany PACZKĄ co 100 ms (jedno dopisanie + jeden zapis pliku)
+  zamiast każdej linii osobno — podgląd wypisuje do 23 tys. linii/min.
+
+### Wii: minuty ciszy w „puste katalogi" (`_prune_empty_dirs`)
+- Sprzątanie pustych katalogów przeglądało CAŁE drzewo (os.walk) i robiło
+  `rmdir` na każdym podkatalogu — Wii: 1266 katalogów gier, przez internet same
+  rundy SMB (~17 KB/s ruchu, 200+ s). Teraz tylko katalogi, z których w tym
+  przebiegu coś zniknęło (indeks notuje je przy remove_path/rename) + rodzice.
+
+### Lunar - The Silver Star (USA) (RE) budowany na darmo w każdej naprawie
+- „CHD z archiwum" ruszał, gdy archiwum miało NAJWIĘKSZY tor gry — także dla
+  INNEJ płyty dzielącej tory (RE ma 50 z 52 torów oryginału): pobranie 430 MB,
+  createcd, weryfikacja i ODRZUCENIE przez strażnika treści. Teraz wymagany
+  KOMPLET torów danych gry w tym archiwum (sprawdzenie z indeksu, bez I/O).
+
+## [0.6.74] — 2026-09-24
+
+### Potok konwersji/odbudowy: mniej czekania na NAS (Z: przez Tailscale, 33 ms)
+Analiza żywej odbudowy PS2 (CD→DVD): w 20 min 2 gry, 4 wątki kompresji
+głównie CZEKAŁY — wąskim gardłem było POBIERANIE (99–412 s/grę, jeden wątek),
+nie chdman. Z: jest podpięty adresem Tailscale (100.85.254.31), ruch idzie przez
+internet (~10 MB/s).
+- **Kilka pobierań naraz** (`gather_workers`, domyślnie 3) w potoku konwersji i
+  odbudowy CHD. W trybie z zachowaną kolejnością nadal 1 (bez zakleszczeń).
+- **Budżet RAM rezerwowany przy STARCIE pobierania**, nie przy zleceniu — gry
+  czekające w kolejce nie blokują już nowych zleceń (log: 5 min przestoju przy
+  pustym RAM). Kolejka zleceń ograniczona liczbą; `drain()`/`wait()` finalizują
+  każde gotowe zadanie (głowa kolejki może czekać na budżet).
+- **Odbudowa CHD: kopia całego CHD na RAM-dysk przed ekstrakcją** — chdman
+  czytający hunk po hunku przez SMB dawał 39 MB/s, lokalnie 101 MB/s (pomiar).
+  Kopia i surowy .bin kasowane od razu po użyciu (mniejszy szczyt RAM).
+- **SHA-1 obrazu w locie** przy deframingu bin→iso (paczkami ramek zamiast
+  ramka po ramce); koniec z `iso.read_bytes()` — cały obraz PS2 w pamięci
+  programu (3,2 GB RomHelper w tasklist) w walce o RAM z RAM-dyskiem.
+- **Konwersja ze źródła: sumy liczone ze scratchu (RAM) PRZED wysyłką**
+  (potok i obie ścieżki seryjne) — koniec ponownego odczytu całego CHD/RVZ z
+  NAS po wysyłce (podwójny transfer przez internet). Po wysyłce tylko kontrola
+  rozmiaru; niezgodny → źródła zostają do ponowienia.
+- **Równoległe pliki na osobnych paskach.** Odbudowa CHD podawała chdmanowi
+  callback o złej sygnaturze (`done, total, text` zamiast `pct, msg`) — do paska
+  trafiał tekst jako liczba, obsługa w oknie się wywracała i własne paski nigdy
+  się nie pokazywały; widać było tylko wspólny pasek, na który pisały
+  pobierania i wysyłki WSZYSTKICH gier naraz. Teraz: kompresja każdej gry na
+  swoim pasku, każde równoległe pobieranie na swoim (numery za paskami
+  kompresji), konwersja ze źródła pokazuje postęp pobierania (dotąd żadnego).
+  Okno postępu toleruje zły typ wartości (pasek pulsuje zamiast znikać).
+
+## [0.6.73] — 2026-09-24
+
+### Przepakowania w KAŻDEJ naprawie mimo poprawnych nazw w zipie (pętle)
+- **ROM-y-bliźniaki** (DAT arcade: ta sama treść pod różnymi nazwami, np.
+  angelkds `epr-11437` = `epr-11445`, alpha1v): dopasowanie brało DOWOLNEGO
+  członka o tej sumie → poprawny zip wyglądał na „złe nazwy" → PRZEPAKUJ w
+  każdej naprawie. Teraz spośród członków o tej samej treści wybierany jest
+  ten o NAZWIE ROM-u.
+- **Ukośniki w ścieżkach** (DAT-y Flux: `disk1	rack.raw`, ZIP zawsze
+  `disk1/track.raw`): porównanie nazw bez normalizacji separatora → pętla
+  przepakowań całych kolekcji Flux (Amiga, FM Towns, PC-88/98, X68000…).
+- Audyt całej kolekcji: przepakowania „poprawne nazwy wewn." 6370 → 4903;
+  pozostałe to PIERWSZE zbudowanie zestawów FinalBurn Neo (konsole w 1G1R) z
+  zipów No-Intro — inne nazwy zestawów/plików, jednorazowo.
+
+### Nieaktualny skład zipa w indeksie („There is no item named … in the archive")
+- Konwersja „w miejscu" do ZIP zapisywała w indeksie tylko sam plik, a
+  członków zostawiała STARYCH (mario.zip: indeks 15 plików, na dysku 12).
+  Teraz archiwum jest indeksowane z członkami (`reindex_archive`).
+- Kopia archiwum w naprawie (`_copy_file`) przenosi w indeksie skład źródła.
+- SAMONAPRAWA: gdy pobieranie trafi na członka, którego w pliku nie ma, skład
+  tego archiwum w indeksie jest odświeżany na końcu konwersji katalogu —
+  dotychczasowe nieaktualne wpisy znikną przy najbliższej naprawie.
+
+## [0.6.72] — 2026-09-24
+
+### Skan plików: bez podwójnego obchodu NAS przed skanem
+- **„Liczenie plików" usunięte** — przed skanem program obchodził CAŁĄ
+  kolekcję na NAS tylko po to, żeby policzyć pliki na mianownik paska, a
+  potem skan obchodził te same katalogi drugi raz. Teraz mianownik to liczba
+  plików z indeksu (poprzedni skan, jedno zapytanie SQL): „plik X z ~Y";
+  skan rusza od razu, katalog po katalogu. Nowe pliki ponad szacunek → pasek
+  nieokreślony zamiast >100%.
+- **„Ustalam katalogi platform" / „Analizuję rozmiary…"** — istnienie
+  katalogów kandydatów (target, Redump, ES × ~600 DAT-ów, dwa razy) sprawdzane
+  było `is_dir` na NAS pojedynczo. Teraz JEDEN listing każdego katalogu
+  nadrzędnego (kilka) z cache na całe zadanie (`dirrules.DirExists`).
+- Te same zmiany w „Pełnym skanie" katalogu i skanie z zakładki Indeks.
+
+### Strażnik ciszy widzi kod okna i działa w exe
+- Pisał „(poza kodem programu)": pomijał ramki z `ui/` (a przygotowanie skanu
+  żyje w pliku okna) i w exe nie rozpoznawał ścieżek modułów (PyInstaller
+  zapisuje je względnie). Teraz pomija tylko główny wątek GUI.
+
 ## [0.6.71] — 2026-09-24
 
 ### „Zawieszenie" na PlayStation w Znajdź naprawy / Napraw
@@ -16,6 +432,96 @@ Format: [semver](https://semver.org). Najnowsze na górze.
 - **Widoczność:** w przeliczaniu kandydatów pasek pokazuje bieżącą grę i
   licznik („Odbudowa CHD — przeliczam: <gra>", zrobione / wszystkie); dalej,
   jak dotąd, „CHD wg cue: <gra>" przy czytaniu nagłówków.
+
+### Sprzątanie katalogu: bez ciszy na NAS, z nazwą pliku
+- W PODGLĄDZIE sprzątanie nie-kanonicznych plików (zły link / do ToSort)
+  opiera się wyłącznie na indeksie — wcześniej każdy plik to 2–3 rundy SMB
+  (`is_link`, `is_file`, `lexists`), nawet gdy nic się nie ruszało. Realna
+  naprawa nadal sprawdza system plików.
+- Pasek pokazuje bieżący plik („sprzątanie: <plik>") i licznik; przerwanie
+  działa w trakcie.
+
+### MSU-1 (i każda gra w archiwum): luźne kopie nie trafiają do ToSort
+- Luźne `.pcm`/`.sfc` obok kanonicznego `<gra>.zip` (ta sama treść co członek
+  archiwum) szły do ToSort — sprawdzanie „czy treść jest w kolekcji" patrzyło
+  tylko na pliki, nie na zawartość archiwów.
+- Teraz: gdy treść leży w kanonicznym pliku ALBO archiwum kolekcji (fizycznym,
+  poza ToSort, potwierdzonym na dysku), a włączone jest kasowanie ułożonych
+  kopii z ToSort — zbędna kopia jest KASOWANA („KASUJ zbędną kopię … (jest w
+  …)"). Bez tej opcji — ToSort jak dotąd.
+- Czystka ToSort obejmuje też LUŹNE pliki (nie tylko zip/7z) i członków
+  archiwów w kolekcji — usuwa pozostałości MSU-1 z poprzednich napraw.
+  Pliki przeniesione do ToSort w bieżącym przebiegu są chronione.
+- **Przepakowanie zipa MSU-1 tworzy pusty `.msu`** (0 B, w DAT-cie bez sum)
+  zamiast „BŁĄD przepakowania … brak ….msu" — wcześniej KAŻDY zip MSU-1 z
+  poprawnymi danymi był odrzucany, a potem sprzątany do ToSort (ActRaiser,
+  Aladdin, Axelay…). Braki wykrywane PRZED czytaniem danych (sam katalog zipa)
+  — wcześniej błąd wychodził po przepisaniu setek MB z NAS (1–3 min na grę).
+
+### Utrata NAS (uśpienie laptopa, restart routera) — praca czeka i wznawia się sama
+- Nowy `core/netguard.py`: gdy dysk sieciowy zniknie, operacja NIE sypie
+  błędem — log „⚠ NAS niedostępny … Praca WSTRZYMANA", pasek pokazuje czas
+  czekania, a po powrocie („✓ NAS znowu dostępny po m:ss — wznawiam") ta sama
+  operacja jest ponawiana. Obejmuje: przenoszenie/kopiowanie/kasowanie w
+  naprawie, pobieranie źródeł na RAM i wysyłkę finałów konwersji, odbudowę
+  CHD, odczyt plików przy skanie; punkt kontrolny co 20 s między grami.
+- **Skan nie gubi plików przy zniknięciu NAS** — nieczytelny katalog nie jest
+  już pomijany po cichu (co oznaczało całe drzewo jako „brakujące"); skan
+  czeka na powrót, a przerwane czekanie = przerwany skan (nic nie oznaczone).
+- System nie usypia się sam (bezczynność) w czasie pracy zadania. Uśpienie po
+  zamknięciu pokrywy to ustawienie zasilania Windows — po wybudzeniu praca
+  czeka na NAS i rusza dalej.
+- Wolumin martwy już na starcie zadania nie wstrzymuje pracy (obserwowane są
+  tylko żywe); trwały błąd sieci przy działającym woluminie — kilka prób, potem
+  zwykły błąd (nie wieczne czekanie).
+
+### „Czy to się zawiesiło?" — strażnik ciszy i stan NAS w oknie postępu
+- Nowy `core/watchdog.py`: gdy przez 20 s nie ma żadnego zdarzenia (log,
+  pasek), program SAM loguje, w której funkcji stoi i na jakim pliku/grze
+  („⏳ [60 s bez postępu] trwa: …"), potem co minutę. Działa w KAŻDEJ fazie,
+  bez łatania pętli po kolei; linie trafiają do pliku logu.
+- Okno postępu: „brak nowych zdarzeń od m:ss — trwa ostatnia operacja…" oraz
+  sprawdzany w tle stan NAS („NAS odpowiada" / „NAS NIE odpowiada — program
+  czeka").
+
+### Formuła naprawy w jednym module (`core/repair.py`)
+- Cały przebieg naprawy/podglądu przeniesiony z okna do `repair_collection` —
+  GUI tylko go woła. Pozwala puścić podgląd CAŁEJ kolekcji bez GUI (audyt
+  cichych miejsc wszystkich platform naraz, testy), zamiast wyłapywać je u
+  usera platforma po platformie.
+
+### Planowanie naprawy nie dotyka NAS (Znajdź naprawy: godziny → minuty)
+- Pomiar na logu „Znajdź naprawy" (184 min): **107 min to cisza** — pytania do
+  NAS o pliki, które indeks już znał. Zasada: po skanie planowanie (podgląd i
+  planująca część naprawy) pracuje WYŁĄCZNIE na indeksie; realna naprawa pyta
+  dysk tylko o pliki, które faktycznie rusza, tuż przed operacją.
+- **Finał „porządki w ToSort" (~50 min ciszy)**: `is_file` na NAS dla KAŻDEGO
+  pliku kanonicznego kolekcji, zanim sprawdzono, czy w ogóle jest jakaś kopia.
+  Teraz kandydaci najpierw z indeksu; NAS tylko dla realnych kopii i tylko w
+  naprawie.
+- **Hardlinki znane indeksowi** (nowa kolumna `link_of`): program zapisuje je,
+  gdy sam tworzy hardlink albo go wykryje. Podgląd rozpoznaje „już zlinkowane"
+  bez `same_file` na NAS (dawniej per kandydat na link — 64 tys. w podglądzie).
+- **Nagłówki CHD czyta skan, nie naprawa**: liczba ścieżek CD i typ kontenera
+  zapisywane w indeksie z tego samego odczytu co profil zawartości (stare wpisy
+  z niepotwierdzonym układem uzupełnia najbliższy skan — raz). Odbudowa CHD w
+  podglądzie rozstrzyga z indeksu (dawniej `chdman info` ~6 s na plik PS2);
+  nieznane tylko liczy („sprawdzi je naprawa").
+- Dopasowanie: pusty ROM (.msu MSU-1) sprawdzany w indeksie, nie `isfile` +
+  `getsize` na NAS przy każdej grze MSU-1.
+- Wyszukiwanie DAT-ów: jeden obchód katalogów (typ pliku z listingu) zamiast
+  `rglob` + `is_file` per DAT; postęp „…szukam DAT-ów / sygnatury" co ~3 s.
+- Narzędzie audytu (skrypt deweloperski): podgląd całej kolekcji z emulacją
+  dysku z indeksu — każde wywołanie systemu plików na NAS liczone z miejscem w
+  kodzie.
+
+### Konwersja: bez ciszy przed PlayStation, skąd → dokąd w logu
+- Przed konwersją każda gra z DAT-u była sprawdzana na NAS (`is_file`
+  `<gra>.chd`) — pętla szła po GRACH DAT-u (PSX 1G1R: 4574), nie po ~1750
+  plikach na dysku, bez paska. Teraz jedno listowanie katalogu + postęp
+  „konwersja — sprawdzam: <gra>".
+- Każda linia konwersji/odbudowy ma pełne ścieżki: „KONWERSJA→ZIP: <źródło>
+  (+N plików)  →  <cel>", „ODBUDOWA CD→DVD: <plik>  →  <plik> (w miejscu)".
 
 ## [0.6.70] — 2026-09-24
 

@@ -66,6 +66,13 @@ class Settings:
     # rdzeni). 0 => auto (min(8, rdzenie_logiczne//2)). Mniej = mniej strumieni
     # I/O na NAS i mniej RAM-dysku naraz. Domyślnie 4.
     convert_workers: int = 4
+    # Ile POBIERAŃ (NAS→RAM) naraz w potoku konwersji/odbudowy. Domyślnie 1 =
+    # potok „na zakładkę" (user): jeden plik się pobiera; gdy skończy i zaczyna
+    # się przerabiać, rusza pobieranie następnego; gotowy idzie do wysyłki,
+    # a w tym czasie kolejne się przerabiają. Kilka pobrań naraz tylko dzieliło
+    # łącze. (Nowa nazwa pola — stare `gather_workers`=3 z 0.6.74–0.6.76 jest
+    # ignorowane przy wczytywaniu.)
+    download_workers: int = 1
     verify_after_create: bool = True
     # Round-trip: po createdvd wypakuj obraz i porównaj SHA-1 ze źródłem.
     # Silniejsze niż verify (dowód danych, nie tylko kontenera) — domyślnie ON,
@@ -133,7 +140,7 @@ class Settings:
     fix_incomplete: bool = False     # buduj też niekompletne gry
     fix_del_tosort: bool = True      # usuń z ToSort pliki już na miejscu
     fix_convert: bool = False        # konwertuj do formatu docelowego
-    fix_dedup: bool = True           # kopie potwierdzonych → symlinki
+    fix_dedup: bool = True           # kopie potwierdzonych → hardlinki
     # Równoległe hashowanie w skanie wg nośnika katalogu (NAS/SSD; HDD=1 zawsze).
     # Kilka odczytów naraz ukrywa latencję sieci/kolejkę SSD — duży zysk na
     # pierwszym skanie TB; na pojedynczym HDD szkodzi (skakanie głowicy).

@@ -150,7 +150,7 @@ class DatSettingsDialog(QDialog):
         self.chk_skip.setChecked(bool(eff.get("skip", False)))
         self.chk_complete = QCheckBox(tr("buduj tylko kompletne gry"))
         self.chk_complete.setChecked(bool(eff.get("only_complete", True)))
-        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → symlinki"))
+        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → hardlinki"))
         self.chk_dedup.setChecked(bool(eff.get("dedup_copies", True)))
         self.chk_trans = QCheckBox(tr("podmieniaj wersje (Japan) na tłumaczenia [T-En]"))
         self.chk_trans.setChecked(bool(eff.get("prefer_translations", False)))
@@ -172,13 +172,13 @@ class DatSettingsDialog(QDialog):
 
         if is_child:
             note_txt = tr("To DAT-DZIECKO swojej platformy — jego pliki to "
-                        "symlinki do plików RODZICA, więc format jest "
+                        "hardlinki do plików RODZICA, więc format jest "
                         "dziedziczony i niezmienialny tutaj. Zmień go w "
                         "ustawieniach DAT-a rodzica (albo w oknie hierarchii).")
         else:
             note_txt = tr("Format (chd/rvz/zip) to docelowy sposób przechowywania "
                         "RODZICA — dzieci platformy dziedziczą go automatycznie "
-                        "(są symlinkami). Konwersja przy naprawie jest osobnym "
+                        "(są hardlinkami). Konwersja przy naprawie jest osobnym "
                         "krokiem; teraz zapisujesz preferencję.")
         note = QLabel(note_txt)
         note.setWordWrap(True)

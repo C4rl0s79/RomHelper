@@ -82,7 +82,7 @@ class MultiDatSettingsDialog(QDialog):
         self._add_row(form, "only_complete", tr("Kompletność:"), self.chk_complete,
                       lambda: self.chk_complete.isChecked())
 
-        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → symlinki"))
+        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → hardlinki"))
         self._add_row(form, "dedup_copies", tr("Dedup:"), self.chk_dedup,
                       lambda: self.chk_dedup.isChecked())
 

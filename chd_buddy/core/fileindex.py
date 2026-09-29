@@ -34,12 +34,13 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
 from .settings import app_base_dir
+from . import netguard
 from .storage import same_volume
 
 INDEX_DB_FILENAME = "chd_buddy_index.sqlite3"
 
 # Próbnik zawartości CHD: path -> hex SHA-1 zawartości ("" gdy nieznane).
-ChdProber = Callable[[Path], str]
+ChdProber = Callable[[Path], object]   # str (data_sha1) albo (data_sha1, cd_tracks, cd_typed)
 # Callback postępu: (liczba widzianych plików, aktualna ścieżka).
 FileCB = Callable[[int, Path], None]
 
@@ -71,12 +72,24 @@ CREATE TABLE IF NOT EXISTS files (
     -- CHD gry CD: czy UKŁAD ścieżek (liczba/rodzaj torów) zgadza się z DAT.
     -- -1 = niesprawdzony, 1 = zgodny. Odbudowa CHD pomija zgodne BEZ czytania
     -- nagłówka z NAS (dawniej każdy przebieg sprawdzał setki PSX/Saturn/DC).
-    layout_ok INTEGER NOT NULL DEFAULT -1
+    layout_ok INTEGER NOT NULL DEFAULT -1,
+    -- CHD: z NAGŁÓWKA czytanego przy skanie (chdman info — i tak czytany dla
+    -- data_sha1): liczba ścieżek CD w metadanych i czy kontener jest „CD"
+    -- (createcd). -1 = nieznane. Planowanie naprawy porównuje je z DAT-em BEZ
+    -- czytania nagłówków z NAS.
+    cd_tracks INTEGER NOT NULL DEFAULT -1,
+    cd_typed INTEGER NOT NULL DEFAULT -1,
+    -- HARDLINK znany programowi: normcase ścieżki pliku, z którym ten wpis
+    -- dzieli treść fizycznie (program go utworzył albo wykrył). Hardlink nie
+    -- jest reparse pointem, więc skan widzi go jak zwykły plik — bez tej wiedzy
+    -- planowanie musiało pytać NAS (same_file) o każdą kopię. '' = nieznane.
+    link_of TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
 CREATE INDEX IF NOT EXISTS idx_files_md5 ON files(md5);
 CREATE INDEX IF NOT EXISTS idx_files_data_sha1 ON files(data_sha1);
+CREATE INDEX IF NOT EXISTS idx_files_size_mtime ON files(size, mtime_ns);
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
     archive TEXT NOT NULL,
@@ -193,9 +206,13 @@ def is_reparse_stat(st: os.stat_result) -> bool:
 
 # Artefakty robocze kombajnu — NIGDY nie indeksowane (żywe pliki tymczasowe
 # naprawy/ekstrakcji/dedupu nie mogą stać się kandydatami dopasowania).
-_TEMP_DIR_PREFIXES = ("chdbuddy_", "chddeep_", "chd_buddy_")
+_TEMP_DIR_PREFIXES = ("chdbuddy_", "chddeep_", "chd_buddy_", ".rh_upload_")
 _TEMP_FILE_MARKERS = (".rtcheck.", ".chdbuddy_extract_tmp",
-                      ".chdbuddy_dedup_tmp", ".chd_tmp", ".json.tmp")
+                      ".chdbuddy_dedup_tmp", ".chd_tmp", ".json.tmp",
+                      # przerwana wysyłka / podmiana symlinku na hardlink —
+                      # resztki NIE mogą trafić do indeksu jako zwykłe pliki
+                      ".chdbuddy_move_tmp", ".rh_hardlink_tmp",
+                      ".chdbuddy_rebuild_tmp")
 
 
 def _is_temp_artifact(name: str, is_dir: bool) -> bool:
@@ -206,8 +223,28 @@ def _is_temp_artifact(name: str, is_dir: bool) -> bool:
             or any(m in low for m in _TEMP_FILE_MARKERS))
 
 
-def _walk(root: Path, skip_dirs: Optional[set] = None
-          ) -> Iterator[tuple[Path, os.stat_result, bool]]:
+def _list_dir(d: Path) -> list:
+    """Jeden katalog: [(ścieżka, lstat, czy_katalog, czy_link)] bez plików
+    tymczasowych kombajnu. Na Windows `DirEntry.stat(follow_symlinks=False)`
+    bierze dane z listingu (bez dodatkowej rundy SMB). OSError z scandir leci
+    wyżej (obsługa zaniku sieci w obchodzie)."""
+    out = []
+    with os.scandir(d) as it:
+        entries = list(it)
+    for e in entries:
+        try:
+            st = e.stat(follow_symlinks=False)
+            is_dir = e.is_dir(follow_symlinks=False)
+        except OSError:
+            continue
+        if _is_temp_artifact(e.name, is_dir):
+            continue
+        out.append((Path(e.path), st, is_dir, is_reparse_stat(st)))
+    return out
+
+
+def _walk(root: Path, skip_dirs: Optional[set] = None, cancel=None,
+          workers: int = 1) -> Iterator[tuple[Path, os.stat_result, bool]]:
     """Rekurencyjny scandir; yielduje (ścieżka, lstat, czy_link).
 
     W linkowane katalogi NIE wchodzi (yielduje je jako linki) — inaczej
@@ -219,32 +256,77 @@ def _walk(root: Path, skip_dirs: Optional[set] = None
     Sam pokrywający korzeń zostaje przeskanowany, tylko te podkatalogi pomijamy
     — bez utraty pokrycia reszty drzewa (ważne: pominięte pliki NIE są liczone
     jako widziane, więc nie stają się „duchami").
+
+    `workers` > 1 — katalogi listowane RÓWNOLEGLE (NAS: każdy scandir to
+    runda sieciowa ~33 ms przez Tailscale; tysiące katalogów gier bin/cue
+    szeregowo = minuty samego czekania). Kolejność plików wtedy dowolna.
     """
-    stack = [root]
-    while stack:
-        d = stack.pop()
-        try:
-            it = os.scandir(d)
-        except OSError:
-            continue
-        with it:
-            for e in it:
-                try:
-                    st = e.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if _is_temp_artifact(e.name, e.is_dir(follow_symlinks=False)):
-                    continue
-                link = is_reparse_stat(st)
-                if e.is_dir(follow_symlinks=False):
-                    if link:
-                        yield Path(e.path), st, True
-                    elif skip_dirs and os.path.normcase(e.path) in skip_dirs:
-                        continue                   # już przeskanowany osobno
-                    else:
-                        stack.append(Path(e.path))
+    def _dispatch(listing, push):
+        for path, st, is_dir, link in listing:
+            if is_dir:
+                if link:
+                    yield path, st, True
+                elif skip_dirs and os.path.normcase(str(path)) in skip_dirs:
+                    continue                   # już przeskanowany osobno
                 else:
-                    yield Path(e.path), st, link
+                    push(path)
+            else:
+                yield path, st, link
+
+    def _net_retry(d, err) -> Optional[bool]:
+        """NAS zniknął (uśpienie laptopa, restart routera)? — czekaj i
+        przeczytaj katalog PONOWNIE; pominięcie oznaczyłoby całe drzewo jako
+        „brakujące". True = ponów, False = koniec obchodu (przerwane czekanie
+        — skan zauważy przerwanie i niczego nie oznaczy jako brak), None =
+        zwykły błąd katalogu (pomiń)."""
+        if netguard.is_net_error(err) or not netguard.alive(d):
+            return bool(netguard.wait_until_back([d], cancel=cancel))
+        return None
+
+    if workers <= 1:
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                listing = _list_dir(d)
+            except OSError as err:
+                r = _net_retry(d, err)
+                if r:
+                    stack.append(d)
+                elif r is False:
+                    return
+                continue
+            yield from _dispatch(listing, stack.append)
+        return
+
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    ex = ThreadPoolExecutor(max_workers=workers)
+    pending: dict = {}
+
+    def push(d):
+        pending[ex.submit(_list_dir, d)] = d
+
+    try:
+        push(root)
+        while pending:
+            if cancel is not None and cancel.is_set():
+                return
+            done, _ = wait(list(pending), timeout=0.5,
+                           return_when=FIRST_COMPLETED)
+            for fut in done:
+                d = pending.pop(fut)
+                try:
+                    listing = fut.result()
+                except OSError as err:
+                    r = _net_retry(d, err)
+                    if r:
+                        push(d)
+                    elif r is False:
+                        return
+                    continue
+                yield from _dispatch(listing, push)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 @dataclass
@@ -291,6 +373,11 @@ class FileIndex:
         # zapytań SELECT przy matchingu całej kolekcji to minuty; wczytanie
         # indeksu raz i dopasowanie w RAM to sekundy. None => nieaktywny.
         self._mcache = None
+        # KATALOGI OPUSZCZONE w tym przebiegu (plik skasowany/przeniesiony stąd):
+        # normcase → ścieżka. Jedyni kandydaci do „pusty katalog → usuń" —
+        # zamiast os.walk całego drzewa na NAS (Wii: 1266 podkatalogów = minuty
+        # ciszy przez internet).
+        self._vacated: dict = {}
         self._db.executescript(_SCHEMA)
         # migracja starych baz (CREATE IF NOT EXISTS nie dodaje kolumn)
         try:
@@ -314,6 +401,17 @@ class FileIndex:
             self._db.execute(
                 "ALTER TABLE files ADD COLUMN layout_ok "
                 "INTEGER NOT NULL DEFAULT -1")
+        except sqlite3.OperationalError:
+            pass                       # kolumna już jest
+        for _col in ("cd_tracks", "cd_typed"):
+            try:
+                self._db.execute(f"ALTER TABLE files ADD COLUMN {_col} "
+                                 "INTEGER NOT NULL DEFAULT -1")
+            except sqlite3.OperationalError:
+                pass                   # kolumna już jest
+        try:
+            self._db.execute("ALTER TABLE files ADD COLUMN link_of "
+                             "TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass                       # kolumna już jest
         self._db.commit()
@@ -356,24 +454,26 @@ class FileIndex:
         """Zapisuje policzony plik: profil CHD (data_sha1), wiersz w `files`,
         członków archiwum. Wspólne dla skanu serialnego i równoległego. Zwraca
         liczbę operacji do licznika commitu."""
-        ds = ""
-        if chd_prober and path.suffix.lower() == ".chd":
-            ds = self._probe_chd(chd_prober, path, log)
         cur.execute(
             "INSERT INTO files(path, size, mtime_ns, crc32, md5, sha1, "
-            "                  data_sha1, is_link, missing, scanned_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?) "
+            "                  data_sha1, is_link, missing, scanned_at, "
+            "                  cd_tracks, cd_typed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?) "
             "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
             "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
             "  md5=excluded.md5, sha1=excluded.sha1, "
             "  data_sha1=excluded.data_sha1, is_link=0, missing=0, "
             "  scanned_at=excluded.scanned_at, deep_fail=0, "
-            "  bad_container=-1, layout_ok=-1",  # plik się zmienił → od nowa
-            (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, ds, now),
+            "  bad_container=-1, layout_ok=-1, "  # plik się zmienił → od nowa
+            "  cd_tracks=excluded.cd_tracks, cd_typed=excluded.cd_typed, "
+            "  link_of=''",
+            (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, "", now, -1, -1),
         )
         stats.hashed += 1
         stats.bytes_hashed += st.st_size
         added = 1
+        if suffix == "chd":
+            added += self._know_chd(cur, key, path, chd_prober, log)
         if suffix in ARCHIVE_EXTS:
             cur.execute("DELETE FROM members WHERE archive=?", (key,))
             # NOWE/ZMIENIONE archiwum zawsze skanujemy PEŁNIE (SHA-1 zawartości)
@@ -443,6 +543,9 @@ class FileIndex:
         # postęp bajtowy TEGO pliku na własnym pasku (slot_progress) — dzięki
         # temu widać kilka wielkich RVZ/CHD liczonych równolegle.
         workers = max(1, int(workers or 1))
+        # listowanie katalogów równolegle wg nośnika: NAS (8 wątków hash) → 16
+        # naraz (czysta latencja sieci), SSD → 8, HDD (1) → szeregowo
+        list_workers = 1 if workers <= 1 else min(32, workers * 2)
         ex = None
         inflight: list = []            # (future, key, st, path, suffix) FIFO
         max_inflight = workers * 3
@@ -457,7 +560,9 @@ class FileIndex:
                 if slot_progress is not None:
                     cb = (lambda dn, tt, _s=sl, _nm=p.name:
                           slot_progress(_s, dn, tt, _nm))
-                return hash_file(p, on_progress=cb, cancel=cancel)
+                return netguard.call(
+                    lambda: hash_file(p, on_progress=cb, cancel=cancel), p,
+                    what=f"odczyt {p.name}", cancel=cancel)
             finally:
                 with slot_lock:
                     slot_pool.append(sl)
@@ -497,7 +602,8 @@ class FileIndex:
 
         try:
             cancelled = False
-            for path, st, link in _walk(root, _skip_norm or None):
+            for path, st, link in _walk(root, _skip_norm or None, cancel,
+                                        list_workers):
                 if cancel is not None and cancel.is_set():
                     cancelled = True
                     break                      # to, co policzone, zostaje w bazie
@@ -509,12 +615,32 @@ class FileIndex:
                 if link:
                     stats.links += 1
                     seen.append(key)
+                    # CEL symlinku do indeksu (link_of) — RAZ, gdy link nowy albo
+                    # zmieniony (mtime). Dopasowanie porównuje z indeksem zamiast
+                    # pytać NAS o każdy link (islink+readlink+exists = 3 rundy SMB
+                    # na grę → „20 s bez postępu" w Znajdź naprawy, 29.09).
+                    old = cur.execute("SELECT mtime_ns, link_of, is_link FROM files "
+                                      "WHERE path=?", (key,)).fetchone()
+                    tgt = (old["link_of"] if old is not None and old["is_link"]
+                           and old["mtime_ns"] == st.st_mtime_ns and old["link_of"]
+                           else "")
+                    if not tgt:
+                        try:
+                            t = os.readlink(str(path))
+                            if not os.path.isabs(t):
+                                t = os.path.join(os.path.dirname(str(path)), t)
+                            tgt = os.path.normcase(os.path.abspath(
+                                t.replace("\\\\?\\", "")))
+                        except OSError:
+                            tgt = ""
                     cur.execute(
-                        "INSERT INTO files(path, size, mtime_ns, is_link, missing, scanned_at) "
-                        "VALUES (?, 0, ?, 1, 0, ?) "
+                        "INSERT INTO files(path, size, mtime_ns, is_link, missing, "
+                        "                  scanned_at, link_of) "
+                        "VALUES (?, 0, ?, 1, 0, ?, ?) "
                         "ON CONFLICT(path) DO UPDATE SET is_link=1, missing=0, "
-                        "  mtime_ns=excluded.mtime_ns, scanned_at=excluded.scanned_at",
-                        (key, st.st_mtime_ns, now),
+                        "  mtime_ns=excluded.mtime_ns, scanned_at=excluded.scanned_at, "
+                        "  link_of=excluded.link_of",
+                        (key, st.st_mtime_ns, now, tgt),
                     )
                     pending += 1
                 else:
@@ -523,7 +649,8 @@ class FileIndex:
                         stats.filtered += 1
                         continue
                     row = cur.execute(
-                        "SELECT size, mtime_ns, sha1, data_sha1, missing FROM files WHERE path=?",
+                        "SELECT size, mtime_ns, sha1, data_sha1, missing, cd_tracks, "
+                        "layout_ok, bad_container FROM files WHERE path=?",
                         (key,),
                     ).fetchone()
                     # SIZE CAP: nowy plik surowy większy niż największy ROM włączonych
@@ -559,12 +686,14 @@ class FileIndex:
                         if row["missing"]:
                             cur.execute("UPDATE files SET missing=0 WHERE path=?", (key,))
                             pending += 1
-                        # backfill zawartości CHD, jeśli teraz mamy próbnik
-                        if chd_prober and not row["data_sha1"] and path.suffix.lower() == ".chd":
-                            ds = self._probe_chd(chd_prober, path, log)
-                            if ds:
-                                cur.execute("UPDATE files SET data_sha1=? WHERE path=?", (ds, key))
-                                pending += 1
+                        # wiedza o CHD (profil/układ/kontener): bliźniak z
+                        # indeksu, chdman tylko gdy wciąż nieznana (raz — potem
+                        # planowanie naprawy bierze ją z indeksu, bez NAS)
+                        if path.suffix.lower() == ".chd":
+                            k = self._know_chd(cur, key, path, chd_prober, log)
+                            if k:
+                                stats.adopted += 1
+                                pending += k
                         # backfill/UPGRADE członków archiwum: brak członków ALBO
                         # członkowie bez SHA-1 (stary skan szybki = tylko CRC) →
                         # doskanuj PEŁNIE (SHA-1 zawartości). „Zawsze wiemy co
@@ -576,9 +705,20 @@ class FileIndex:
                                 "SELECT COUNT(*) FROM members WHERE archive=? AND "
                                 "(sha1='' OR sha1 IS NULL)", (key,)).fetchone()[0]
                             if n == 0 or no_sha:
-                                cur.execute("DELETE FROM members WHERE archive=?", (key,))
-                                pending += self._index_members(cur, key, path, log,
-                                                               full=True)
+                                # NAJPIERW z bliźniaka w indeksie (hardlink/kopia —
+                                # ta sama suma CAŁEGO pliku = ta sama zawartość):
+                                # bez otwierania zipa na NAS. Hardlinki z naprawy
+                                # 0.6.81 (przed poprawką) miały sumy bez członków →
+                                # skan otwierał i hashował KAŻDY link (~0,3 s/plik).
+                                if self._borrow_members(cur, key, row["sha1"],
+                                                        st.st_size):
+                                    stats.adopted += 1
+                                    pending += 1
+                                else:
+                                    cur.execute("DELETE FROM members WHERE archive=?",
+                                                (key,))
+                                    pending += self._index_members(cur, key, path, log,
+                                                                   full=True)
                         # NIE otwieramy tu ZIP-a, by wykryć metodę kompresji: na NAS
                         # to SZEREGOWE otwarcie centralnego katalogu KAŻDEGO zipa =
                         # jedna runda SMB na plik (sieć/CPU ~0%, sama latencja) →
@@ -598,6 +738,13 @@ class FileIndex:
                                 stats.adopted += 1
                                 pending += 1
                                 continue
+                            # HARDLINK znanego pliku pod NOWĄ ścieżką (np. po
+                            # zmianie katalogów DAT-ów): ten sam plik fizyczny
+                            # (identyfikator pliku) → sumy bez czytania danych
+                            if self._adopt_hardlink(cur, key, path, st, now):
+                                stats.adopted += 1
+                                pending += 1
+                                continue
                         if ex is not None:
                             # RÓWNOLEGLE: zleć hash do puli (czyta bajty — na NAS/SSD
                             # kilka naraz ukrywa latencję), zapis do SQLite ODROCZONY
@@ -611,8 +758,11 @@ class FileIndex:
                             try:
                                 _dcb = ((lambda dn, tt: detail(dn, tt, path.name))
                                         if detail is not None else None)
-                                crc, md5, sha1 = hash_file(path, on_progress=_dcb,
-                                                           cancel=cancel)
+                                crc, md5, sha1 = netguard.call(
+                                    lambda: hash_file(path, on_progress=_dcb,
+                                                      cancel=cancel),
+                                    path, what=f"odczyt {path.name}",
+                                    cancel=cancel)
                             except HashAborted:
                                 cancelled = True
                                 break
@@ -629,6 +779,13 @@ class FileIndex:
                     self._db.commit()
                     pending = 0
 
+            # obchód skończony przez przerwane czekanie na NAS, albo wolumin
+            # zniknął na sam koniec — NIE oznaczaj brakujących (niepełny obraz)
+            if cancel is not None and cancel.is_set():
+                cancelled = True
+            elif not netguard.alive(root):
+                if not netguard.wait_until_back([root], cancel=cancel):
+                    cancelled = True
             if cancelled:
                 # przerwano: porzuć zadania w locie (przeliczą się przy kolejnym
                 # skanie), zapisz to, co już policzone
@@ -718,6 +875,124 @@ class FileIndex:
                        if m else "") + ".")
         return n
 
+    # Kolumny opisujące TREŚĆ pliku (nie ścieżkę): identyczne bajty = identyczne
+    # wartości. Kopiowanie wpisu z bliźniaka (hardlink, przeniesienie) MUSI brać
+    # je WSZYSTKIE — dawniej każda ścieżka miała własną listę bez sondy CHD
+    # (cd_tracks/layout_ok/bad_container) → skan pytał chdman po NAS o każdy
+    # świeży hardlink CHD, pojedynczo (1344 PS1/PS2, 29.09).
+    _CONTENT_COLS = ("crc32", "md5", "sha1", "data_sha1", "deep_fail",
+                     "bad_container", "bad_zip_method", "layout_ok",
+                     "cd_tracks", "cd_typed")
+    _PROBE_COLS = ("data_sha1", "deep_fail", "bad_container", "layout_ok",
+                   "cd_tracks", "cd_typed")
+
+    @classmethod
+    def _copy_content(cls, cur, key: str, src, size: int, mtime_ns: int,
+                      now: str, link_of: str = "") -> None:
+        """Wpis `key` = treść wiersza `src` (wszystkie kolumny treści)."""
+        cols = cls._CONTENT_COLS
+        names = ", ".join(cols)
+        marks = ", ".join("?" for _ in cols)
+        upd = ", ".join(f"{c}=excluded.{c}" for c in cols)
+        cur.execute(
+            f"INSERT INTO files(path, size, mtime_ns, {names}, is_link, missing, "
+            f"                  scanned_at, link_of) "
+            f"VALUES (?, ?, ?, {marks}, 0, 0, ?, ?) "
+            f"ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
+            f"  mtime_ns=excluded.mtime_ns, {upd}, is_link=0, missing=0, "
+            f"  scanned_at=excluded.scanned_at, link_of=excluded.link_of",
+            (key, size, mtime_ns, *[src[c] for c in cols], now, link_of))
+
+    # wartość „nieznane” kolumn sondy (świeży wpis, zanim cokolwiek sprawdzono)
+    _PROBE_UNKNOWN = {"data_sha1": "", "deep_fail": 0, "bad_container": -1,
+                      "layout_ok": -1, "cd_tracks": -1, "cd_typed": -1}
+
+    @classmethod
+    def _borrow_probe(cls, cur, key: str, sha1: str, size: int) -> bool:
+        """Wiedza z sondy CHD (profil, układ, kontener, porażka identyfikacji)
+        z BLIŹNIAKÓW o tej samej sumie całego pliku — bez chdman na NAS.
+        Uzupełnia TYLKO kolumny nieznane u `key`, z dowolnego bliźniaka, który
+        je zna. True = coś uzupełniono."""
+        if not sha1:
+            return False
+        row = cur.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone()
+        if row is None:
+            return False
+        unk = cls._PROBE_UNKNOWN
+        lacking = [c for c in cls._PROBE_COLS
+                   if row[c] is None or row[c] == unk[c]]
+        if not lacking:
+            return False
+        twins = cur.execute(
+            "SELECT * FROM files WHERE sha1=? AND size=? AND path<>? "
+            "ORDER BY missing", (sha1, size, key)).fetchall()
+        upd: dict = {}
+        for c in lacking:
+            for t in twins:
+                if t[c] is not None and t[c] != unk[c]:
+                    upd[c] = t[c]
+                    break
+        if not upd:
+            return False
+        cur.execute(f"UPDATE files SET {', '.join(f'{c}=?' for c in upd)} "
+                    f"WHERE path=?", (*upd.values(), key))
+        return True
+
+    @staticmethod
+    def _chd_unknown(r) -> bool:
+        """CHD wymaga sondy: brak profilu treści ALBO nieznany układ ścieżek
+        przy niepotwierdzonym kontenerze."""
+        return (not r["data_sha1"]
+                or (r["cd_tracks"] < 0 and r["layout_ok"] != 1
+                    and r["bad_container"] < 0))
+
+    def _know_chd(self, cur, key: str, path: Path, prober, log) -> int:
+        """JEDYNA droga skanu do wiedzy o CHD (plik nowy i znany): najpierw
+        bliźniak z indeksu (hardlink/kopia), chdman na NAS tylko dla tego, co
+        wciąż nieznane. Zwraca liczbę zapisów (0 = nic nie trzeba było)."""
+        row = cur.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone()
+        if row is None or not self._chd_unknown(row):
+            return 0
+        ops = 0
+        if self._borrow_probe(cur, key, row["sha1"], row["size"]):
+            ops += 1
+            row = cur.execute("SELECT * FROM files WHERE path=?",
+                              (key,)).fetchone()
+            if not self._chd_unknown(row):
+                return ops
+        if prober is None:
+            return ops
+        ds, trk, cdt = self._probe_chd(prober, path, log)
+        if ds and not row["data_sha1"]:
+            cur.execute("UPDATE files SET data_sha1=? WHERE path=?", (ds, key))
+            ops += 1
+        if trk >= 0 or cdt >= 0:
+            cur.execute("UPDATE files SET cd_tracks=?, cd_typed=? WHERE path=?",
+                        (trk, cdt, key))
+            ops += 1
+        return ops
+
+    def fill_from_twins(self, log=None) -> int:
+        """JEDEN przebieg po indeksie (bez NAS): każdy CHD z niepełną wiedzą
+        o treści dostaje ją od bliźniaków (hardlink/kopia, ta sama suma). Woła
+        się przed KAŻDĄ fazą, która sonduje CHD (skan, sonda CHD) — żadna nie
+        może pytać chdman o coś, co indeks już wie (29.09: 2942 hardlinków
+        REDUMP w fazie sondy po poprawce samego skanu)."""
+        rows = self._db.execute(
+            "SELECT path, sha1, size FROM files WHERE missing=0 AND is_link=0 "
+            "AND sha1<>'' AND lower(path) LIKE '%.chd' AND (data_sha1='' "
+            "OR bad_container=-1 OR layout_ok=-1 OR cd_tracks=-1 "
+            "OR cd_typed=-1)").fetchall()
+        cur = self._db.cursor()
+        n = 0
+        for r in rows:
+            if self._borrow_probe(cur, r["path"], r["sha1"], r["size"]):
+                n += 1
+        self._db.commit()
+        if n and log:
+            log(f"Wiedza o CHD przejęta od bliźniaków (bez chdman): {n}")
+        return n
+
     @staticmethod
     def _adopt_moved(cur, key: str, path: Path, st, now: str) -> bool:
         """Przejmuje wpis PRZENIESIONEGO pliku bez ponownego liczenia sum.
@@ -743,21 +1018,78 @@ class FileIndex:
         if len(matches) != 1:
             return False                     # niejednoznaczne => policz normalnie
         old = matches[0]
-        cur.execute(
-            "INSERT INTO files(path, size, mtime_ns, crc32, md5, sha1, "
-            "                  data_sha1, is_link, missing, scanned_at, deep_fail) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?) "
-            "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
-            "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
-            "  md5=excluded.md5, sha1=excluded.sha1, "
-            "  data_sha1=excluded.data_sha1, is_link=0, missing=0, "
-            "  scanned_at=excluded.scanned_at, deep_fail=excluded.deep_fail",
-            (key, st.st_size, st.st_mtime_ns, old["crc32"], old["md5"],
-             old["sha1"], old["data_sha1"], now, old["deep_fail"]))
+        FileIndex._copy_content(cur, key, old, st.st_size, st.st_mtime_ns, now)
         cur.execute("UPDATE members SET archive=? WHERE archive=?",
                     (key, old["path"]))
         cur.execute("DELETE FROM files WHERE path=?", (old["path"],))
         return True
+
+    @staticmethod
+    def _borrow_members(cur, key: str, sha1: str, size: int) -> int:
+        """Członkowie archiwum `key` skopiowani z INNEGO wpisu o tej samej sumie
+        SHA-1 i rozmiarze CAŁEGO pliku (identyczne bajty = identyczna
+        zawartość), który ma pełnych członków (z SHA-1). Zwraca liczbę
+        skopiowanych (0 = brak bliźniaka — trzeba otworzyć archiwum)."""
+        if not sha1:
+            return 0
+        # także wpisy BRAKUJĄCE (missing=1): plik zniknął, ale jego członkowie
+        # to wciąż prawda o tej treści (ta sama suma całego archiwum). Dawniej
+        # hardlink, którego cel usunięto/przeniesiono, tracił jedyne źródło
+        # członków → skan otwierał go na NAS (1373 zipy Mega Drive, ~0,3 s/plik).
+        twins = cur.execute(
+            "SELECT path FROM files WHERE sha1=? AND size=? AND path<>? "
+            "ORDER BY missing", (sha1, size, key)).fetchall()
+        for t in twins:
+            src = t[0]
+            n, no_sha = cur.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN sha1='' OR sha1 IS NULL "
+                "THEN 1 ELSE 0 END) FROM members WHERE archive=?",
+                (src,)).fetchone()
+            if not n or no_sha:
+                continue
+            cur.execute("DELETE FROM members WHERE archive=?", (key,))
+            cur.execute(
+                "INSERT OR IGNORE INTO members(archive, name, size, crc32, md5, sha1) "
+                "SELECT ?, name, size, crc32, md5, sha1 FROM members WHERE archive=?",
+                (key, src))
+            return n
+        return 0
+
+    @staticmethod
+    def _adopt_hardlink(cur, key: str, path: Path, st, now: str) -> bool:
+        """Nowa ścieżka będąca HARDLINKIEM pliku już zaindeksowanego: ten sam
+        rozmiar i mtime (hardlink dzieli je z celem) ORAZ ten sam identyfikator
+        pliku (st_ino+st_dev — sprawdzane os.stat, jedna runda SMB na
+        kandydata zamiast czytania całego pliku). Przejmuje sumy, data_sha1 i
+        członków; zapisuje link_of."""
+        cands = cur.execute(
+            "SELECT * FROM files WHERE size=? AND mtime_ns=? AND is_link=0 "
+            "AND missing=0 AND sha1<>'' AND path<>? LIMIT 8",
+            (st.st_size, st.st_mtime_ns, key)).fetchall()
+        if not cands:
+            return False
+        try:
+            me = os.stat(path)
+        except OSError:
+            return False
+        if not me.st_ino:
+            return False
+        for c in cands:
+            try:
+                other = os.stat(c["path"])
+            except OSError:
+                continue
+            if other.st_ino != me.st_ino or other.st_dev != me.st_dev:
+                continue
+            FileIndex._copy_content(cur, key, c, st.st_size, st.st_mtime_ns,
+                                    now, os.path.normcase(c["path"]))
+            cur.execute("DELETE FROM members WHERE archive=?", (key,))
+            cur.execute(
+                "INSERT OR IGNORE INTO members(archive, name, size, crc32, md5, sha1) "
+                "SELECT ?, name, size, crc32, md5, sha1 FROM members WHERE archive=?",
+                (key, c["path"]))
+            return True
+        return False
 
     @staticmethod
     def _index_members(cur, key: str, path: Path, log, full: bool = False) -> int:
@@ -885,13 +1217,19 @@ class FileIndex:
                           hashlib.sha1(blob).hexdigest())
 
     @staticmethod
-    def _probe_chd(prober: ChdProber, path: Path, log) -> str:
+    def _probe_chd(prober: ChdProber, path: Path, log) -> tuple:
+        """(data_sha1, cd_tracks, cd_typed) — próbnik może zwrócić sam SHA-1
+        (str) albo krotkę z danymi nagłówka; brak = ("", -1, -1)."""
         try:
-            return prober(path) or ""
+            res = prober(path)
         except Exception as e:  # próbnik nie może ubić skanu
             if log:
                 log(f"CHD prober: {path}: {e}")
-            return ""
+            return "", -1, -1
+        if isinstance(res, tuple):
+            ds, trk, cdt = (list(res) + [-1, -1])[:3]
+            return ds or "", int(trk), int(cdt)
+        return res or "", -1, -1
 
     def _mark_missing(self, root: Path, seen: Iterable[str],
                       skip_norm: Optional[set] = None) -> int:
@@ -966,6 +1304,10 @@ class FileIndex:
                 m_crc.setdefault((r["crc32"], r["size"]), []).append(r)
         self._mcache = {"sha1": by_sha1, "crc": by_crc, "md5": by_md5,
                         "data": by_data, "msha": m_sha, "mcrc": m_crc}
+        # miliony wierszy w RAM na czas dopasowania — nie każ pełnemu GC ich
+        # przeglądać co kilkanaście sekund (pauza całego programu do ~2 s)
+        from .gcpause import settle
+        settle()
 
     def drop_match_cache(self) -> None:
         self._mcache = None
@@ -1096,9 +1438,13 @@ class FileIndex:
             "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
             "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
             "  md5=excluded.md5, sha1=excluded.sha1, is_link=0, missing=0, "
-            "  scanned_at=excluded.scanned_at, layout_ok=-1",
+            "  scanned_at=excluded.scanned_at, layout_ok=-1, cd_tracks=-1, "
+            "  cd_typed=-1, link_of=''",
             (str(p), st.st_size, st.st_mtime_ns, crc32.lower(), md5.lower(),
              sha1.lower(), now))
+        # kopia znanej treści (np. CHD kopiowane dla innej platformy): wynik
+        # sondy z bliźniaka — inaczej skan sondowałby ją chdman po NAS
+        self._borrow_probe(self._db, str(p), sha1.lower(), st.st_size)
         self._db.commit()
 
     def all_under(self, root: Path | str, physical_only: bool = True) -> list[sqlite3.Row]:
@@ -1108,6 +1454,24 @@ class FileIndex:
         if physical_only:
             q += " AND is_link=0"
         return self._db.execute(q, (len(prefix), prefix)).fetchall()
+
+    def count_under(self, root: Path | str, skip=()) -> int:
+        """Liczba znanych (nie-brakujących) wpisów pod `root` — SZACUNEK
+        mianownika paska skanu z poprzedniego skanu, jednym zapytaniem SQL.
+        Zastępuje osobny obchód NAS („liczenie plików") przed skanem, który
+        dublował pracę samego skanu. `skip` — poddrzewa skanowane osobno."""
+        def _n(r) -> int:
+            prefix = str(Path(os.path.abspath(r))).rstrip("/" + os.sep) + os.sep
+            return self._db.execute(
+                "SELECT COUNT(*) FROM files WHERE missing=0 "
+                "AND substr(path, 1, ?) = ?", (len(prefix), prefix)).fetchone()[0]
+        total = _n(root)
+        rn = os.path.normcase(os.path.abspath(str(root))).rstrip("/" + os.sep) + os.sep
+        for sk in skip or ():
+            skn = os.path.normcase(os.path.abspath(str(sk)))
+            if skn.startswith(rn):
+                total -= _n(sk)
+        return max(total, 0)
 
     def identified_chds_under(self, root: Path | str) -> list[sqlite3.Row]:
         """Fizyczne .chd pod `root` z USTALONYM odciskiem treści (data_sha1) —
@@ -1133,6 +1497,8 @@ class FileIndex:
         wpis pliku pozostaje AKTUALNY (skan uzna go za świeży)."""
         old_key = str(Path(os.path.abspath(old)))
         new_key = str(Path(os.path.abspath(new)))
+        self._note_vacated(old_key)
+        self._hand_over_members(new_key)          # nadpisywany wpis
         self._db.execute("DELETE FROM files WHERE path=?", (new_key,))
         self._db.execute("UPDATE files SET path=? WHERE path=?", (new_key, old_key))
         # osieroceni członkowie pod nową ścieżką (gdyby coś było) → precz, potem
@@ -1170,6 +1536,20 @@ class FileIndex:
                          (int(bad), key))
         self._db.commit()
 
+    def chd_header(self, path: Path | str) -> tuple:
+        """(cd_tracks, cd_typed) CHD z indeksu (z nagłówka czytanego przy
+        skanie); (-1, -1) = nieznane. Bez dostępu do dysku."""
+        row = self.lookup(path)
+        if row is None or row["missing"] or "cd_tracks" not in row.keys():
+            return -1, -1
+        return int(row["cd_tracks"]), int(row["cd_typed"])
+
+    def set_chd_header(self, path: Path | str, tracks: int, cd_typed: int) -> None:
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET cd_tracks=?, cd_typed=? WHERE path=?",
+                         (int(tracks), int(cd_typed), key))
+        self._db.commit()
+
     def set_layout_ok(self, path: Path | str, ok: int) -> None:
         """Zapisuje wynik sprawdzenia UKŁADU ścieżek CHD gry CD vs DAT:
         -1 niesprawdzony, 1 zgodny (odbudowa go pominie bez czytania z NAS)."""
@@ -1186,12 +1566,98 @@ class FileIndex:
                          (int(bad), key))
         self._db.commit()
 
+    def _hand_over_members(self, key: str) -> None:
+        """Przed usunięciem wpisu archiwum: jego członkowie przechodzą na
+        BLIŹNIAKÓW (ta sama suma i rozmiar — hardlinki/kopie), którzy ich nie
+        mają. Inaczej skasowanie jednej nazwy hardlinku kasowało jedyną w
+        indeksie wiedzę o zawartości, a pozostałe nazwy trzeba było otwierać."""
+        r = self._db.execute("SELECT sha1, size FROM files WHERE path=?",
+                             (key,)).fetchone()
+        if r is None or not r["sha1"]:
+            return
+        if not self._db.execute("SELECT 1 FROM members WHERE archive=? LIMIT 1",
+                                (key,)).fetchone():
+            return
+        for (twin,) in self._db.execute(
+                "SELECT path FROM files WHERE sha1=? AND size=? AND path<>? "
+                "AND NOT EXISTS (SELECT 1 FROM members m WHERE m.archive=files.path)",
+                (r["sha1"], r["size"], key)).fetchall():
+            self._db.execute(
+                "INSERT OR IGNORE INTO members(archive, name, size, crc32, md5, sha1) "
+                "SELECT ?, name, size, crc32, md5, sha1 FROM members WHERE archive=?",
+                (twin, key))
+
     def remove_path(self, path: Path | str) -> None:
         """Usuwa wpis pliku z indeksu (po skasowaniu pliku z dysku)."""
         key = str(Path(os.path.abspath(path)))
+        self._note_vacated(key)
+        self._hand_over_members(key)
         self._db.execute("DELETE FROM files WHERE path=?", (key,))
         self._db.execute("DELETE FROM members WHERE archive=?", (key,))
         self._db.commit()
+
+    def _note_vacated(self, path_key: str) -> None:
+        d = os.path.dirname(path_key)
+        if d:
+            self._vacated[os.path.normcase(d)] = d
+
+    def take_vacated_under(self, root: Path | str) -> list:
+        """Katalogi opuszczone pod `root` (bez samego `root`), NAJGŁĘBSZE
+        pierwsze; zwrócone są zapominane (kolejne sprzątanie ich nie ponawia)."""
+        r = os.path.normcase(os.path.abspath(str(root))).rstrip("\\/")
+        pref = r + os.sep
+        out = [k for k in self._vacated if k.startswith(pref)]
+        paths = [self._vacated.pop(k) for k in out]
+        return sorted(paths, key=len, reverse=True)
+
+    def copy_members(self, src: Path | str, dest: Path | str) -> None:
+        """Kopia archiwum: członkowie `dest` = członkowie `src` (ta sama treść
+        bajt w bajt) — bez czytania pliku z dysku. Czyści ewentualny STARY
+        skład spod `dest` (nadpisany plik)."""
+        s_key = str(Path(os.path.abspath(src)))
+        d_key = str(Path(os.path.abspath(dest)))
+        cur = self._db.cursor()
+        cur.execute("DELETE FROM members WHERE archive=?", (d_key,))
+        cur.execute(
+            "INSERT OR IGNORE INTO members(archive, name, size, crc32, md5, sha1) "
+            "SELECT ?, name, size, crc32, md5, sha1 FROM members WHERE archive=?",
+            (d_key, s_key))
+        self._db.commit()
+
+    def set_link_of(self, path: Path | str, target: Path | str) -> None:
+        """Zapamiętaj: `path` to HARDLINK treści `target` (ten sam plik
+        fizyczny). Planowanie pomija go bez pytania NAS."""
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET link_of=? WHERE path=?",
+                         (os.path.normcase(os.path.abspath(str(target))), key))
+        self._db.commit()
+
+    def record_hardlink(self, path: Path | str, target: Path | str,
+                        commit: bool = True) -> None:
+        """Świeżo utworzony HARDLINK `path` → treść `target`: wpis z danymi
+        celu (rozmiar, mtime, sumy — hardlink dzieli je z celem), BEZ pytania
+        NAS. Cel nieznany indeksowi → nic (skan dopisze)."""
+        key = str(Path(os.path.abspath(path)))
+        tkey = str(Path(os.path.abspath(target)))
+        t = self._db.execute("SELECT * FROM files WHERE path=?", (tkey,)).fetchone()
+        if t is None or not t["sha1"]:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        self._copy_content(self._db, key, t, t["size"], t["mtime_ns"], now,
+                           os.path.normcase(tkey))
+        # członkowie archiwum celu = członkowie linku (ta sama treść)
+        mem = self._db.execute(
+            "SELECT name, size, crc32, md5, sha1 FROM members WHERE archive=?",
+            (tkey,)).fetchall()
+        if mem:
+            self._db.execute("DELETE FROM members WHERE archive=?", (key,))
+            self._db.executemany(
+                "INSERT INTO members(archive, name, size, crc32, md5, sha1) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(key, m["name"], m["size"], m["crc32"], m["md5"], m["sha1"])
+                 for m in mem])
+        if commit:
+            self._db.commit()
 
     def mark_link(self, path: Path | str) -> None:
         """Po zastąpieniu pliku symlinkiem: wpis staje się linkiem."""

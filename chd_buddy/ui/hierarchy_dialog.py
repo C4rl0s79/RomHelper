@@ -42,7 +42,7 @@ class HierarchyDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(tr(
             "WSZYSTKIE platformy (także z jednym DAT-em). W obrębie platformy: "
-            "góra = RODZIC (pliki fizyczne), niżej = dzieci (symlinki). "
+            "góra = RODZIC (pliki fizyczne), niżej = dzieci (hardlinki). "
             "DAT o innej nazwie (np. FinalBurn Neo - SNES Games) możesz "
             "PRZYPIĄĆ do platformy rodzica przyciskiem 🔗 — stanie się jej "
             "dzieckiem (hierarchia + wspólny format).")))
@@ -85,7 +85,7 @@ class HierarchyDialog(QDialog):
         self.btn_pin = QPushButton(tr("🔗 Przypnij do platformy…"))
         self.btn_pin.setToolTip(tr(
             "Wybrany DAT staje się DZIECKIEM wskazanej platformy — dostaje "
-            "symlinki do plików jej rodzica i dziedziczy format, mimo że "
+            "hardlinki do plików jej rodzica i dziedziczy format, mimo że "
             "nazwa DAT-a jest inna (np. FinalBurn Neo → Nintendo SNES)."))
         self.btn_pin.clicked.connect(self._pin_to_platform)
         self.btn_unpin = QPushButton(tr("✂ Odepnij (własna platforma)"))

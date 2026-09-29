@@ -110,8 +110,8 @@ _EN: dict[str, str] = {
     "buduj też niekompletne gry": "build incomplete games too",
     "usuń z ToSort pliki już na miejscu": "delete ToSort files already in place",
     "konwertuj do formatu docelowego": "convert to target format",
-    "kopie potwierdzonych → symlinki": "confirmed copies → symlinks",
-    "twórz symlinki dla DAT-ów dzieci": "create symlinks for child DATs",
+    "kopie potwierdzonych → hardlinki": "confirmed copies → hardlinks",
+    "twórz hardlinki dla DAT-ów dzieci": "create hardlinks for child DATs",
     "uruchamiaj jako administrator (auto)": "run as administrator (auto)",
     "naprawa:": "fix level:",
 
