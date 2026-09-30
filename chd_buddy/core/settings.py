@@ -8,7 +8,6 @@ robimy fallback na katalog obok skryptu / bieżący i logujemy ostrzeżenie.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 from dataclasses import dataclass, asdict, field
@@ -201,10 +200,9 @@ class Settings:
         p = self.path()
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {k: v for k, v in asdict(self).items() if not k.startswith("_")}
-        # zapis atomowy
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
+        from .fileops import atomic_write_text
+        atomic_write_text(p, json.dumps(payload, indent=2, ensure_ascii=False),
+                          backup=True)
         return p
 
     # --- Wygodne akcesory --------------------------------------------------

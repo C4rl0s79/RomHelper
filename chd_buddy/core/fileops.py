@@ -21,6 +21,38 @@ ProgCB = Callable[[int, int, str], None]
 _CHUNK = 8 * 1024 * 1024        # 8 MiB — kompromis szybkość / częstość aktualizacji
 
 
+def atomic_write_text(path, text: str, *, backup: bool = False,
+                      encoding: str = "utf-8") -> Path:
+    """JEDYNY sposób zapisu plików konfiguracyjnych: treść do pliku
+    tymczasowego obok, fsync, potem ATOMOWA podmiana. Zerwanie NAS / zamknięcie
+    programu w trakcie zostawia STARY plik nietknięty — `write_text` najpierw
+    czyści plik (29.09: `_reguly.json` = 0 bajtów → program liczył wszystko na
+    domyślnych regułach, 4551 plików „bez DAT-a” do ToSort).
+    backup=True — poprzednia (niepusta) wersja zostaje jako `<plik>.bak`."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    with open(tmp, "w", encoding=encoding) as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    if backup:
+        # kopia też ATOMOWO: .bak.tmp → os.replace; przerwanie zostawia starą,
+        # pełną .bak (dawniej copy2 prosto do .bak → 0 B po przerwaniu, 30.09)
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                btmp = p.with_name(p.name + ".bak.tmp")
+                shutil.copy2(p, btmp)
+                with open(btmp, "rb+") as f:
+                    os.fsync(f.fileno())
+                if btmp.stat().st_size > 0:
+                    os.replace(btmp, p.with_name(p.name + ".bak"))
+        except OSError:
+            pass
+    os.replace(tmp, p)
+    return p
+
+
 def copy_with_progress(src, dst, on_progress: Optional[ProgCB] = None,
                        label: str = "", chunk: int = _CHUNK) -> int:
     """Kopiuje src→dst blokami, raportując on_progress(done, total, label).

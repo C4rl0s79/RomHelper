@@ -241,7 +241,7 @@ class _LiveSignals(QObject):
     """Stan NA ŻYWO w trakcie naprawy (jak RomVault): wątek naprawy emituje,
     okno (wątek GUI) przestawia liczby DAT-u. Połączenie kolejkowane Qt."""
     game = Signal(str, str, object)          # dat_key, gra, {rom_lower: RomState}
-    reload = Signal()                        # zapisany stan wszystkich DAT-ów nowy
+    reload = Signal(object)                  # stan wszystkich DAT-ów po etapie 1
 
 
 def _game_cat(states) -> str:
@@ -1926,7 +1926,8 @@ class SuiteWindow(QMainWindow):
     def _after_update(self, plan, ok) -> None:
         if ok:
             self._log(f"[AKTUALIZACJA] '{plan.game_name}': zaktualizowano DAT "
-                      f"i podmieniono plik(i). Zrób Skanuj, by odświeżyć.")
+                      f"i podmieniono plik(i); indeks już zaktualizowany — „Znajdź "
+                      f"naprawy” odświeży stan (bez skanu plików).")
             extra = ("." if plan.same_format else tr(
                 " — a potem „Napraw”, by skonwertować nowe pliki do formatu "
                 "docelowego."))
@@ -1965,6 +1966,8 @@ class SuiteWindow(QMainWindow):
             if cancel.is_set():
                 return entries
             rules = DirRules(dats)
+            if rules.error:
+                log(("BŁĄD: " if rules.fatal else "UWAGA: ") + rules.error)
             from ..core.dirrules import pop_notices
             for _m in pop_notices():
                 log(_m)
@@ -2195,7 +2198,7 @@ class SuiteWindow(QMainWindow):
                                    Path(self.row_roms.path))
         if dlg.exec():
             self._log(f"Ustawienia katalogu {folder_key} zapisane "
-                      f"(_reguly.json). Skanuj i raportuj, by zastosować.")
+                      f"(_reguly.json). „Znajdź naprawy” zastosuje je od razu (dopasowanie z indeksu, bez skanu plików).")
 
     def _dat_settings_for(self, entry) -> None:
         from .dat_settings_dialog import DatSettingsDialog
@@ -2219,7 +2222,7 @@ class SuiteWindow(QMainWindow):
                                 inherited_format=parent.store_format)
         if dlg.exec():
             self._log(f"Ustawienia DAT-a {entry.name} zapisane. "
-                      f"Skanuj i raportuj, by zastosować.")
+                      f"„Znajdź naprawy” zastosuje je od razu (dopasowanie z indeksu, bez skanu plików).")
 
     def _rebuild_chds_cue(self) -> None:
         """Odbudowa CHD ze sklejonym układem ścieżek wg cue z dat\\cues."""
@@ -2409,7 +2412,7 @@ class SuiteWindow(QMainWindow):
         dlg = MultiDatSettingsDialog(self, entries, Path(self.row_dats.path))
         if dlg.exec():
             self._log(f"Zapisano ustawienia dla {len(entries)} DAT-ów. "
-                      f"Skanuj i raportuj, by zastosować.")
+                      f"„Znajdź naprawy” zastosuje je od razu (dopasowanie z indeksu, bez skanu plików).")
 
     def _art_keys(self) -> dict:
         """Klucze API wszystkich źródeł grafik (z ustawień)."""
@@ -2513,6 +2516,11 @@ class SuiteWindow(QMainWindow):
                                                             cancel=cancel)
                 from ..core.dirrules import DirRules, apply_rule_targets
                 rules = DirRules(dats)
+                if rules.fatal:
+                    # skan przenosi obce pliki do ToSort wg katalogów z reguł —
+                    # na domyślnych regułach to byłyby złe katalogi
+                    log(f"BŁĄD: {rules.error}")
+                    return all_entries, None
                 apply_rule_targets(all_entries, rules, roms, log=log)
                 # WŁĄCZONE DAT-y (skip=false); wyłączone zostają w drzewie,
                 # ale nie są skanowane ani dopasowywane
@@ -2897,20 +2905,26 @@ class SuiteWindow(QMainWindow):
             cnt[0] += 1
         cnt[col[new_cat]] += 1
         item, skip = ent
+        # programowa zmiana wiersza — NIE kliknięcie pola (itemChanged)
+        _prev, self._filling = getattr(self, "_filling", False), True
         try:
             for i in range(4):
                 item.setText(i + 1, str(cnt[i]))
             self._paint_dat_item(item, cnt[1], cnt[2], cnt[3], skip)
         except RuntimeError:
             pass                           # pozycja drzewa już usunięta
+        finally:
+            self._filling = _prev
 
-    def _on_live_reload(self) -> None:
-        """Zapisany stan WSZYSTKICH DAT-ów odświeżony (po etapie 1 naprawy)."""
+    def _on_live_reload(self, states: dict) -> None:
+        """Stan WSZYSTKICH DAT-ów po etapie 1 — policzony w wątku naprawy
+        (`states_from_reports`); tu tylko podstawienie i przerysowanie drzewa,
+        BEZ czytania dysku w wątku okna (3,8 s = „nie odpowiada")."""
         try:
-            from ..core.datcache import load_report_states
+            from datetime import datetime
             self._reports_by_id = {}
-            self._saved_at, self._saved_states = load_report_states(
-                known_keys={self._dat_key(e) for e in (self._entries or [])})
+            self._saved_states.update(states or {})
+            self._saved_at = datetime.now().isoformat(timespec="seconds")
             self._fill_dats(self._entries or [], with_stats=True)
         except Exception as e:
             self._log(f"UWAGA: nie odświeżono liczb: {e}")
@@ -2949,6 +2963,9 @@ class SuiteWindow(QMainWindow):
         groups: dict = {}
         self._dat_items = {}
         self._dat_counts = {}
+        # stan pola zaznaczenia per DAT — `_on_tree_item_changed` zapisuje regułę
+        # tylko przy jego ZMIANIE (nie przy zmianie tekstu/koloru wiersza)
+        self._dat_checked = {}
         for e in self._display_order(entries, dat_root, lambda x: x):
             skip = rules.for_entry(e)["skip"] if rules else False
             states = self._game_states_for(e) if with_stats else None
@@ -2966,6 +2983,7 @@ class SuiteWindow(QMainWindow):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Unchecked if skip
                                else Qt.CheckState.Checked)
+            self._dat_checked[self._dat_key(e)] = not skip
             if skip:
                 item.setForeground(0, QBrush(QColor(150, 150, 150)))
             parent = self._group_parent(dat_root, e.dat_path, groups)
@@ -3019,15 +3037,30 @@ class SuiteWindow(QMainWindow):
         if not isinstance(entry, DatEntry):
             return
         skip = item.checkState(0) == Qt.CheckState.Unchecked
+        # itemChanged przychodzi też przy zmianie TEKSTU/KOLORU wiersza (liczby
+        # na żywo w naprawie) — reguła tylko przy realnej zmianie pola
+        k = self._dat_key(entry)
+        checked = getattr(self, "_dat_checked", {})
+        if checked.get(k) == (not skip):
+            return
         try:
             save_rule(Path(self.row_dats.path), entry.name, {"skip": skip})
         except OSError as e:
             self._log(f"BŁĄD zapisu reguły: {e}")
             return
+        checked[k] = not skip
         col = QColor(150, 150, 150) if skip else QColor()
-        item.setForeground(0, QBrush(col))
+        _prev, self._filling = self._filling, True     # kolor ≠ kliknięcie
+        try:
+            item.setForeground(0, QBrush(col))
+        finally:
+            self._filling = _prev
+        # włączenie: pliki tej platformy mogą nie być w indeksie (wyłączonych
+        # nie skanujemy) — wtedy skan; wyłączenie: nic do skanowania
         self._log(f"DAT {entry.name}: {'WYŁĄCZONY (nie skanuję)' if skip else 'włączony'}"
-                  f" — Skanuj i raportuj, by zastosować.")
+                  + (" — „Znajdź naprawy” zastosuje od razu." if skip else
+                     " — „Znajdź naprawy” zastosuje od razu; jeśli tej platformy "
+                     "jeszcze nigdy nie skanowano, najpierw „Skanuj i raportuj”."))
 
     def _collection_fix(self, dry: bool = False) -> None:
         paths = self._collection_paths()

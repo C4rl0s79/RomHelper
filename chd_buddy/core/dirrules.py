@@ -118,12 +118,13 @@ def save_rule(dat_root: Path, key: str, updates: dict, *,
     p = Path(dat_root) / RULES_FILENAME
     data: dict = {}
     if p.is_file():
-        try:
-            loaded = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, ValueError):
-            data = {}
+        # NIECZYTELNY plik reguł NIE jest „pusty": dawniej zapis jednej reguły
+        # nadpisywał WSZYSTKIE pozostałe (dane usera) — teraz odmowa
+        loaded = _read_rules(p)
+        if loaded is None:
+            raise OSError(f"{RULES_FILENAME} nieczytelny — nie nadpisuję (napraw "
+                          f"plik albo przywróć {RULES_FILENAME}.bak)")
+        data = loaded
     rule = dict(data.get(key, {}))
     for name, val in updates.items():
         if strip_defaults:
@@ -138,9 +139,19 @@ def save_rule(dat_root: Path, key: str, updates: dict, *,
         data[key] = rule
     else:
         data.pop(key, None)
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                 encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(p, json.dumps(data, indent=2, ensure_ascii=False),
+                      backup=True)
     return p
+
+
+def _read_rules(p: Path):
+    """Treść pliku reguł (dict) albo None, gdy nieczytelny/pusty/nie-JSON."""
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # Sugerowany format przechowywania wg skrótu platformy (płytowe → CHD;
@@ -249,11 +260,8 @@ def migrate_parent_priority(dat_root: Path) -> str:
       (tam stał dotąd: po wymienionych, przed resztą),
     - klucz parent_priority usuwany. Zwraca opis zmian ("" = nic)."""
     p = Path(dat_root) / RULES_FILENAME
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(data, dict):
+    data = _read_rules(p) if p.is_file() else None
+    if data is None:
         return ""
     keys = sorted((k for k, v in data.items()
                    if isinstance(v, dict) and "parent_priority" in v),
@@ -281,8 +289,9 @@ def migrate_parent_priority(dat_root: Path) -> str:
                     order_changed = True
         if not rule:
             data.pop(k)
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                 encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(p, json.dumps(data, indent=2, ensure_ascii=False),
+                      backup=True)
     if order_changed:
         save_order(dat_root, order)
     msg = (f"Migracja reguł: „rodzic” wycofany — {', '.join(parents) or '—'} "
@@ -299,19 +308,31 @@ class DirRules:
         self.raw: dict[str, dict] = {}
         self.error = ""
         self.notice = ""
+        # plik reguł ISTNIEJE, ale ani on, ani .bak nie dają się odczytać →
+        # żadna operacja na plikach nie może ruszyć (domyślne reguły = inne
+        # katalogi docelowe = masowe przenosiny do ToSort)
+        self.fatal = False
         try:
             self.notice = migrate_parent_priority(self.dat_root)
         except OSError as e:
             self.error = f"{RULES_FILENAME}: migracja: {e}"
         p = self.dat_root / RULES_FILENAME
         if p.is_file():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    self.raw = {str(k).lower(): v for k, v in data.items()
-                                if isinstance(v, dict)}
-            except (OSError, ValueError) as e:
-                self.error = f"{RULES_FILENAME}: {e}"
+            data = _read_rules(p)
+            if data is None:
+                bak = p.with_name(p.name + ".bak")
+                data = _read_rules(bak) if bak.is_file() else None
+                if data is None:
+                    self.fatal = True
+                    self.error = (f"{RULES_FILENAME} jest nieczytelny (pusty albo "
+                                  f"uszkodzony) i brak dobrej kopii .bak — "
+                                  f"STOP: bez reguł nie ruszam plików")
+                    return
+                self.notice = (f"{RULES_FILENAME} nieczytelny — użyto kopii "
+                               f"{bak.name}")
+                _NOTICES.append(self.notice)
+            self.raw = {str(k).lower(): v for k, v in data.items()
+                        if isinstance(v, dict)}
 
     def _entry_keys(self, entry) -> list[str]:
         """Klucze kaskady dla DAT-a, od najogólniejszego do najszczegółowszego

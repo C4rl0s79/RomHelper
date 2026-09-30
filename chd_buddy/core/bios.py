@@ -193,8 +193,8 @@ def load_manifest() -> dict:
 
 
 def save_manifest(m: dict) -> None:
-    manifest_path().write_text(json.dumps(m, indent=2, ensure_ascii=False),
-                               encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(manifest_path(), json.dumps(m, indent=2, ensure_ascii=False))
 
 
 # --- import libretro System.dat (clrmamepro) ----------------------------------

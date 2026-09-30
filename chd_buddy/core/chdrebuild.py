@@ -325,6 +325,8 @@ def _rb_finalize(payload, sums, index, log):
         index.set_data_sha1(payload["chd_path"], game_profile(payload["data"]))
         index.set_layout_ok(payload["chd_path"], 1)
     index.set_bad_container(payload["chd_path"], 0)
+    from .linker import relink_twins
+    relink_twins(payload["chd_path"], payload.get("twins"), index, log)
 
 
 def _rb_release(payload, st, log):
@@ -360,6 +362,7 @@ def rebuild_bad_chds(
     detail=None,
     cancel=None,
     slot=None,
+    seen: Optional[set] = None,
 ) -> RebuildChdStats:
     """Odbudowuje CHD o złym układzie ścieżek:
 
@@ -532,7 +535,9 @@ def rebuild_bad_chds(
             _sjob = _dc.replace(settings, threads=_jthreads)
         except Exception:
             _sjob = settings
+        from .linker import hardlink_twins
         _pipe.feed({
+            "twins": hardlink_twins(chd_path, index),   # przed podmianą
             "kind": kind, "chd_path": chd_path, "game_name": game_name,
             "need": need, "comp": comp_dvd if kind == "dvd" else comp,
             "iso_rom": iso_rom, "data": data, "cue_rom": cue_rom,
@@ -584,6 +589,11 @@ def rebuild_bad_chds(
         None = nagłówek nieznany (stary wpis — sprawdzi naprawa albo skan)."""
         if index is None:
             return None
+        # zły kontener stwierdzony sondą CHD (bad_container=1) to WERDYKT —
+        # dawniej liczył się tylko zapisany typ nagłówka i 503 złe CHD PS2 bez
+        # niego wypadały z podglądu jako „nieznane" (0 do odbudowy)
+        if _bad_container(chd_path) == 1:
+            return False
         try:
             trk, cdt = index.chd_header(chd_path)
         except Exception:
@@ -682,10 +692,44 @@ def rebuild_bad_chds(
                 continue
             targets.append((chd_path, hit[1].name, hit))
 
+    # JEDEN plik = JEDNA odbudowa na cały przebieg naprawy: CHD z ToSort
+    # (extra_roots) widzi każdy DAT tej platformy (ROMS/REDUMP/1G1R) — bez
+    # wspólnego `seen` szedł do podglądu (i do sprawdzenia) po razie na DAT.
+    if seen is not None:
+        _fresh = []
+        for t in targets:
+            k = os.path.normcase(os.path.abspath(str(t[0])))
+            if k not in seen:
+                seen.add(k)
+                _fresh.append(t)
+        targets = _fresh
+
+    # HARDLINKI jednego pliku = JEDNA odbudowa: przebudowujemy plik fizyczny,
+    # jego pozostałe nazwy przepina `relink_twins` po podmianie. Inaczej każda
+    # nazwa szłaby osobno (ponowne pobranie przez NAS i druga kopia fizyczna).
+    if index is not None and targets:
+        tset = {os.path.normcase(str(t[0])) for t in targets}
+        kept = []
+        for t in targets:
+            try:
+                r = index.lookup(t[0])
+                lo = (r["link_of"] or "") if r is not None else ""
+            except Exception:
+                lo = ""
+            if lo and os.path.normcase(lo) in tset:
+                continue
+            kept.append(t)
+        if len(kept) != len(targets):
+            log(f"Odbudowa CHD: {len(targets) - len(kept)} hardlinków innych "
+                f"celów — przepięte po odbudowie ich pliku, bez osobnej pracy.")
+        targets = kept
+
     from collections import Counter as _Ctr
     _bydir = _Ctr(str(t[0].parent) for t in targets)
     _prog["total"] = len(targets)
-    log(f"Odbudowa CHD: {len(targets)} plików do SPRAWDZENIA "
+    # DAT bez żadnego CHD (kartridże itp.) — bez linii „0 plików" w logu
+    _quiet = not targets and not skipped_done and not unknown
+    _msg = (f"Odbudowa CHD: {len(targets)} plików do SPRAWDZENIA "
         f"(czytam nagłówek; przerobione zostaną tylko te ze złym kontenerem/"
         f"układem — linie „ODBUDOWA”)"
         + (f"; {skipped_done} już potwierdzonych jako OK — pominięte"
@@ -693,6 +737,8 @@ def rebuild_bad_chds(
         + (f"; {unknown} bez zapisanego nagłówka — sprawdzi je naprawa "
            f"(albo najbliższy skan)" if unknown else "")
         + (f" w {len(_bydir)} katalogach:" if _bydir else "."))
+    if not _quiet:
+        log(_msg)
     for d, n in sorted(_bydir.items(), key=lambda kv: -kv[1]):
         log(f"  {n:5}  {d}")
     if on_progress:
@@ -926,6 +972,8 @@ def _rebuild_dvd_one(chd_path: Path, game_name: str, iso_rom, chd, settings,
                 _sums = hash_file(new_chd)
             except OSError:
                 _sums = None
+        from .linker import hardlink_twins, relink_twins
+        twins = hardlink_twins(chd_path, index)     # przed podmianą
         _place_final(new_chd, chd_path, detail)
         st.rebuilt += 1
         log(f"   ✔ kontener CD→DVD podmieniony: {chd_path.name}")
@@ -934,6 +982,7 @@ def _rebuild_dvd_one(chd_path: Path, game_name: str, iso_rom, chd, settings,
             index.record_file(chd_path, crc, md5, sha1)
             index.set_data_sha1(chd_path, iso_rom.sha1.lower())
             index.set_bad_container(chd_path, 0)   # kontener naprawiony
+        relink_twins(chd_path, twins, index, log)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1001,6 +1050,8 @@ def _rebuild_one(chd_path: Path, game_name: str, data, cue_rom, lib, chd,
                 _sums = hash_file(new_chd)
             except OSError:
                 _sums = None
+        from .linker import hardlink_twins, relink_twins
+        twins = hardlink_twins(chd_path, index)     # przed podmianą
         _place_final(new_chd, chd_path, detail)
         st.rebuilt += 1
         log(f"   ✔ kanoniczny CHD podmieniony: {chd_path.name}")
@@ -1012,5 +1063,6 @@ def _rebuild_one(chd_path: Path, game_name: str, data, cue_rom, lib, chd,
             index.set_data_sha1(chd_path, game_profile(data))
             index.set_bad_container(chd_path, 0)   # kontener kanoniczny
             index.set_layout_ok(chd_path, 1)
+        relink_twins(chd_path, twins, index, log)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

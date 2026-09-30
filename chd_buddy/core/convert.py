@@ -225,46 +225,6 @@ def repack_zip_to_deflate(zip_path: Path, *, level: int = 6,
                       dry_run=dry_run)
 
 
-def repack_incompatible_zips(roots, *, method: str = "deflate", index=None,
-                             level: int = 6, log: LogCB = lambda m: None,
-                             dry_run: bool = False, cancel=None) -> tuple:
-    """Skanuje `roots` i przepakowuje KAŻDY ZIP, który NIE jest w wybranej
-    metodzie (`method`), na tę metodę. Zwraca (przepakowane, błędy). Aktualizuje
-    indeks (suma pliku-kontenera się zmienia)."""
-    n = err = 0
-    for root in roots:
-        if not root or not Path(root).is_dir():
-            continue
-        for dirpath, _dirs, files in os.walk(root):
-            for fn in files:
-                if cancel is not None and cancel.is_set():
-                    return n, err
-                if not fn.lower().endswith(".zip"):
-                    continue
-                p = Path(dirpath) / fn
-                if os.path.islink(p) or not zip_needs_repack(p, method):
-                    continue                       # link albo już w tej metodzie
-                r = repack_zip(p, method=method, level=level, log=log,
-                               dry_run=dry_run)
-                if r.ok:
-                    n += 1
-                    if index is not None and not dry_run:
-                        try:
-                            from .fileindex import hash_file
-                            crc, md5, sha1 = hash_file(p)
-                            index.record_file(p, crc, md5, sha1)
-                        except Exception:
-                            pass
-                else:
-                    err += 1
-                    log(f"  BŁĄD repack: {p} — {r.message}")
-    if n or err:
-        log(f"Przepakowano ZIP-ów na DEFLATE: {n}" +
-            (f", błędy {err}" if err else "") +
-            (" (podgląd)" if dry_run else ""))
-    return n, err
-
-
 # --- CHD (przez chdman) -------------------------------------------------------
 
 def disc_to_chd(main_file: Path, dst_chd: Path, chdman, settings, *,
@@ -537,7 +497,7 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
     w formacie docelowym). Weryfikacja w każdej konwersji; źródło kasowane
     dopiero po sukcesie.
     """
-    from .dirrules import effective_format, resolve_format  # noqa: F401
+    from .dirrules import effective_format
     st = ConvertStats()
     # ODROCZONE kasowanie źródeł: gry WIELOPŁYTOWE współdzielą ścieżki (np. audio
     # CDDA) — konwersja płyty 1 nie może skasować ścieżki, której potrzebuje
@@ -719,7 +679,6 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB,
     """Kopiuje/wypakowuje JEDNĄ ścieżkę gry ze źródła (ToSort) na RAM i
     weryfikuje SHA-1 z DAT-em. Zwraca ścieżkę na RAM albo None (błąd/niezgoda).
     Docelowy katalog kolekcji NIGDY nie jest dotykany."""
-    import shutil as _sh
     rom = status.rom
     dst = ram_dir / rom.name
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1149,7 +1108,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     umie/nie chce ruszyć, zostawia nietknięte (obsłuży zwykły placement +
     stara konwersja) — bezpieczny fallback.
     """
-    from .dirrules import effective_format, resolve_format  # noqa: F401
+    from .dirrules import effective_format
     from .matcher import RomState
 
     from .datfile import game_profile
@@ -1312,8 +1271,6 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 if pr:
                     _profc[(_pl, pr)] += 1
         _shared_profiles = {k for k, c in _profc.items() if c > 1}
-        import dataclasses as _dc
-
         from .convert_pipeline import StagePipeline
         # RÓWNOLEGŁA KONWERSJA: N chdman/DolphinTool naraz. Cel — obłożyć
         # 8 rdzeni WYDAJNYCH (bez HT) po JEDNEJ konwersji, zamiast jednej
@@ -1729,7 +1686,7 @@ def purge_loose_on_verified_chd(reports, rules_fn, index, *,
         return 0
     from collections import defaultdict
     from .matcher import RomState
-    from .dirrules import effective_format, resolve_format  # noqa: F401
+    from .dirrules import effective_format
     # OCHRONA `needed_sha1`: NIE kasuj luźnego toru, jeśli potrzebuje go inna gra,
     # która NAPRAWDĘ powstanie w tej naprawie. KLUCZOWE zawężenie: tylko gry
     # BUDOWALNE — takie, które mają WSZYSTKIE tory DANYCH obecne (choćby pod złą

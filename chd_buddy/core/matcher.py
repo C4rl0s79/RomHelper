@@ -837,7 +837,9 @@ def deep_probe_chds(
     #    żeby pasek OGÓLNY pokazał realny licznik „X/Y", a nie stał na 0/0.
     candidates: list = []
     for root in roots:
-        if not root or not Path(root).is_dir():
+        # BEZ `is_dir()` na NAS per korzeń (~430 szeregowych rund = „20 s bez
+        # postępu”): nieistniejący korzeń po prostu nie ma wpisów w indeksie
+        if not root:
             continue
         for row in index.all_under(root):
             p = row["path"]

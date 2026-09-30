@@ -1632,6 +1632,18 @@ class FileIndex:
                          (os.path.normcase(os.path.abspath(str(target))), key))
         self._db.commit()
 
+    def same_content(self, path: Path | str) -> list:
+        """Inne FIZYCZNE wpisy (nie symlinki, obecne) o tej samej sumie i
+        rozmiarze co `path` — kandydaci na jego hardlinki/kopie. Bez NAS."""
+        key = str(Path(os.path.abspath(path)))
+        r = self._db.execute("SELECT sha1, size FROM files WHERE path=?",
+                             (key,)).fetchone()
+        if r is None or not r["sha1"]:
+            return []
+        return [row[0] for row in self._db.execute(
+            "SELECT path FROM files WHERE sha1=? AND size=? AND path<>? "
+            "AND missing=0 AND is_link=0", (r["sha1"], r["size"], key))]
+
     def record_hardlink(self, path: Path | str, target: Path | str,
                         commit: bool = True) -> None:
         """Świeżo utworzony HARDLINK `path` → treść `target`: wpis z danymi

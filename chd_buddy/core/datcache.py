@@ -141,6 +141,29 @@ def _migrate_legacy(d: Path) -> None:
         _write_report_file(d, key, games, saved_at)
 
 
+def _expand(games: dict) -> dict:
+    """Zapisany (zwarty) stan DAT-u → {gra: {rom_lower: status}} dla okna."""
+    from types import SimpleNamespace
+
+    from .matcher import RomState
+    return {g: {rn: SimpleNamespace(
+                    state=RomState(v[0]), source_path=v[1], member=v[2],
+                    via_chd=bool(v[3]),
+                    via_archive=bool(v[4]) if len(v) > 4 else False,
+                    archive_names_ok=bool(v[5]) if len(v) > 5 else True)
+                for rn, v in roms.items()}
+            for g, roms in games.items()}
+
+
+def states_from_reports(reports) -> dict:
+    """Stan okna {dat_abspath: {gra: {rom_lower: status}}} prosto z raportów
+    w pamięci — TEN SAM format co `load_report_states`, bez czytania dysku.
+    Osobne obiekty (nie statusy raportu), więc dalsze zmiany na żywo liczą
+    różnicę względem tego stanu."""
+    return {str(Path(os.path.abspath(rep.entry.dat_path))): _expand(_compact(rep))
+            for rep in reports}
+
+
 def load_report_states(path: Optional[Path] = None, known_keys=None):
     """Zwraca (saved_at, {dat_abspath: {gra: {rom_lower: status}}}) albo
     (None, {}). status = lekki obiekt z polami state/source_path/member/
@@ -157,9 +180,6 @@ def load_report_states(path: Optional[Path] = None, known_keys=None):
         _migrate_legacy(d)
     if not d.is_dir():
         return None, {}
-    from types import SimpleNamespace
-
-    from .matcher import RomState
     known = ({os.path.normcase(k) for k in known_keys}
              if known_keys is not None else None)
     out: dict[str, dict] = {}
@@ -175,14 +195,7 @@ def load_report_states(path: Optional[Path] = None, known_keys=None):
         key = blob.get("dat") or ""
         if not key or (known is not None and os.path.normcase(key) not in known):
             continue
-        out[key] = {
-            g: {rn: SimpleNamespace(
-                    state=RomState(v[0]), source_path=v[1], member=v[2],
-                    via_chd=bool(v[3]),
-                    via_archive=bool(v[4]) if len(v) > 4 else False,
-                    archive_names_ok=bool(v[5]) if len(v) > 5 else True)
-                for rn, v in roms.items()}
-            for g, roms in (blob.get("games") or {}).items()}
+        out[key] = _expand(blob.get("games") or {})
         at = blob.get("saved_at")
         if at and (newest is None or at > newest):
             newest = at

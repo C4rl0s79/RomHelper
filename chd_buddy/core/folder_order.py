@@ -18,7 +18,6 @@ którą użytkownik widzi. Porównanie nazw bez wielkości liter.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 ORDER_FILENAME = "_kolejnosc.json"
@@ -54,10 +53,9 @@ def _load_raw(dat_root) -> dict:
 
 def save_order(dat_root, order: dict) -> Path:
     p = Path(dat_root) / ORDER_FILENAME
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"version": 1, "order": order},
-                              ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, p)
+    from .fileops import atomic_write_text
+    atomic_write_text(p, json.dumps({"version": 1, "order": order},
+                                    ensure_ascii=False, indent=1), backup=True)
     return p
 
 

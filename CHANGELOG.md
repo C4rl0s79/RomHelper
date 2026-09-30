@@ -2,6 +2,164 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.6.89] — 2026-09-30
+
+### Reguły zapisywane tylko po kliknięciu pola DAT-u (regresja 0.6.82)
+- DZIAŁANIE: w naprawie okno „nie odpowiada" (REDUMP PS2, 303/2625); w logu
+  „DAT Sony - PlayStation 2: włączony" bez klikania. To samo w naprawie
+  29.09 19:24 (pierwsza na 0.6.82) — a o 20:57 `_reguly.json` = 0 B.
+- ANALIZA: `_on_tree_item_changed` reaguje na KAŻDY `itemChanged` wiersza
+  DAT-u (Qt nie mówi, co się zmieniło), nie tylko na pole zaznaczenia.
+  „Liczby na żywo" (0.6.82) zmieniają tekst/kolor wiersza przy każdej
+  naprawionej grze → za każdym razem zapis `_reguly.json` na NAS w wątku
+  okna (zawieszenia; setki zapisów przez Tailscale — przerwany nieatomowy
+  zapis wyzerował plik 29.09). Do tego sam handler po zapisie zmienia kolor
+  wiersza → wywołuje się drugi raz → drugi zapis przy każdym kliknięciu.
+- MIEJSCA (jedyne programowe zmiany drzewa bez osłony `_filling`):
+  `_on_live_game` (setText + `_paint_dat_item`), `_on_tree_item_changed`
+  (setForeground). Pozostałe zmiany drzewa są w `_fill_dats` (osłonięte).
+  Sygnał `itemChanged` drzewa ma jednego odbiorcę.
+- ZMIANA (tylko ui/suite_window.py):
+  1. `_on_tree_item_changed` zapisuje regułę WYŁĄCZNIE, gdy stan pola
+     zaznaczenia DAT-u różni się od zapamiętanego (`_dat_checked`,
+     wypełniane w `_fill_dats`); zmiana tekstu/koloru — ignorowana.
+  2. `_on_live_game` i zmiana koloru po zapisie w `_on_tree_item_changed`
+     pod osłoną `_filling` (jak `_fill_dats`).
+- WPŁYW: kliknięcie pola DAT-u — zapis reguły RAZ (dawniej 2×); liczby na
+  żywo — bez zapisu reguł i bez zawieszania okna. Podgląd, naprawa, skan,
+  indeks, rdzeń (core/) — bez zmian.
+
+### Audyt prawdziwej naprawy: okno nie zamarza, każda długa pętla ma postęp
+- DZIAŁANIE: przegląd wszystkich faz `repair_collection` w trybie realnym
+  (podgląd ich nie wykonuje) przed kolejnym uruchomieniem naprawy.
+- ANALIZA / MIEJSCA:
+  1. po etapie 1 okno (wątek GUI) wczytywało zapisany stan wszystkich DAT-ów
+     z dysku (`load_report_states`: 3,8 s na danych usera, 668 plików) i
+     przebudowywało drzewo — Windows po ~5 s oznacza okno „nie odpowiada"
+     (`_on_live_reload` w ui/suite_window.py, wołane z repair.py);
+  2. `rebuilder.sweep_orphans` (finał: 7055 starych kopii w No-intro,
+     ~3 rundy NAS na plik) zgłaszał postęp tylko raz na KATALOG — katalog PS2
+     (2053 pliki) = minuty bez ruchu paska, jak zawieszenie.
+  Pozostałe fazy sprawdzone bez zmian: sprzątanie ToSort (postęp co 100),
+  `_clean_dir` (postęp per plik), `prune_empty_trees` (równolegle, co 50),
+  odbudowa CHD i konwersje (paski per plik), zapis stanu (wątek naprawy).
+- ZMIANA:
+  1. `datcache.states_from_reports(reports)` — ten sam format co
+     `load_report_states` (wspólna konwersja `_expand`); naprawa liczy go W
+     SWOIM wątku i przekazuje `on_reload(states)`; okno tylko podstawia dane
+     (`_saved_states.update`) i przerysowuje drzewo — bez czytania dysku.
+  2. `sweep_orphans`: postęp z nazwą pliku co 25 plików.
+- WPŁYW: tylko wyświetlanie; liczby po etapie 1 z tych samych danych, które
+  właśnie zapisano na dysk (identyczne). Operacje naprawy, podgląd, skan,
+  indeks — bez zmian. Stan DAT-ów wyłączonych w oknie zostaje (update, nie
+  podmiana).
+
+### Kopia `.bak` plików konfiguracyjnych też atomowa
+- DZIAŁANIE: po zamknięciu programu w trakcie zapisu reguł (30.09 03:06)
+  `_reguly.json` cały (atomowy zapis zadziałał), ale `_reguly.json.bak` =
+  0 B i został `_reguly.json.tmp`.
+- ANALIZA: `atomic_write_text` robił kopię `.bak` przez `shutil.copy2`
+  prosto do `.bak` (czyści plik, potem pisze) — przerwanie = pusta kopia,
+  czyli brak ratunku przy następnej awarii pliku głównego.
+- MIEJSCA: jedno — `fileops.atomic_write_text` (używają go wszystkie zapisy
+  konfiguracji; zmiana dotyczy tylko sposobu robienia `.bak`).
+- ZMIANA: kopia do `<plik>.bak.tmp` + fsync + `os.replace` → `.bak`; pusta
+  albo nieczytelna kopia NIE nadpisuje dobrej `.bak`.
+- WPŁYW: treść zapisywanych plików i ich odczyt bez zmian; `.bak` zawsze
+  pełna (albo poprzednia pełna). Podgląd/naprawa/skan — bez zmian.
+
+## [0.6.88] — 2026-09-30
+
+### Naprawa nie pyta NAS o każdą grę, która już jest na miejscu
+- Etap 1 stawał na REDUMP GameCube („80 s bez postępu" w `is_link`): dla
+  każdej gry „jest" u dziecka (hardlink do rodzica) naprawa sprawdzała na
+  dysku, czy to link do przepięcia — 2 szeregowe rundy SMB przez Tailscale na
+  grę. REGRESJA z 0.6.85: klucz gry CHD = treść (zamiast ścieżki) sprawił, że
+  dzieci CHD (REDUMP/1G1R: PS1, PS2, 3DO, Saturn, DC) weszły w to sprawdzenie;
+  REDUMP GameCube/Wii (hardlinki od 29.09) — też.
+- `_link_or_absent` w naprawie: najpierw indeks — plik znany jako zwykły
+  (albo hardlink) = nic do przepinania, bez NAS. Dysk tylko, gdy indeks nie
+  wie albo zna link. Podgląd bez zmian (liczby jak w 0.6.87).
+
+## [0.6.87] — 2026-09-29
+
+### Podgląd pokazuje odbudowę złych CHD
+- „Znajdź naprawy" pokazywał 0 CHD do odbudowy, choć indeks znał 503 złe
+  kontenery PS2 (ROMS\ps2): podgląd rozstrzygał tylko z zapisanego typu
+  nagłówka (CD/DVD), a u nich go nie było („574 bez zapisanego nagłówka").
+  Zły kontener stwierdzony sondą CHD (`bad_container=1`) jest teraz
+  werdyktem. Na indeksie usera: PS2 0 → 500 do odbudowy.
+- Bez linii „Odbudowa CHD: 0 plików" dla DAT-ów bez żadnego CHD (608 linii
+  szumu w podglądzie).
+- Jeden plik = jedna odbudowa na cały przebieg: zły CHD w ToSort widzi każdy
+  DAT tej platformy (ROMS/REDUMP/1G1R) — w podglądzie był po 2–3 razy (699
+  linii dla 569 plików). Wspólny zbiór `seen` przebiegu naprawy.
+- Porównanie pełnego podglądu z logiem 0.6.86: jedyna różnica = +569
+  „ODBUDOWA CD→DVD" (500 ROMS\ps2 + 69 ToSort), reszta kategorii identyczna.
+- Po „Aktualizuj z nowszej wersji" program nie każe skanować — indeks jest
+  już zaktualizowany, wystarczy „Znajdź naprawy".
+- Uzupełnienie brakującego wpisu: od 0.6.71 (24.09) podgląd nie czyta
+  nagłówków CHD z NAS — przez to złe kontenery bez zapisanego nagłówka
+  znikały z podglądu (prawdziwa naprawa odbudowywała je normalnie).
+
+## [0.6.86] — 2026-09-29
+
+### Podgląd: każda operacja raz
+- „Znajdź naprawy" nie zmienia dysku ani indeksu, więc etap 2 i kolejne
+  DAT-y widziały stan sprzed operacji już zaplanowanych: 134 × POPRAW LINK
+  (etap 1 i znowu etap 2) i 37 × KASUJ z ToSort (dwa DAT-y) — zawyżone liczby.
+- Wspólny stan podglądu: `_dry_linked` (ścieżka po naprawie będzie linkiem)
+  i `_plan_delete` (kasowanie planowane raz) we wszystkich miejscach
+  planowania linków i kasowania. Realna naprawa bez zmian.
+- Poprawione przy okazji: zaplanowane już kasowanie „sieroty" nie może spaść
+  do gałęzi „przenieś do ToSort".
+
+## [0.6.85] — 2026-09-29
+
+### Dziecko linkuje do rodzica także przy zipach i naprawach w miejscu
+- Podgląd planował 598 FIZYCZNYCH kopii No-intro → 1G1R (ZX Spectrum,
+  NeoGeo Pocket, Supervision, Zeebo, V.Smile…) zamiast hardlinków. Wspólna
+  przyczyna (metoda, nie platformy):
+  - `_whole_file` uznawał każdą grę-archiwum za „nie cały plik" (bo ma
+    `member` = nazwa ROM-u w środku) → reguła „plik DAT-u wyżej = link" nie
+    działała dla ŻADNEGO zipa;
+  - naprawa w miejscu (przepakowanie złej metody ZIP) nie zgłaszała pliku
+    rodzica jako kopii fizycznej → dziecko nie wiedziało, do czego linkować;
+  - klucz gry-archiwum/CHD zawierał ŚCIEŻKĘ źródła, więc dziecko z własnym
+    plikiem nie rozpoznawało tej samej gry u rodzica. Teraz klucz = treść
+    gry (sumy ROM-ów; dla archiwum także nazwy w środku).
+- Podmiana pliku W MIEJSCU (przepakowanie ZIP, odbudowa CHD CD→DVD) tworzy
+  nowy plik na dysku — jego dawne hardlinki zostawały ze starą treścią i
+  każdy był potem przerabiany osobno (druga kopia + ponowne pobieranie przez
+  NAS). Jedna para funkcji `hardlink_twins`/`relink_twins` we WSZYSTKICH
+  miejscach podmiany: hardlinki są przepinane na nowy plik, odbudowa CHD
+  pomija cele będące hardlinkami innych celów. Flagi problemów pliku
+  sprawdzane z indeksu w chwili wykonania (`_still_flagged`).
+- Dowód: odtworzenie ZX na kopii indeksu usera — przed: 127 kopii, po:
+  127 linków, 0 kopii, przepakowanie tylko plików rodzica.
+
+### Reguły: zapis atomowy i STOP przy nieczytelnym pliku
+- `_reguly.json` wyzerowany (0 B) przez przerwany zapis na NAS → program
+  po cichu liczył na domyślnych regułach (inne katalogi docelowe, 4551 plików
+  „bez DAT-a" do ToSort, przenosiny całych katalogów).
+- Wszystkie pliki konfiguracyjne (reguły, kolejność, priorytety, ustawienia,
+  tłumaczenia, manifest BIOS, wersje) przez jedno `atomic_write_text`:
+  plik tymczasowy + fsync + atomowa podmiana, poprzednia wersja jako `.bak`.
+- Nieczytelne reguły: odczyt z `.bak`; bez niej naprawa, podgląd i skan
+  ZATRZYMUJĄ się z komunikatem (bezpiecznik). Zapis reguły nie nadpisuje
+  nieczytelnego pliku.
+
+### Bez zbędnych skanów
+- Po zmianie ustawień DAT-u/katalogu program radził „Skanuj i raportuj" —
+  wystarczy „Znajdź naprawy" (dopasowanie z indeksu). Skan tylko przy
+  włączeniu nigdy nie skanowanej platformy.
+- Sonda CHD nie pyta NAS o istnienie każdego katalogu (~430 rund).
+
+### Sprzątanie
+- Usunięte martwe `repack_incompatible_zips` (bez wywołań) i nieużywane
+  importy; logika atomowej zamiany na hardlink w jednym miejscu
+  (`replace_with_hardlink`).
+
 ## [0.6.84] — 2026-09-29
 
 ### Skan: katalogi listowane równolegle

@@ -150,6 +150,73 @@ def remove_link(path: Path) -> bool:
     return True
 
 
+def replace_with_hardlink(path: Path, target: Path) -> Optional[OSError]:
+    """`path` staje się HARDLINKIEM `target` — ATOMOWO: hardlink pod nazwą
+    tymczasową, potem os.replace w miejsce starego wpisu (symlinku albo
+    dawnego hardlinku). Żadnej chwili bez pliku; bez uprawnień administratora.
+    Zwraca błąd (stary wpis nietknięty) albo None."""
+    tmp = Path(str(path) + ".rh_hardlink_tmp")
+    try:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.link(str(target), str(tmp))
+    except OSError as e:
+        return e
+    try:
+        os.replace(str(tmp), str(path))
+        return None
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return e
+
+
+def hardlink_twins(path, index) -> list:
+    """Inne nazwy TEGO SAMEGO pliku fizycznego (hardlinki) — kandydaci z
+    indeksu (ta sama suma i rozmiar), potwierdzeni `same_file`. Wołać PRZED
+    podmianą pliku w miejscu: nowy plik to inny plik na dysku, więc jego
+    dawne hardlinki zostałyby ze STARĄ treścią (dziecko z zipem zstd/CHD-CD
+    obok przepakowanego rodzica = druga kopia fizyczna i ponowna praca)."""
+    if index is None:
+        return []
+    key = str(Path(os.path.abspath(str(path))))
+    try:
+        cands = index.same_content(key)
+    except Exception:
+        return []
+    out = []
+    for cand in cands:
+        try:
+            if same_file(Path(cand), Path(key)):
+                out.append(cand)
+        except OSError:
+            continue
+    return out
+
+
+def relink_twins(path, twins, index=None, log: Optional[LogCB] = None) -> int:
+    """PO podmianie `path` w miejscu: każdy dawny hardlink (`hardlink_twins`)
+    znów wskazuje NOWY plik; wpis indeksu z danymi nowego pliku. Zwraca ile."""
+    n = 0
+    for t in twins or ():
+        err = replace_with_hardlink(Path(t), Path(path))
+        if err is not None:
+            if log:
+                log(f"  BŁĄD przepięcia hardlinku {t}: {err}")
+            continue
+        n += 1
+        if index is not None:
+            try:
+                index.record_hardlink(t, path)
+            except Exception:
+                pass
+        if log:
+            log(f"  hardlink przepięty na nowy plik: {t}")
+    return n
+
+
 def remove_broken_links(roots, index=None, log: Optional[LogCB] = None,
                         cancel=None) -> int:
     """Usuwa ZERWANE symlinki (cel nie istnieje) w podanych korzeniach.
@@ -231,26 +298,8 @@ def remove_broken_links(roots, index=None, log: Optional[LogCB] = None,
                     return ("error", p, e)
             if not _same_volume(p, Path(tgt)) or os.path.isdir(tgt):
                 return ("skip", p, None)
-            # BEZ uprawnień administratora (program działa bez nich — hardlinki
-            # ich nie wymagają): hardlink pod nazwą tymczasową, potem ATOMOWA
-            # podmiana w miejsce symlinku. Żadnej chwili bez pliku i żadnej
-            # próby tworzenia symlinku przy błędzie.
-            tmp = Path(str(p) + ".rh_hardlink_tmp")
-            try:
-                if os.path.lexists(tmp):
-                    os.unlink(tmp)
-                os.link(tgt, str(tmp))
-            except OSError as e:
-                return ("error", p, e)          # symlink zostaje nietknięty
-            try:
-                os.replace(str(tmp), str(p))
-                return ("hard", p, tgt)
-            except OSError as e:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                return ("error", p, e)
+            err = replace_with_hardlink(p, Path(tgt))
+            return ("error", p, err) if err else ("hard", p, tgt)
 
         converted = 0
         with ThreadPoolExecutor(16) as ex:

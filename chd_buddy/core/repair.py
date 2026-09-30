@@ -62,7 +62,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     plików.
 
     `on_game(dat_key, gra, {rom: RomState})` — gra naprawiona (stan NA ŻYWO,
-    jak w RomVault: wypadkowa operacji, bez dopasowania); `on_reload()` —
+    jak w RomVault: wypadkowa operacji, bez dopasowania); `on_reload(stan)` —
     zapisany stan wszystkich DAT-ów odświeżony (po etapie 1)."""
     import threading
     from .dirrules import DirRules, missing_roots, scan_roots
@@ -74,6 +74,9 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     convert, clean = opts.convert, opts.clean
 
     rules = DirRules(dats)
+    if rules.fatal:                        # bezpiecznik: bez reguł nic nie ruszamy
+        log(f"BŁĄD: {rules.error}")
+        return None
     if rules.error:
         log(f"UWAGA: {rules.error}")
     # DAT-y: z pamięci (jeśli wczytane), inaczej odkryj TERAZ (cache per DAT →
@@ -216,6 +219,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     # zależności naprawy kontenera CHD budujemy RAZ (nie per katalog: CueLibrary
     # czyta katalog cues) i wołamy per katalog.
     _bad_chd_ctx = None
+    _rebuild_seen: set = set()             # jeden plik = jedna odbudowa w przebiegu
     if convert:
         try:
             from .chdman import CHDMan
@@ -319,7 +323,8 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
         _rep_by_entry.update({id(r.entry): r for r in reports})
         if on_reload is not None:
             try:
-                on_reload()
+                from .datcache import states_from_reports
+                on_reload(states_from_reports(reports))   # wątek naprawy, nie okna
             except Exception:
                 pass
     done_reports: list = []
@@ -393,7 +398,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
                 _rst = rebuild_bad_chds(
                     [rep.entry], _lib, _chd, settings, idx, extra_roots=_extra,
                     dry_run=dry, log=log, on_progress=progress, detail=detail,
-                    cancel=cancel, slot=slot)
+                    cancel=cancel, slot=slot, seen=_rebuild_seen)
                 if _rst.rebuilt or _rst.verify_failed or _rst.errors:
                     log(f"   naprawa kontenera CHD: {_rst.summary()}")
                 if not dry and _rst.rebuilt:

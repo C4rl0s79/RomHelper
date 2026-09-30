@@ -117,8 +117,8 @@ def load_versions() -> dict:
 
 
 def save_versions(v: dict) -> None:
-    versions_path().write_text(json.dumps(v, indent=2, ensure_ascii=False),
-                               encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(versions_path(), json.dumps(v, indent=2, ensure_ascii=False))
 
 
 def _download(session, url: str, dest: Path, log: LogCB) -> None:

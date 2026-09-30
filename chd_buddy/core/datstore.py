@@ -112,7 +112,8 @@ def save_priority(dat_root: Path, names: list[str]) -> Path:
             "# fizycznie; niżej = dzieci, dostają symlinki). Kolejność między\n"
             "# platformami bez znaczenia. Plik generowany z GUI.\n"
             + "\n".join(names) + "\n")
-    p.write_text(body, encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(p, body, backup=True)
     return p
 
 

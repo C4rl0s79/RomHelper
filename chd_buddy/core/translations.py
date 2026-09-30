@@ -260,12 +260,10 @@ class TranslationStore:
         return self
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps({"version": 1, "subs": self._subs},
-                                  ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        from .fileops import atomic_write_text
+        atomic_write_text(self.path, json.dumps({"version": 1, "subs": self._subs},
+                                                ensure_ascii=False, indent=2),
+                          backup=True)
 
     # -- API per gra --
     def get(self, dat_name: str, game: str) -> Optional[dict]:
