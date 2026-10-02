@@ -29,6 +29,9 @@ from typing import Optional, Sequence
 from .datfile import DatRom
 from .datstore import DatEntry
 from .fileindex import FileIndex
+from .gcpause import settle
+from .models import MediaType
+from .paths import dir_prefix, is_under
 
 
 class RomState(Enum):
@@ -36,6 +39,9 @@ class RomState(Enum):
     HAVE_CHD = "have_chd"
     WRONG_NAME = "wrong_name"
     ELSEWHERE = "elsewhere"
+    CREATABLE = "creatable"     # pusty plik-znacznik (size=0, np. .msu) — nie ma
+                                # go na miejscu, ale rebuilder go trywialnie
+                                # tworzy: liczymy jak „do naprawy", nie „brak"
     MISSING = "missing"
     NO_HASH = "no_hash"
 
@@ -54,6 +60,18 @@ class RomStatus:
     game_multi: bool = False    # gra wieloplikowa (CD bin/cue) => podkatalog
     archive_names_ok: bool = True  # via_archive: nazwy WEWN. zgodne z DAT-em
                                    # (False => przepakuj z poprawnymi nazwami)
+    archive_superset: bool = False  # źródłowe archiwum ma WIĘCEJ plików niż gra
+                                    # (np. MAME merged set: parent+klony) =>
+                                    # NIE przenosić całości, tylko WYPAKOWAĆ
+                                    # potrzebne ROM-y; źródła NIE kasować
+    is_translation: bool = False    # slot SPEŁNIONY świadomą podmianą na
+                                    # tłumaczenie (translations.json) — GUI 🌐
+    bad_container: bool = False     # CHD ma ZŁY kontener vs medium DAT (np. gra
+                                    # DVD zrobiona jako CD) — „do naprawy",
+                                    # naprawia „Odbuduj CHD wg cue"
+    bad_zip_method: bool = False    # ZIP użył metody != store/deflate (zstd/lzma)
+                                    # — niezgodne z emulatorami → „do naprawy"
+                                    # (naprawa przepakuje na deflate)
 
     @property
     def canonical_path(self) -> Path:
@@ -93,6 +111,7 @@ class DatReport:
         tak nie da się skompletować."""
         rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
                 RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+                RomState.CREATABLE: 2,
                 RomState.HAVE: 1, RomState.HAVE_CHD: 1}
         worst: dict[str, RomState] = {}
         for s in self.statuses:
@@ -103,7 +122,8 @@ class DatReport:
         for st in worst.values():
             if st in (RomState.HAVE, RomState.HAVE_CHD):
                 complete += 1
-            elif st in (RomState.WRONG_NAME, RomState.ELSEWHERE):
+            elif st in (RomState.WRONG_NAME, RomState.ELSEWHERE,
+                        RomState.CREATABLE):
                 fix += 1
             else:
                 miss += 1
@@ -116,33 +136,60 @@ class DatReport:
                 f"brak {miss}")
 
 
+_STATE_RANK = {RomState.MISSING: 3, RomState.NO_HASH: 3,
+               RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+               RomState.CREATABLE: 2,
+               RomState.HAVE: 1, RomState.HAVE_CHD: 1}
+
+
+def game_category(states) -> str:
+    """JEDNA reguła kategorii gry z jej stanów ROM-ów (najgorszy wygrywa):
+    'c' komplet, 'f' do naprawy, 'm' brak."""
+    worst = max((_STATE_RANK.get(st, 3) for st in states), default=3)
+    return "c" if worst == 1 else "f" if worst == 2 else "m"
+
+
 def game_stats_from_states(game_states: dict) -> tuple[int, int, int, int]:
     """(wszystkie, komplet, do_naprawy, brak) z mapy {gra: {rom: RomState}}.
     Wspólne dla żywego raportu i wczytanego cache."""
-    rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
-            RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
-            RomState.HAVE: 1, RomState.HAVE_CHD: 1}
-    complete = fix = miss = 0
+    n = {"c": 0, "f": 0, "m": 0}
     for roms in game_states.values():
-        worst = max(roms.values(), key=lambda st: rank[st])
-        if worst in (RomState.HAVE, RomState.HAVE_CHD):
-            complete += 1
-        elif worst in (RomState.WRONG_NAME, RomState.ELSEWHERE):
-            fix += 1
-        else:
-            miss += 1
-    return len(game_states), complete, fix, miss
+        n[game_category(roms.values())] += 1
+    return len(game_states), n["c"], n["f"], n["m"]
 
 
 def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(a) == os.path.normcase(b)
 
 
-def _link_satisfies(canonical, src: str) -> bool:
+def _link_satisfies(canonical, src: str, index: "FileIndex | None" = None) -> bool:
     """Czy ścieżka kanoniczna to POPRAWNY symlink na znalezioną kopię
     fizyczną `src`? Wtedy gra DZIECKA jest na miejscu (HAVE), a nie „do
-    naprawy" — dokładnie tak dzieci mają wyglądać po naprawie."""
+    naprawy" — dokładnie tak dzieci mają wyglądać po naprawie.
+
+    `index` (świeżo po skanie) pozwala UNIKNĄĆ rundy SMB: jeśli indeks nie zna
+    ścieżki kanonicznej jako ISTNIEJĄCEGO LINKU, nie może ona być spełniającym
+    linkiem → False bez dotykania dysku. Przy przenoszeniu z ToSort kanoniczny
+    plik zwykle jeszcze nie istnieje, więc tu kończymy — to zdejmuje ~jedną
+    rundę SMB z KAŻDEJ gry w podglądzie naprawy (na NAS = z minut na sekundy)."""
     c = str(canonical)
+    if index is not None:
+        row = index.lookup(c)
+        if row is None or row["missing"] or not row["is_link"]:
+            return False
+        # CEL linku z INDEKSU (skan zapisuje go w link_of) — bez NAS. Na dysk
+        # idziemy tylko dla linku sprzed tej wersji (link_of puste).
+        lo = row["link_of"] if "link_of" in row.keys() else ""
+        if lo:
+            if not _same_path(lo, os.path.abspath(str(src).replace("\\\\?\\", ""))):
+                return False
+            s = index.lookup(str(src))
+            return s is not None and not s["missing"]
+        # symlink bez zapisanego celu (sprzed tej wersji): NIE pytamy NAS —
+        # planowanie działa wyłącznie na indeksie (3 rundy SMB na grę = minuty
+        # przy starcie). Traktujemy jako „do naprawy": naprawa i tak zamienia
+        # każdy symlink na hardlink na starcie (w kolekcji tylko hardlinki).
+        return False
     try:
         if not os.path.islink(c):
             return False
@@ -181,7 +228,7 @@ def _row_full_match(row, rom) -> bool:
 def _pick(rows: Sequence, canonical: Path, target_dir: Path):
     """Wybiera najlepszego kandydata: kanoniczny > w katalogu DAT-a > inny."""
     canon = str(canonical)
-    tprefix = os.path.normcase(str(target_dir)).rstrip("\\/") + os.sep
+    tprefix = dir_prefix(target_dir)
     in_dir = None
     other = None
     for r in rows:
@@ -200,12 +247,45 @@ def _pick(rows: Sequence, canonical: Path, target_dir: Path):
     return None, ""
 
 
+_EMPTY_SUMS = {"da39a3ee5e6b4b0d3255bfef95601890afd80709",   # sha1("")
+               "d41d8cd98f00b204e9800998ecf8427e",           # md5("")
+               "00000000", "-"}                              # crc("") / brak
+
+
+def _is_empty_rom(rom) -> bool:
+    """PUSTY znacznik (0 B): sumy brak albo sumy PUSTEGO pliku. Każdy pusty plik
+    ma te sumy, więc NIE niosą tożsamości — nie szukamy po nich (TeknoParrot
+    „Missing in Action" dopasowywał przerwane 0 B zipy z ToSort). Rozmiar 0 z
+    PRAWDZIWYMI sumami (BIOS „System": rozmiar nieznany) to zwykły plik."""
+    if (rom.size or 0) != 0:
+        return False
+    return all((v or "").lower() in _EMPTY_SUMS or not v
+               for v in (rom.sha1, rom.md5, rom.crc))
+
+
 def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
               game_multi: bool = False) -> RomStatus:
     """Status pojedynczego ROM-a z DAT-a względem indeksu (bez CHD —
     dopasowanie CHD jest na poziomie GRY, patrz match_game).
 
     game_multi — gra wieloplikowa luzem => podkatalog per gra."""
+    # PUSTY plik-znacznik (np. .msu w MSU-1: size=0, crc="-"): brak sum, ale
+    # trywialnie odtwarzalny — 0 bajtów ma zawsze tę samą treść. HAVE, gdy leży
+    # na miejscu; inaczej CREATABLE (rebuilder utworzy pusty plik). CREATABLE
+    # liczy się jak „do naprawy", nie „brak" — bez tego gry MSU-1 (każda ma .msu)
+    # miały wieczne „brak", choć wszystkie realne pliki są.
+    if _is_empty_rom(rom):
+        status = RomStatus(entry, game, rom, RomState.CREATABLE,
+                           game_multi=game_multi)
+        # z INDEKSU, nie z NAS: dopasowanie nie dotyka dysku (isfile+getsize
+        # per pusty ROM = 2 rundy SMB na grę MSU-1 w KAŻDYM dopasowaniu)
+        canon = status.canonical_path
+        row = index.lookup(canon)
+        if (row is not None and not row["missing"] and not row["is_link"]
+                and (row["size"] or 0) == 0):
+            status.state = RomState.HAVE
+            status.source_path = str(canon)
+        return status
     rows: list = []
     if rom.sha1:
         rows = index.find_sha1(rom.sha1, include_chd_content=False)
@@ -236,10 +316,15 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
             status.state = {"canonical": RomState.HAVE,
                             "in_dir": RomState.WRONG_NAME,
                             "other": RomState.ELSEWHERE}[kind]
+            # Gra JEDNOPLIKOWA (CHD/RVZ/ISO) w podfolderze <target>/<gra>/<rom>
+            # zostaje WRONG_NAME: jeden plik = płasko, podfolder tylko dla gier
+            # wieloplikowych (bin/cue, reguła subdir_per_game). Naprawa przenosi
+            # ją zmianą nazwy (ten sam wolumin), a pusty folder sprząta (0.6.80;
+            # wcześniej taki układ z paczek RomVault był akceptowany jako HAVE).
             # kanoniczna ścieżka jest już POPRAWNYM linkiem na tę kopię
             # (typowy stan DZIECKA po naprawie) => na miejscu, nie „napraw"
             if (status.state != RomState.HAVE
-                    and _link_satisfies(status.canonical_path, row["path"])):
+                    and _link_satisfies(status.canonical_path, row["path"], index)):
                 status.state = RomState.HAVE
             return status
 
@@ -261,8 +346,15 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
 
 def _under(path: str, target_dir) -> bool:
     """Czy `path` leży w katalogu docelowym (bezpośrednio lub w podkatalogu)."""
-    return os.path.normcase(path).startswith(
-        os.path.normcase(str(target_dir)).rstrip("\\/") + os.sep)
+    return is_under(path, target_dir)
+
+
+def _zname(name: str) -> str:
+    """Nazwa członka archiwum do PORÓWNAŃ: ZIP przechowuje ścieżki z „/",
+    a DAT-y (np. Flux: `disk1\track.raw`) bywają z „\\". Python przy zapisie
+    zipa i tak zamienia „\\" na „/", więc bez normalizacji poprawny zip
+    wyglądał na „złe nazwy" → przepakowanie w KAŻDEJ naprawie."""
+    return (name or "").replace("\\", "/")
 
 
 def _archives_with_game(game, index: FileIndex) -> dict:
@@ -271,6 +363,12 @@ def _archives_with_game(game, index: FileIndex) -> dict:
     gdzie CAŁA gra siedzi w jednym pliku <gra>.zip."""
     per: dict[str, dict[int, str]] = {}
     for i, rom in enumerate(game.roms):
+        if _is_empty_rom(rom):
+            # PUSTY znacznik (size=0): suma „pustego pliku" ma KAŻDE archiwum z
+            # pustym wpisem w całej kolekcji — nie niesie tożsamości, a wyszukanie
+            # po niej dawało tysiące archiwów na grę (DSi: ~5 min dopasowania).
+            # Sprawdzany po NAZWIE w _match_game_archive, tylko u kandydatów.
+            continue
         rows: list = []
         if rom.sha1:
             rows = index.find_member_sha1(rom.sha1)
@@ -278,7 +376,13 @@ def _archives_with_game(game, index: FileIndex) -> dict:
             rows = index.find_member_crc(rom.crc, rom.size)
         for r in rows:
             if _row_full_match(r, rom):     # KOMPLET sum, nie jedna
-                per.setdefault(r["archive"], {})[i] = r["name"]
+                # kilka członków o TEJ SAMEJ treści (DAT arcade ma ROM-y-
+                # bliźniaki pod różnymi nazwami, np. epr-11437 = epr-11445):
+                # wybierz członka o NAZWIE tego ROM-u, inaczej poprawny zip
+                # wyglądał na „złe nazwy" → przepakowanie w KAŻDEJ naprawie
+                got = per.setdefault(r["archive"], {})
+                if _zname(got.get(i, "")) != _zname(rom.name):
+                    got[i] = r["name"]
     return per
 
 
@@ -295,43 +399,153 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
     """
     need = set(range(len(game.roms)))
     per = _archives_with_game(game, index)          # {archiwum: {rom_idx: nazwa}}
+    # PUSTE ZNACZNIKI (size=0, np. .msu MSU-1): sha1/crc puste, więc
+    # _archives_with_game ich nie łapie. Liczymy je jako obecne, gdy archiwum ma
+    # członka o tej NAZWIE (pusty wpis). Bez tego kompletne <gra>.zip nigdy nie
+    # jest „pełne" → naprawa wypakowuje/pakuje w kółko.
+    # Pytamy o członków WYŁĄCZNIE archiwa, które mają już WSZYSTKIE niepuste
+    # ROM-y gry (zwykle 1–2) — nie każde archiwum z jakimkolwiek wspólnym ROM-em
+    # (DSi: plik wspólny dla ~1200 gier → milion zapytań SQL na DAT).
+    empty_idx = {i for i, r in enumerate(game.roms) if _is_empty_rom(r)}
+    nonempty = need - empty_idx
+    if empty_idx and per and nonempty:
+        for a, m in per.items():
+            if not nonempty <= set(m):
+                continue                 # nie kandydat na pełną grę
+            try:
+                rows = index.members_of(a)
+            except Exception:
+                rows = []
+            by_name = {_zname(row["name"]): row for row in rows}
+            taken = set(m.values())
+            for i in empty_idx:
+                nm = game.roms[i].name
+                if _zname(nm) in by_name:
+                    m[i] = by_name[_zname(nm)]["name"]
+                    taken.add(nm)
+                    continue
+                # pusty wpis pod INNĄ nazwą → obecny (naprawa przepakuje nazwę)
+                alt = next((r["name"] for r in rows
+                            if (r["size"] or 0) == 0 and r["name"] not in taken),
+                           None)
+                if alt is not None:
+                    m[i] = alt
+                    taken.add(alt)
     full = [(a, m) for a, m in per.items() if need <= set(m)]
     if not full:
         return None
 
     def _names_ok(members: dict) -> bool:
         # nazwa WEWNĄTRZ archiwum musi zgadzać się z nazwą ROM-a z DAT-a
-        return all(members.get(i, "") == game.roms[i].name for i in need)
+        return all(_zname(members.get(i, "")) == _zname(game.roms[i].name)
+                   for i in need)
 
-    def _mk(archive, members, state, canonical, names_ok):
+    def _superset(archive: str) -> bool:
+        # archiwum ma WIĘCEJ plików niż gra potrzebuje (np. MAME merged set:
+        # parent + klony w podfolderach). Wtedy NIE wolno przenieść/skasować
+        # całości — trzeba WYPAKOWAĆ tylko ROM-y gry, źródło zostawić.
+        try:
+            n = index._db.execute(
+                "SELECT COUNT(*) FROM members WHERE archive=?",
+                (archive,)).fetchone()[0]
+        except Exception:
+            return False
+        return n > len(game.roms)
+
+    def _mk(archive, members, state, canonical, names_ok, superset=False,
+            bad_zip=False):
         return [RomStatus(entry, game.name, rom, state, source_path=archive,
                           member=members.get(i, ""), via_archive=True,
-                          canonical_override=canonical, archive_names_ok=names_ok)
+                          canonical_override=canonical, archive_names_ok=names_ok,
+                          archive_superset=superset, bad_zip_method=bad_zip)
                 for i, rom in enumerate(game.roms)]
+
+    def _bad_zip(archive: str) -> bool:
+        # ZŁA metoda kompresji ZIP (zstd/lzma) — skan zapisał to w indeksie
+        # (tanio, z centralnego katalogu). Emulatory takich nie czytają → repack.
+        if not archive.lower().endswith(".zip"):
+            return False
+        # 0.6.95: także zip, który NIE jest TorrentZipem (tz=0) — przepakowanie
+        # do postaci bitowo powtarzalnej (dedup, zgodność z RomVaultem); czy
+        # przepakować naprawdę (metoda zstd, zip opisany jako plik), decyduje
+        # rebuilder
+        try:
+            r = index.lookup(archive)
+            if r is None:
+                return False
+            keys = r.keys()
+            return bool(("bad_zip_method" in keys and r["bad_zip_method"] == 1)
+                        or ("tz" in keys and r["tz"] == 0))
+        except Exception:
+            return False
+
+    def _own(archive: str) -> bool:
+        # archiwum pod NAZWĄ TEJ gry (<gra>.zip) — to jej kanoniczny plik
+        return Path(archive).stem.lower() == game.name.lower()
+
+    # ARCADE (parent/clone/BIOS): własny zip gry z DODATKOWYMI ROM-ami (rodzica,
+    # BIOS-u, klonów — np. set non-merged/merged) jest POPRAWNY do gry; NIE
+    # przepakowujemy go w miejscu (to wycinało ROM-y innych gier — 16.09: 4095
+    # przepakowań nadzbiorów w fbneo).
+    arcade = False
+    try:
+        from . import mamesets
+        arcade = mamesets.is_arcade(entry)
+    except Exception:
+        pass
 
     in_dir = [(a, m) for a, m in full if _under(a, entry.target_dir)]
     if in_dir:
-        in_dir.sort(key=lambda am: (0 if _names_ok(am[1]) else 1, am[0].lower()))
+        # NAJPIERW własny zip gry (pgm.zip przed ddp2.zip zawierającym ROM-y
+        # pgm) — dawniej alfabetycznie, więc gra „znajdowała się" w cudzym zipie.
+        in_dir.sort(key=lambda am: (0 if _own(am[0]) else 1,
+                                    0 if _names_ok(am[1]) else 1,
+                                    am[0].lower()))
         archive, members = in_dir[0]
-        if _names_ok(members):
-            # w katalogu docelowym + poprawne nazwy wewnętrzne => zielone
+        sup = _superset(archive)
+        # własny zip arcade z dodatkami = OK (flaga `sup` zostaje PRAWDZIWA —
+        # przy złych nazwach rebuilder musi wiedzieć, że to nadzbiór)
+        tolerate = arcade and sup and _own(archive)
+        if _names_ok(members) and (not sup or tolerate):
+            # w katalogu docelowym + poprawne nazwy + DOKŁADNY zestaw => zielone,
+            # CHYBA że ZIP ma złą metodę kompresji (zstd/lzma) → „do naprawy"
+            # (repack na deflate w miejscu; treść OK, tylko kontener niezgodny).
+            if _bad_zip(archive):
+                return _mk(archive, members, RomState.WRONG_NAME, archive,
+                           True, bad_zip=True)
             return _mk(archive, members, RomState.HAVE, archive, True)
-        # zawartość poprawna, ale zła nazwa wewnątrz => PRZEPAKUJ (naprawa)
+        # złe nazwy ALBO nadzbiór (merged) => PRZEPAKUJ tylko ROM-y gry (naprawa)
         ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
         canonical = str(entry.target_dir / f"{game.name}.{ext}")
-        return _mk(archive, members, RomState.WRONG_NAME, canonical, False)
+        return _mk(archive, members, RomState.WRONG_NAME, canonical, False,
+                   superset=sup)
     if not allow_move:
         return None
     full.sort(key=lambda am: (0 if _names_ok(am[1]) else 1, am[0].lower()))
     archive, members = full[0]
+    sup = _superset(archive)
     ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
     canonical = str(entry.target_dir / f"{game.name}.{ext}")
     # kanoniczny zip DZIECKA jest już poprawnym linkiem na archiwum rodzica
-    if _link_satisfies(canonical, archive):
+    if _link_satisfies(canonical, archive, index):
         return _mk(archive, members, RomState.HAVE, canonical,
-                   _names_ok(members))
+                   _names_ok(members), superset=sup)
     return _mk(archive, members, RomState.ELSEWHERE, canonical,
-               _names_ok(members))
+               _names_ok(members), superset=sup)
+
+
+# rozszerzenia, które jednoznacznie oznaczają obraz PŁYTY (sam .bin bywa
+# też kartridżem — np. Atari 2600 — więc liczy się tylko z .cue obok)
+_DISC_EXTS = {"iso", "cue", "gdi", "cdi", "img", "toc", "chd", "mdf", "nrg"}
+
+
+def _disc_like(game) -> bool:
+    """Gra jest obrazem płyty (wg nazw ROM-ów z DAT-u)."""
+    for r in getattr(game, "roms", ()) or ():
+        n = (getattr(r, "name", "") or "").lower()
+        if "." in n and n.rsplit(".", 1)[-1] in _DISC_EXTS:
+            return True
+    return False
 
 
 def _find_game_chd(game, index: FileIndex):
@@ -353,7 +567,56 @@ def _find_game_chd(game, index: FileIndex):
     return None
 
 
-def match_game(entry: DatEntry, game, index: FileIndex) -> list[RomStatus]:
+def disk_path(entry: DatEntry, game: str, disk: DatRom,
+              alone: bool = True) -> Path:
+    """Miejsce pliku CHD dysku. Płasko `<katalog>/<gra>.chd` tylko, gdy gra to
+    SAM ten dysk (`alone`: bez ROM-ów, jeden dysk) i nazwa dysku = nazwa gry
+    (dir2dat psx/ps2/dc). Inaczej `<katalog>/<set>/<dysk>.chd` — układ, którego
+    szuka MAME/Naomi (beachspi/gds-0014.chd; simpbowl/simpbowl.chd obok
+    simpbowl.zip — 0.6.93)."""
+    stem = disk.name[:-4] if disk.name.lower().endswith(".chd") else disk.name
+    if alone and stem == game:
+        return entry.target_dir / disk.name
+    return entry.target_dir / game / disk.name
+
+
+def match_disk(entry: DatEntry, game: str, disk: DatRom,
+               index: FileIndex, alone: bool = True) -> RomStatus:
+    """Status dysku (`<disk>`): plik CHD o SHA-1 NAGŁÓWKA = suma z DAT-u.
+    Zwykły plik (nie archiwum, nie „cała gra z CHD"): jest / zła nazwa / gdzie
+    indziej / brak — resztę (link, przeniesienie) robi rebuilder jak dla pliku."""
+    canonical = disk_path(entry, game, disk, alone)
+    st = RomStatus(entry, game, disk, RomState.MISSING,
+                   canonical_override=str(canonical))
+    row, kind = _pick(index.find_chd_sha1(disk.sha1), canonical,
+                      entry.target_dir)
+    if row is None:
+        return st
+    st.source_path = row["path"]
+    st.state = {"canonical": RomState.HAVE, "in_dir": RomState.WRONG_NAME,
+                "other": RomState.ELSEWHERE}[kind]
+    if (st.state != RomState.HAVE
+            and _link_satisfies(canonical, row["path"], index)):
+        st.state = RomState.HAVE
+    return st
+
+
+def match_game(entry: DatEntry, game, index: FileIndex,
+               subs: Optional[dict] = None) -> list[RomStatus]:
+    """Statusy gry: ROM-y (niżej) + dyski CHD (`<disk>`, `match_disk`).
+    Dyski są osobno — ROM-y idą dotychczasową drogą bez zmian."""
+    disks = getattr(game, "disks", None) or ()
+    if not disks:
+        return _match_game_roms(entry, game, index, subs)
+    import dataclasses
+    sts = (_match_game_roms(entry, dataclasses.replace(game, disks=[]), index,
+                            subs) if game.roms else [])
+    alone = not game.roms and len(disks) == 1     # gra = sam ten dysk
+    return sts + [match_disk(entry, game.name, d, index, alone) for d in disks]
+
+
+def _match_game_roms(entry: DatEntry, game, index: FileIndex,
+                     subs: Optional[dict] = None) -> list[RomStatus]:
     """Statusy wszystkich ROM-ów gry, ŚWIADOME formatu przechowywania.
 
     Kluczowe: format docelowy (``entry.store_format``) NADPISuje rozszerzenia
@@ -369,62 +632,226 @@ def match_game(entry: DatEntry, game, index: FileIndex) -> list[RomStatus]:
     Układ: gra WIELOPLIKOWA luzem (bin/cue, gdi+tracki) dostaje podkatalog
     per gra (gdy entry.subdir_per_game); CHD i archiwa są płasko.
     """
+    # ARCADE (parent/clone): oczekiwana zawartość zipa wg `entry.arcade_format`.
+    # split-klon = tylko ROM-y unikalne (współdzielone bierze emulator z rodzica);
+    # non-merged/merged = pełna lista. Ten SAM helper liczy rebuilder → zero pętli
+    # „przepakuj". Zwykłe (nie-arcade) DAT-y: cloneof pusty → bez zmian.
+    if ((getattr(game, "cloneof", "") or getattr(game, "romof", ""))
+            and getattr(entry, "arcade_format", "")):
+        from . import mamesets
+        eff_roms = mamesets.effective_roms(entry, game)
+        if len(eff_roms) != len(game.roms):
+            import dataclasses
+            game = dataclasses.replace(game, roms=eff_roms)
+
     multi = len(game.roms) > 1 and getattr(entry, "subdir_per_game", True)
     statuses = [match_rom(entry, game.name, rom, index, game_multi=multi)
                 for rom in game.roms]
+
+    # PODMIANA na TŁUMACZENIE (translations.json = źródło prawdy): gra ma
+    # zapisany wybór → slot pod NAZWĄ KANONICZNĄ jest SPEŁNIONY przez wariant,
+    # mimo że jego treść ≠ sumy z podstawowego DAT-u. Bez tego skan cofałby
+    # świadomą podmianę. V1: gry jednoplikowe (jeden ROM danych).
+    if subs:
+        from .translations import (sub_key, game_forms, link_form_mismatch,
+                                   slot_path)
+        rec = subs.get(sub_key(entry.name, game.name))
+        if rec:
+            data_sts = [s for s in statuses
+                        if not s.rom.name.lower().endswith((".cue", ".gdi"))]
+            if len(data_sts) == 1:
+                base = data_sts[0].canonical_path
+                fmt_t = getattr(entry, "store_format", "keep") or "keep"
+                if fmt_t != "keep":
+                    # Twardo wg ustawienia katalogu: katalog `zip` = `<gra>.zip`.
+                    canonical = slot_path(base, base, game.name, fmt_t)
+                else:
+                    forms = game_forms(base, game.name)
+                    canonical = next((f for f in forms if os.path.islink(f)),
+                                     next((f for f in forms if os.path.exists(f)), base))
+                # Stara podmiana: link `.rom` → archiwum `.zip`. Emulator tego
+                # nie otworzy, a oryginał w innej formie zostaje obok — to NIE
+                # jest spełniona podmiana (GUI pokaże grę bez 🌐, do ponowienia).
+                form_ok = not (os.path.islink(canonical) and link_form_mismatch(canonical))
+                # NIE ufaj samemu istnieniu wpisu: WISZĄCY symlink (skasowany
+                # cel tłumaczenia) albo OBCY plik pod kanoniczną nazwą dawałyby
+                # fałszywe „komplet". Wymagamy, by CEL istniał (os.path.exists
+                # podąża za linkiem → False dla wiszącego), a gdy indeks zna
+                # treść — by zgadzała się z zapisanym wyborem (rec["sha1"]).
+                want = (rec.get("sha1") or "").lower()
+                have = set()             # znane sumy slotu (plik + członek archiwum)
+                if index is not None:
+                    try:
+                        orow = index.lookup(canonical)
+                    except Exception:
+                        orow = None
+                    if orow is not None and not orow["missing"]:
+                        have.add((orow["sha1"] or "").lower())
+                        if not orow["sha1"] and orow["is_link"]:
+                            try:
+                                trow = index.lookup(
+                                    Path(os.path.realpath(canonical)))
+                                have.add((trow["sha1"] or "").lower()
+                                         if trow else "")
+                            except Exception:
+                                pass
+                    # Slot-archiwum: wybór zapisany jest sumą ROM-u W ŚRODKU, a
+                    # suma całego pliku to suma kontenera — porównujemy obie.
+                    if canonical.suffix.lower() in (".zip", ".7z"):
+                        try:
+                            mem = index.members_of(Path(os.path.realpath(canonical)))
+                        except Exception:
+                            mem = []
+                        if len(mem) == 1:
+                            have.add((mem[0]["sha1"] or "").lower())
+                have.discard("")
+                if (form_ok and os.path.exists(canonical)
+                        and not (want and have and want not in have)):
+                    for s in statuses:
+                        s.state = RomState.HAVE
+                        s.is_translation = True
+                    return statuses
+
     if all(s.state == RomState.HAVE for s in statuses):
         return statuses                       # luźne pliki już na miejscu
 
     fmt = getattr(entry, "store_format", "keep")
+    # (1b) PIERWSZEŃSTWO CHD (user 01.10): gra PŁYTOWA w DAT-cie niepłytowym
+    # (No-Intro: wydanie cyfrowe z tymi samymi sumami co płyta z Redump) —
+    # gdy w kolekcji jest CHD tej gry, gra = ten CHD (link), nie drugi raz
+    # te same dane w zipie. Kartridże: CHD nie jest szukany.
+    chd_first = (_find_game_chd(game, index)
+                 if fmt in ("zip", "7z", "keep") and _disc_like(game) else None)
     # (2) kartridż: cała gra jako jedno archiwum. Dla „keep" też akceptujemy
     # archiwum w katalogu docelowym (nie wymuszamy wypakowania).
-    if fmt in ("zip", "7z", "keep"):
+    if fmt in ("zip", "7z", "keep") and chd_first is None:
         want = fmt if fmt in ("zip", "7z") else None
         arc = _match_game_archive(entry, game, index, want,
                                   allow_move=fmt in ("zip", "7z"))
         if arc is not None:
             return arc
 
+    # (3) format PŁYTOWY (chd/rvz): CHD ma PIERWSZEŃSTWO nad luźnymi ścieżkami.
+    # Bez tego DZIECKO (np. 1G1R), znajdując komplet luźnych ścieżek w ToSort
+    # ZIP-ie, wypakowywałoby je FIZYCZNIE do swojego katalogu — zamiast zrobić
+    # LINK do CHD rodzica. Gdy CHD (rodzica albo własny) istnieje → via_chd.
+    chd_row = chd_first or (_find_game_chd(game, index)
+                            if fmt in ("chd", "rvz") else None)
+
     complete = all(s.state not in (RomState.MISSING, RomState.NO_HASH)
                    for s in statuses)
-    if complete:
-        return statuses
-    chd_row = _find_game_chd(game, index)
     if chd_row is None:
-        return statuses
+        if complete:
+            return statuses                 # luźne/member: przenieś/wypakuj/konwertuj
+        chd_row = _find_game_chd(game, index)   # ostatnia szansa (niekompletne)
+        if chd_row is None:
+            return statuses
     canonical = entry.target_dir / f"{game.name}.chd"
     src = chd_row["path"]
-    if _same_path(src, str(canonical)) or _link_satisfies(canonical, src):
+    if _same_path(src, str(canonical)) or _link_satisfies(canonical, src, index):
         state = RomState.HAVE_CHD
-    elif os.path.normcase(src).startswith(
-            os.path.normcase(str(entry.target_dir)).rstrip("\\/") + os.sep):
+    elif is_under(src, entry.target_dir):
         state = RomState.WRONG_NAME
     else:
         state = RomState.ELSEWHERE
+    # ZŁY KONTENER (np. gra DVD spakowana jako CD): treść się zgadza, więc bez
+    # tego byłby „komplet" — ale w emulatorze nie ruszy. Degradujemy do „do
+    # naprawy"; naprawia „Odbuduj CHD wg cue" (rebuild_bad_chds, CD→DVD).
+    bad_cont = False
+    try:
+        bad_cont = ("bad_container" in chd_row.keys()
+                    and chd_row["bad_container"] == 1)
+    except Exception:
+        bad_cont = False
+    if bad_cont and state == RomState.HAVE_CHD:
+        state = RomState.WRONG_NAME
     for s in statuses:
         s.state = state
         s.via_chd = True
         s.member = ""
         s.source_path = src
         s.canonical_override = str(canonical)
+        s.bad_container = bad_cont
     return statuses
 
 
-def match_entry(entry: DatEntry, index: FileIndex) -> DatReport:
+def match_entry(entry: DatEntry, index: FileIndex,
+                subs: Optional[dict] = None) -> DatReport:
     entry.load()
     report = DatReport(entry)
     for game in entry.games:
-        report.statuses.extend(match_game(entry, game, index))
+        report.statuses.extend(match_game(entry, game, index, subs))
     return report
 
 
 def match_store(entries: Sequence[DatEntry], index: FileIndex,
-                log: Optional[callable] = None) -> list[DatReport]:
+                log: Optional[callable] = None,
+                subs: Optional[dict] = None) -> list[DatReport]:
+    """`subs` — mapa podmian na tłumaczenia (klucz `sub_key(dat,gra)` → wpis);
+    zwykle `TranslationStore._subs`. Gry z wpisem są SPEŁNIONE tłumaczeniem."""
     reports = []
     for e in entries:
         if log:
             log(f"DAT: {e.name}")
-        reports.append(match_entry(e, index))
+        reports.append(match_entry(e, index, subs))
+    return reports
+
+
+def match_reports(entries: Sequence[DatEntry], index: FileIndex, *,
+                  subs: Optional[dict] = None,
+                  log: Optional[callable] = None,
+                  on_progress: Optional[callable] = None,   # (i, n, tekst)
+                  detail: Optional[callable] = None,         # (i, n, tekst)
+                  cancel=None,
+                  label: str = "dopasowanie",
+                  build_cache: bool = True,
+                  drop_cache: bool = True) -> list[DatReport]:
+    """Buduje raporty (per DAT) WYŁĄCZNIE z indeksu — bez skanu plików.
+
+    Wspólny etap „dopasowanie" dla skanu i naprawy (jedna ścieżka zamiast dwóch
+    rozjeżdżających się). Wczytuje indeks do RAM (`build_match_cache`), dopasowuje
+    per gra z podpostępem (wielkie DAT-y pokazują „gra X/Y"), zwalnia cache.
+    Cancel przerywa między DAT-ami i między grami (wyniki cząstkowe zostają).
+
+    Dla naprawy: ponowne dopasowanie z indeksu ODZWIERCIEDLA to, co już
+    naprawiono (naprawa zapisuje wyniki do indeksu z commitem per operacja),
+    więc gotowe gry są HAVE i wypadają z przepisu → naprawa wznawia od miejsca,
+    gdzie stanęła. `build_cache=False` gdy cache już zbudowany (skan)."""
+    subs = subs or {}
+    reports: list[DatReport] = []
+    if build_cache:
+        index.build_match_cache()
+    try:
+        total = len(entries)
+        for i, e in enumerate(entries):
+            if cancel is not None and cancel.is_set():
+                if log:
+                    log(f"PRZERWANO {label} na {i}/{total} DAT-ów — "
+                        f"wyniki cząstkowe zachowane.")
+                break
+            if on_progress:
+                on_progress(i, total, f"{label}: {e.name}")
+            e.load()
+            games = e.games
+            ng = len(games) or 1
+            if log and ng > 300:
+                log(f"  {label}: {e.name} — {ng} gier…")
+            rep = DatReport(e)
+            for gi, g in enumerate(games):
+                if cancel is not None and cancel.is_set():
+                    break
+                if detail and gi % 300 == 0:
+                    detail(gi, ng, f"{e.name}: gra {gi}/{ng}")
+                rep.statuses.extend(match_game(e, g, index, subs))
+            if detail:
+                detail(ng, ng, f"{e.name}: {ng}/{ng}")
+            reports.append(rep)
+            # raporty rosną DAT po DAT (do mln statusów) — zamroź gotowe przed
+            # pełnym GC (pauza całego programu); freeze jest praktycznie darmowy
+            settle()
+    finally:
+        if drop_cache:
+            index.drop_match_cache()
     return reports
 
 
@@ -439,7 +866,11 @@ def deep_probe_chds(
     cancel_event=None,
     on_progress: Optional[callable] = None,   # (done, total, tekst) — OGÓLNY
     detail: Optional[callable] = None,        # (done, total, tekst) — SZCZEGÓŁ
+    slot_progress: Optional[callable] = None,  # (slot, done, total, tekst) — RÓWNOLEGŁY
     scratch_fallback: Optional[str] = None,   # dedykowany temp z ustawień
+    workers: int = 1,                         # równoległość TANIEGO nagłówka (chd.info)
+    deep_workers: int = 1,                     # GÓRNY limit równoległych ekstrakcji
+    deep_budget: int = 0,                      # budżet RAM (B) na scratch — 0=bez
 ) -> int:
     """Identyfikuje pliki .chd względem DAT-ów i zapisuje wynik do indeksu.
 
@@ -472,11 +903,39 @@ def deep_probe_chds(
 
     identified = 0
     seen: set[str] = set()
+    hdr_only: set[str] = set()      # nieudana identyfikacja — czytamy tylko nagłówek
+    # JEDNA treść = JEDEN odczyt: hardlinki/kopie (ta sama suma pliku + rozmiar)
+    # dostaną wynik od bliźniaka po sondzie (fill_from_twins niżej)
+    content_seen: set = set()
+    # wiedza od BLIŹNIAKÓW (hardlinki/kopie — ta sama suma) najpierw, z indeksu:
+    # żaden CHD, którego treść indeks już zna, nie idzie do chdman
+    try:
+        index.fill_from_twins(_log)
+    except Exception as e:
+        _log(f"UWAGA: wiedza od bliźniaków niedostępna ({e})")
+
+    def _flag_container(pth, chd_info, media) -> None:
+        """Zapisz, czy KONTENER CHD zgadza się z medium gry w DAT (createcd vs
+        createdvd). Tani — z nagłówka (bez ekstrakcji). Niepewne → 0 (nie strasz)."""
+        try:
+            if chd_info is None or media is None:
+                index.set_bad_container(pth, 0)
+                return
+            dm = chd_info.detected_media
+            if dm == MediaType.UNKNOWN or media == MediaType.UNKNOWN:
+                index.set_bad_container(pth, 0)
+                return
+            index.set_bad_container(pth, 1 if dm != media else 0)
+        except Exception:
+            pass
+
     # 1. PASS: zbierz kandydatów (CHD bez identyfikacji, nie deep_fail-stale) —
     #    żeby pasek OGÓLNY pokazał realny licznik „X/Y", a nie stał na 0/0.
     candidates: list = []
     for root in roots:
-        if not root or not Path(root).is_dir():
+        # BEZ `is_dir()` na NAS per korzeń (~430 szeregowych rund = „20 s bez
+        # postępu”): nieistniejący korzeń po prostu nie ma wpisów w indeksie
+        if not root:
             continue
         for row in index.all_under(root):
             p = row["path"]
@@ -484,8 +943,19 @@ def deep_probe_chds(
             if key in seen or not p.lower().endswith(".chd"):
                 continue
             seen.add(key)
-            if row["data_sha1"] and row["data_sha1"] in known:
-                continue          # już zidentyfikowany
+            if row["data_sha1"]:
+                # JUŻ zidentyfikowany po TREŚCI (dopasowany do SWOJEGO DAT-u
+                # kiedyś) — NIE ekstrahujemy go ponownie dla INNEGO DAT-u.
+                # (Ból regresji: 5648 CHD ps2/psx/3do/saturn mielonych przeciw
+                # JEDNEMU obcemu DAT-owi CD32, bo ich odcisk nie był w wąskim
+                # `known`.) Plik z ustalonym `data_sha1` jest zidentyfikowany
+                # niezależnie od tego, które DAT-y są teraz w puli. Wyjątek:
+                # kontener niesprawdzony (bad_container=-1) → dołóż na TANI check
+                # nagłówka (bez ekstrakcji). Ponowną PEŁNĄ identyfikację wymusza
+                # zmiana pliku (mtime) albo pełny skan katalogu.
+                bc = row["bad_container"] if "bad_container" in row.keys() else 0
+                if bc != -1 and row["chd_sha1"]:
+                    continue       # znany kontener i SHA-1 nagłówka — nic do czytania
             # PORAŻKA TEŻ JEST WYNIKIEM: plik już przeszedł głęboką
             # identyfikację bez dopasowania i się NIE ZMIENIŁ => nie mielimy
             # go ponownie co skan. Ponowną próbę wymusza pełny skan katalogu.
@@ -494,83 +964,302 @@ def deep_probe_chds(
             except (KeyError, IndexError):
                 deep_fail = 0
             if deep_fail and deep_fail == row["mtime_ns"]:
-                continue
-            if Path(p).is_file():
-                candidates.append(row)
+                if row["chd_sha1"]:
+                    continue
+                hdr_only.add(key)     # tylko nagłówek (SHA-1), bez ponownej ekstrakcji
+            # BEZ `is_file()` per plik: to szeregowa runda SMB na kandydata
+            # („20 s bez postępu” na tej linii, 29.09). Indeks po skanie jest
+            # źródłem prawdy; zniknięty plik obsłuży OSError z chd.info.
+            ck = (row["sha1"], row["size"]) if row["sha1"] else None
+            if ck is not None:
+                if ck in content_seen:
+                    continue      # bliźniak tej treści już w kolejce
+                content_seen.add(ck)
+            candidates.append(row)
     total_cand = len(candidates) or 1
+    if candidates:
+        # SKĄD są pliki: bez tego log podawał same nazwy i nie było wiadomo,
+        # który katalog jest przemiatany.
+        per_dir: dict = {}
+        for row in candidates:
+            d = str(Path(row["path"]).parent)
+            per_dir[d] = per_dir.get(d, 0) + 1
+        _log(f"CHD do sprawdzenia: {len(candidates)} w {len(per_dir)} katalogach "
+             f"(dopasowuję do {len(entries)} DAT-ów płytowych, {merged.games} gier: "
+             f"{', '.join(e.name for e in entries[:5])}"
+             f"{' …' if len(entries) > 5 else ''})")
+        for d, n in sorted(per_dir.items(), key=lambda kv: -kv[1])[:15]:
+            _log(f"  {n:5}  {d}")
+        if len(per_dir) > 15:
+            _log(f"  … i {len(per_dir) - 15} innych katalogów")
 
-    # 2. PASS: identyfikacja z postępem OGÓLNYM (X/Y CHD)
-    for ci, row in enumerate(candidates):
-            p = row["path"]
-            path = Path(p)
-            if cancel_event is not None and cancel_event.is_set():
-                return identified
-            if on_progress is not None:
-                on_progress(ci, total_cand,
-                            f"identyfikacja CHD ({ci + 1}/{total_cand}): "
-                            f"{path.name}")
-            # 1) tani nagłówek
-            hit = ""
-            info = None
-            try:
-                info = chd.info(path)
-                for cand in (info.data_sha1, info.sha1):
-                    if cand and cand.lower() in known:
-                        hit = cand.lower()
-                        break
-            except OSError as e:
-                _log(f"CHD info: {path.name}: {e}")
-            if hit:
-                index.set_data_sha1(path, hit)
-                identified += 1
-                _log(f"CHD OK (nagłówek): {path.name} -> {known[hit].game}")
-                continue
-            # 2) głęboka identyfikacja (ekstrakcja z fail-safe'ami)
-            # Wypakowany obraz tylko HASHUJEMY (nie zostaje), więc może powstać
-            # na DOWOLNYM dysku z miejscem — wybieramy dysk z zapasem (obok
-            # pliku, jeśli ma; inaczej inny). Dzięki temu pełny dysk kolekcji
-            # nie blokuje identyfikacji.
-            from .scratch import pick_scratch_root
+    # 2. PASS: identyfikacja RÓWNOLEGŁA. Odczyt/ekstrakcja CHD to I/O na NAS +
+    #    dekompresja (chdman) — POJEDYNCZY strumień nie wysyca ani łącza (SMB
+    #    latencja round-tripów), ani CPU (dekompresja czeka na I/O). Pula wątków
+    #    czyta/wypakowuje kilka CHD naraz → kilka strumieni wypełnia łącze, a
+    #    dekompresja nakłada się na I/O. ZAPISY DO INDEKSU (SQLite jednowątkowy)
+    #    idą WYŁĄCZNIE w wątku wołającym — wątki tylko liczą i zwracają wynik.
+    #    Dwustopniowo: (A) TANI nagłówek (chd.info) mocno równolegle (RAM≈0),
+    #    (B) GŁĘBOKA ekstrakcja mniej równolegle (każda wypakowuje pełny obraz
+    #    na scratch/RAM-dysk → limit `deep_workers` chroni przed zapchaniem).
+    import queue as _queue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from .scratch import pick_scratch_root
+
+    n_head = max(1, int(workers))
+    n_deep = max(1, int(deep_workers))
+    done = 0
+    need_deep: list = []                       # [(row, info)] — nagłówek nie trafił
+    scratch_lock = threading.Lock()            # serializuje wybór/remount scratchu
+    # BUDŻET RAM na scratch: zamiast sztywnej liczby wątków rezerwujemy tyle, ile
+    # ekstrakcja REALNIE potrzebuje (~2 GB gra CD, ~9 GB DVD). Dla małych gier
+    # zmieści się ich WIĘCEJ naraz (więcej strumieni z NAS = wyżej LAN), dla
+    # dużych zejdzie samo — bez przekraczania fizycznego RAM-u. 0 = bez budżetu
+    # (tylko limit `deep_workers`).
+    budget_total = int(deep_budget) if deep_budget and deep_budget > 0 else 0
+    budget = {"free": budget_total}
+    budget_cond = threading.Condition()
+
+    head_done = 0
+    deep_total = 0
+
+    def _head_tick(name: str) -> None:
+        # postęp FAZY NAGŁÓWKÓW (chd.info na każdym kandydacie) — bez tego przy
+        # dużej kolekcji CHD, gdy nic nie trafia nagłówkiem (np. PS2-jako-CD nie
+        # pasuje do DVD-DAT → wszystko idzie w deep), GUI „stało" minutami z
+        # dyskami NAS na maxa, choć realnie trwał odczyt nagłówków.
+        nonlocal head_done
+        head_done += 1
+        if on_progress is not None:
+            on_progress(head_done, total_cand,
+                        f"nagłówki CHD ({head_done}/{total_cand}): {name}")
+
+    def _deep_tick(name: str) -> None:
+        nonlocal done
+        done += 1
+        if on_progress is not None:
+            on_progress(done, deep_total or 1,
+                        f"głęboka identyfikacja CHD ({done}/{deep_total}): {name}")
+
+    def _aborted() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    # ---- (A) TANI nagłówek: chd.info + dopasowanie, równolegle -------------
+    def _head_job(row):
+        """W wątku roboczym: chd.info + dopasowanie nagłówka. BEZ dostępu do
+        indeksu (SQLite tylko w wątku głównym). Zwraca krotkę do zastosowania."""
+        path = Path(row["path"])
+        # ustalony data_sha1 = JUŻ zidentyfikowany (dowolny DAT) → tylko tani
+        # check kontenera z nagłówka, NIGDY ekstrakcja. Nie wymagamy obecności
+        # w bieżącym `known` (plik mógł być naprawiony do innego DAT-u).
+        dsha_known = bool(row["data_sha1"])
+        info = None
+        try:
+            info = chd.info(path)
+        except OSError as e:
+            if dsha_known:
+                return ("known", row, None)
+            return ("head", row, None, "", str(e))
+        if dsha_known:
+            # zidentyfikowany po TREŚCI — tu tylko dokładamy tani check KONTENERA
+            return ("known", row, info)
+        hit = ""
+        for cand in (info.data_sha1, info.sha1):
+            if cand and cand.lower() in known:
+                hit = cand.lower()
+                break
+        return ("head", row, info, hit, "")
+
+    if candidates:
+        if on_progress is not None:
+            on_progress(0, total_cand,
+                        f"sprawdzam nagłówki {total_cand} CHD…")
+        ex = ThreadPoolExecutor(max_workers=n_head)
+        try:
+            futs = {ex.submit(_head_job, r): r for r in candidates}
+            for fut in as_completed(futs):
+                if _aborted():
+                    break
+                res = fut.result()
+                tag, row, info = res[0], res[1], res[2]
+                path = Path(row["path"])
+                # SHA-1 NAGŁÓWKA = suma `<disk>` w DAT-ach MAME/dir2dat
+                if info is not None and getattr(info, "sha1", "") \
+                        and not row["chd_sha1"]:
+                    index.set_chd_sha1(path, info.sha1)
+                if tag == "known":
+                    # media z DAT-u jeśli odcisk jest w bieżącej puli; gdy plik
+                    # naprawiony do INNEGO (niezaładowanego) DAT-u — media=None
+                    # (_flag_container ustawi 0: bez pewności nie strasz).
+                    _m = known.get(row["data_sha1"])
+                    _flag_container(path, info, _m.media if _m else None)
+                    _head_tick(path.name)
+                    continue
+                hit, err = res[3], res[4]
+                if err:
+                    _log(f"CHD info: {path}: {err}")
+                    if not os.path.exists(path):   # tylko przy błędzie (rzadko)
+                        _head_tick(path.name)
+                        continue
+                if hit:
+                    index.set_data_sha1(path, hit)
+                    _flag_container(path, info, known[hit].media)
+                    identified += 1
+                    _log(f"CHD OK (nagłówek): {path} -> {known[hit].game}")
+                elif os.path.normcase(row["path"]) not in hdr_only:
+                    need_deep.append((row, info))   # policzony w fazie głębokiej
+                _head_tick(path.name)
+        finally:
+            # NA PRZERWANIU też CZEKAMY (wait=True): wątki w locie widzą
+            # cancel_event, chdman jest zabijany od razu (_stream sprawdza cancel
+            # co linię), a deep_identify przerywa pętlę metod — więc kończą się w
+            # sekundy. Bez czekania `deep_probe` wracał NATYCHMIAST i pozostałe
+            # ekstrakcje jechały dalej w tle (dopasowanie startowało nad żywymi
+            # ekstrakcjami, a przy zamknięciu ramdysk był zajęty). cancel_futures
+            # porzuca tylko to, co jeszcze NIE ruszyło.
+            ex.shutdown(wait=True, cancel_futures=_aborted())
+    deep_total = len(need_deep)
+
+    # ---- (B) GŁĘBOKA ekstrakcja: równolegle wg deep_workers, pasek per slot -
+    def _acquire_budget(need: int) -> int:
+        """Rezerwuje `need` bajtów z budżetu RAM (albo cały, gdy gra > budżet →
+        idzie sama, bez zakleszczenia). Czeka, aż się zmieści. Zwraca ile
+        zarezerwowano (0 gdy budżet wyłączony)."""
+        if budget_total <= 0:
+            return 0
+        reserve = min(need, budget_total)
+        with budget_cond:
+            while budget["free"] < reserve and budget["free"] < budget_total:
+                if _aborted():
+                    return -1                      # sygnał przerwania
+                budget_cond.wait(timeout=0.5)
+            budget["free"] -= reserve
+        return reserve
+
+    def _release_budget(reserve: int) -> None:
+        if reserve and reserve > 0:
+            with budget_cond:
+                budget["free"] += reserve
+                budget_cond.notify_all()
+
+    def _deep_job(row, info):
+        """W wątku: rezerwacja budżetu RAM + pick_scratch_root + deep_identify
+        (ekstrakcja pełnego obrazu → hash). Wynik tylko zwracamy; index zapisuje
+        wątek główny."""
+        path = Path(row["path"])
+        if _aborted():
+            return ("cancel", row, info, None)
+        try:
             need = max(int(path.stat().st_size * 2.2), 2 << 30)
-            # RAM dysk MA PIERWSZEŃSTWO (jak przy konwersji); work_dir (jeśli
-            # ustawiony) to dopiero fallback, gdy RAM niedostępny/za mały.
-            wd = pick_scratch_root(
-                need, prefer=(str(work_dir) if work_dir else str(path.parent)),
-                log=_log, fallback=scratch_fallback)
+        except OSError:
+            need = 2 << 30
+        # BRAMKA BUDŻETU RAM: czeka aż zmieści się `need` (małe gry → więcej
+        # naraz). Zwolnienie w finally na KAŻDEJ ścieżce.
+        reserve = _acquire_budget(need)
+        if reserve < 0:
+            return ("cancel", row, info, None)
+        try:
+            # RAM dysk MA PIERWSZEŃSTWO; wybór/remount pod lockiem — unika
+            # wyścigu o odmontowany RAM-dysk między wątkami.
+            with scratch_lock:
+                wd = pick_scratch_root(
+                    need, prefer=(str(work_dir) if work_dir else str(path.parent)),
+                    log=_log, fallback=scratch_fallback)
             if wd is None:
-                _log(f"CHD POMIJAM (za mało miejsca na ŻADNYM dysku): "
-                     f"{path.name} — potrzeba ~{need/1024**3:.1f} GB")
-                continue
-            _log(f"CHD głęboko: {path.name}… (scratch: {wd})")
+                return ("noscratch", row, info, need)
+            slot = slot_q.get()
+            _log(f"CHD głęboko: {path}… (scratch: {wd})")
 
-            # postęp ekstrakcji chdman (pct 0-100 albo -1=nieokreślony) → pasek
-            # szczegółowy. Bez tego długie extractcd wyglądało na zawieszone.
-            # PRIMUJEMY pasek od razu — nawet zanim chdman wypisze pierwszy %,
-            # widać że trwa wypakowanie tego CHD.
-            if detail is not None:
-                detail(0, 0, f"wypakowuję CHD: {path.name}…")
+            def _dp(pct: float, msg: str = "", _name=path.name, _slot=slot) -> None:
+                # postęp ekstrakcji chdman → OSOBNY pasek slotu (kilka naraz);
+                # gdy brak slot_progress → wspólny pasek szczegółowy (1 wątek).
+                if slot_progress is not None:
+                    if pct is not None and pct >= 0:
+                        slot_progress(_slot, int(pct), 100,
+                                      f"{_name}: {msg or f'{int(pct)}%'}")
+                    else:
+                        slot_progress(_slot, 0, 0, f"{_name}: {msg}".rstrip(": "))
+                elif detail is not None:
+                    if pct is not None and pct >= 0:
+                        detail(int(pct), 100,
+                               f"CHD {_name}: {msg or f'{int(pct)}%'}")
+                    else:
+                        detail(0, 0, f"CHD {_name}: {msg}".rstrip(": "))
 
-            def _dp(pct: float, msg: str = "", _name=path.name) -> None:
-                if detail is None:
-                    return
-                if pct is not None and pct >= 0:
-                    detail(int(pct), 100, f"CHD {_name}: {msg or f'{int(pct)}%'}")
+            try:
+                if slot_progress is not None:
+                    slot_progress(slot, 0, 0, f"wypakowuję: {path.name}…")
+                elif detail is not None:
+                    detail(0, 0, f"wypakowuję CHD: {path.name}…")
+                # PREFIKS z nazwą pliku: w trybie równoległym logi z
+                # deep_identify (Próba/✔/✗) się PRZEPLATAJĄ — bez nazwy „✔ ==
+                # DAT 'X'" wyglądałaby, jakby należała do sąsiedniego „CHD
+                # głęboko: Y". Prefiks czyni log jednoznacznym i weryfikowalnym.
+                # prefiks: PLATFORMA/plik (katalog nadrzędny = platforma), by
+                # w przeplatanym logu było widać, z którego katalogu leci CHD.
+                _pfx = f"[{path.parent.name}/{path.name}] " if n_deep > 1 else ""
+                r = deep_identify(chd, path, merged, wd,
+                                  log=lambda m, _p=_pfx: _log(f"  {_p}{m}"),
+                                  on_progress=_dp,
+                                  cancel_event=cancel_event, chd_info=info)
+                return ("deep", row, info, r)
+            finally:
+                if slot_progress is not None:
+                    slot_progress(slot, -1, 0, "")  # zwolnij/ukryj pasek slotu
+                slot_q.put(slot)
+        finally:
+            _release_budget(reserve)
+
+    if need_deep and not _aborted():
+        slot_q: _queue.Queue = _queue.Queue()
+        for i in range(n_deep):
+            slot_q.put(i)
+        ex = ThreadPoolExecutor(max_workers=n_deep)
+        try:
+            futs = {ex.submit(_deep_job, row, info): row
+                    for (row, info) in need_deep}
+            for fut in as_completed(futs):
+                if _aborted():
+                    break
+                tag, row, info, r = fut.result()
+                path = Path(row["path"])
+                if tag == "cancel":
+                    continue
+                if tag == "noscratch":
+                    _log(f"CHD POMIJAM (za mało miejsca na ŻADNYM dysku): "
+                         f"{path} — potrzeba ~{r/1024**3:.1f} GB")
+                    _deep_tick(path.name)
+                    continue
+                # tag == "deep"
+                if r.ok and r.sha1:
+                    index.set_data_sha1(path, r.sha1)
+                    _media = r.media if r.media is not None else (
+                        known[r.sha1].media if r.sha1 in known else None)
+                    _flag_container(path, info, _media)
+                    identified += 1
+                    _log(f"CHD OK ({r.method}): {path} -> {r.game}")
+                elif _aborted():
+                    pass                    # przerwane ręcznie — NIE zapisuj porażki
                 else:
-                    detail(0, 0, f"CHD {_name}: {msg}".rstrip(": "))
-
-            r = deep_identify(chd, path, merged, wd,
-                              log=lambda m: _log(f"  {m}"),
-                              on_progress=_dp,
-                              cancel_event=cancel_event, chd_info=info)
-            if r.ok and r.sha1:
-                index.set_data_sha1(path, r.sha1)
-                identified += 1
-                _log(f"CHD OK ({r.method}): {path.name} -> {r.game}")
-            elif cancel_event is not None and cancel_event.is_set():
-                return identified     # przerwane ręcznie — NIE zapisuj porażki
-            else:
-                index.set_deep_fail(path)   # zapamiętaj: nie próbuj ponownie
-                _log(f"CHD BRAK: {path.name} — bez dopasowania "
-                     f"(prób: {len(r.tried)}; zapamiętane — nie będzie "
-                     f"mielony przy kolejnych skanach)")
+                    index.set_deep_fail(path)   # zapamiętaj: nie próbuj ponownie
+                    _log(f"CHD BRAK: {path} — bez dopasowania "
+                         f"(prób: {len(r.tried)}; zapamiętane — nie będzie "
+                         f"mielony przy kolejnych skanach)")
+                _deep_tick(path.name)
+        finally:
+            # NA PRZERWANIU też CZEKAMY (wait=True): wątki w locie widzą
+            # cancel_event, chdman jest zabijany od razu (_stream sprawdza cancel
+            # co linię), a deep_identify przerywa pętlę metod — więc kończą się w
+            # sekundy. Bez czekania `deep_probe` wracał NATYCHMIAST i pozostałe
+            # ekstrakcje jechały dalej w tle (dopasowanie startowało nad żywymi
+            # ekstrakcjami, a przy zamknięciu ramdysk był zajęty). cancel_futures
+            # porzuca tylko to, co jeszcze NIE ruszyło.
+            ex.shutdown(wait=True, cancel_futures=_aborted())
+    # wyniki sondy (nagłówek, odcisk, kontener, porażka) → bliźniaki treści
+    try:
+        index.fill_from_twins(_log)
+    except Exception as e:
+        _log(f"UWAGA: wiedza od bliźniaków niedostępna ({e})")
     return identified

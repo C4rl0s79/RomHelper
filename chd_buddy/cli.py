@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from pathlib import Path
 
@@ -241,26 +242,6 @@ def cmd_dupes(args, settings: Settings) -> int:
     return 0
 
 
-def cmd_dedup(args, settings: Settings) -> int:
-    from .core.linker import LinkPrivilegeError, apply_dedup, plan_dedup
-    with _open_index(args, settings) as idx:
-        actions = plan_dedup(idx, prefer_roots=args.prefer or (),
-                             min_size=args.min_size)
-        if not actions:
-            print("Brak duplikatów w indeksie.")
-            return 0
-        dry = not args.yes
-        if dry:
-            print("PODGLĄD (bez --yes nic nie zmieniam):")
-        try:
-            st = apply_dedup(actions, index=idx, dry_run=dry, log=print)
-        except LinkPrivilegeError as e:
-            print(f"Błąd: {e}", file=sys.stderr)
-            return 3
-        print(f"\n{st.summary()}")
-    return 0 if st.errors == 0 else 1
-
-
 def cmd_mirror(args, settings: Settings) -> int:
     from .core.linker import DEFAULT_EXCLUDES, LinkPrivilegeError, mirror_tree
     excludes = (tuple(e.strip() for e in args.exclude.split(",") if e.strip())
@@ -356,7 +337,11 @@ def cmd_report(args, settings: Settings) -> int:
     with _open_index(args, settings) as idx:
         _scan_sources(idx, args, settings)
         _maybe_deep_probe(idx, entries, args, settings)
-        reports = match_store(entries, idx)
+        idx.build_match_cache()          # dopasowanie w RAM (sekundy, nie minuty)
+        try:
+            reports = match_store(entries, idx)
+        finally:
+            idx.drop_match_cache()
     grand_total = grand_have = 0
     for rep in reports:
         have = rep.count(RomState.HAVE, RomState.HAVE_CHD)
@@ -389,7 +374,11 @@ def cmd_rebuild(args, settings: Settings) -> int:
     with _open_index(args, settings) as idx:
         _scan_sources(idx, args, settings)
         _maybe_deep_probe(idx, entries, args, settings)
-        reports = match_store(entries, idx)
+        idx.build_match_cache()          # dopasowanie w RAM (sekundy, nie minuty)
+        try:
+            reports = match_store(entries, idx)
+        finally:
+            idx.drop_match_cache()
         dedup_roots = ([] if args.keep_copies else
                        [r for r in (args.roms, args.tosort) if r])
         rb = Rebuilder(idx, tosort=Path(args.tosort) if args.tosort else None,
@@ -589,15 +578,6 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--min-size", type=int, default=1, help="minimalny rozmiar pliku (B)")
     pd.set_defaults(func=cmd_dupes)
 
-    pdd = sub.add_parser("dedup", help="zastąp duplikaty symlinkami (jedna kopia fizyczna)")
-    pdd.add_argument("--db", help="plik bazy indeksu")
-    pdd.add_argument("--prefer", action="append", metavar="KATALOG",
-                     help="katalog preferowany na kopię fizyczną (można podać wielokrotnie, "
-                          "kolejność = priorytet)")
-    pdd.add_argument("--min-size", type=int, default=1)
-    pdd.add_argument("--yes", action="store_true",
-                     help="wykonaj podmiany (bez tego tylko podgląd)")
-    pdd.set_defaults(func=cmd_dedup)
 
     pm = sub.add_parser("mirror", help="mirror drzewa ROM-ów symlinkami (serwer → RetroBat)")
     pm.add_argument("source", help="katalog źródłowy na serwerze (np. Z:\\ROMS)")
@@ -681,16 +661,23 @@ def build_parser() -> argparse.ArgumentParser:
     pic.add_argument("--sgdb-key", help="klucz API SteamGridDB (fallback; domyślnie z ustawień)")
     pic.set_defaults(func=cmd_icons)
 
-    psh = sub.add_parser("shortcuts", help="twórz skróty .lnk z właściwą składnią emulatora")
+    from .core.shortcuts import SHORTCUT_EXT
+    _sep = "\\" if os.name == "nt" else "/"
+    psh = sub.add_parser(
+        "shortcuts",
+        help=f"twórz skróty {SHORTCUT_EXT} z właściwą składnią emulatora")
     psh.add_argument("rom_dir", help="katalog gier jednego systemu (albo RomRoot z --tree)")
-    psh.add_argument("--emus", help="katalog główny emulatorów (np. D:\\emu\\Emulatory; "
-                                    "domyślnie z ustawień)")
+    psh.add_argument("--emus", help="katalog główny emulatorów (np. D:\\emu\\Emulatory "
+                                    "albo ~/emu; domyślnie z ustawień)")
     psh.add_argument("--system", help="wymuś system (np. PS2; domyślnie z nazwy katalogu)")
     psh.add_argument("--tree", action="store_true",
                      help="traktuj podkatalogi jako systemy (RomRoot)")
-    psh.add_argument("--out", help="katalog na .lnk (domyślnie <rom_dir>\\shortcuts)")
-    psh.add_argument("--icons", help="katalog z .ico (domyślnie <rom_dir>\\icons)")
-    psh.add_argument("--overwrite", action="store_true", help="nadpisuj istniejące .lnk")
+    psh.add_argument("--out", help=f"katalog na {SHORTCUT_EXT} "
+                                   f"(domyślnie <rom_dir>{_sep}shortcuts)")
+    psh.add_argument("--icons",
+                     help=f"katalog z ikonami (domyślnie <rom_dir>{_sep}icons)")
+    psh.add_argument("--overwrite", action="store_true",
+                     help=f"nadpisuj istniejące {SHORTCUT_EXT}")
     psh.add_argument("--dry-run", action="store_true", help="tylko podgląd")
     psh.set_defaults(func=cmd_shortcuts)
     return p

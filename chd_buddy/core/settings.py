@@ -8,7 +8,6 @@ robimy fallback na katalog obok skryptu / bieżący i logujemy ostrzeżenie.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 from dataclasses import dataclass, asdict, field
@@ -52,12 +51,27 @@ class Settings:
     work_dir: str = ""
     # Kompresja: "default" => niech chdman wybierze wg polecenia.
     compression_preset: str = "default"   # CHD: kodeki (patrz presets.py)
-    # ZIP: poziom DEFLATE 0–9 (0=bez kompresji, 6=domyślny zlib, 9=maks).
+    # ZIP: poziom 0–9 (0=bez kompresji, 6=domyślny, 9=maks).
     zip_level: int = 6
+    # Metoda kompresji ZIP: "deflate" (zgodne z KAŻDYM emulatorem/scraperem)
+    # albo "zstd" (mniejszy plik, ale wiele narzędzi go NIE czyta — „Failed to
+    # inflate"). Domyślnie deflate dla kompatybilności.
+    zip_method: str = "deflate"
     # RVZ (DolphinTool): poziom zstd 1–22 (5=domyślny) i rozmiar bloku w KB.
     rvz_level: int = 5
     rvz_block_kb: int = 128
     threads: int = 0                 # 0 => auto (chdman)
+    # Ile konwersji RÓWNOLEGLE w potoku naprawy (każda 1 wątek chdman → tyle
+    # rdzeni). 0 => auto (min(8, rdzenie_logiczne//2)). Mniej = mniej strumieni
+    # I/O na NAS i mniej RAM-dysku naraz. Domyślnie 4.
+    convert_workers: int = 4
+    # Ile POBIERAŃ (NAS→RAM) naraz w potoku konwersji/odbudowy. Domyślnie 1 =
+    # potok „na zakładkę" (user): jeden plik się pobiera; gdy skończy i zaczyna
+    # się przerabiać, rusza pobieranie następnego; gotowy idzie do wysyłki,
+    # a w tym czasie kolejne się przerabiają. Kilka pobrań naraz tylko dzieliło
+    # łącze. (Nowa nazwa pola — stare `gather_workers`=3 z 0.6.74–0.6.76 jest
+    # ignorowane przy wczytywaniu.)
+    download_workers: int = 1
     verify_after_create: bool = True
     # Round-trip: po createdvd wypakuj obraz i porównaj SHA-1 ze źródłem.
     # Silniejsze niż verify (dowód danych, nie tylko kontenera) — domyślnie ON,
@@ -113,17 +127,32 @@ class Settings:
     # RAM dysk (ImDisk) na operacje tymczasowe: wypakowanie/przepakowanie CHD.
     # Ulotny — nie zapycha dysku kolekcji, nic nie zostaje po przerwaniu.
     ramdisk_enabled: bool = True
-    ramdisk_size_gb: int = 30
+    ramdisk_size_gb: int = 40
     ramdisk_letter: str = "R"
-    # Przy starcie proś o podniesienie do administratora (UAC), by móc tworzyć
-    # symlinki bez trybu dewelopera. Odmowa UAC => program działa bez admina.
+    # Przy starcie proś o podniesienie CAŁEGO programu do administratora (UAC).
+    # DOMYŚLNIE WŁĄCZONE: symlinki (używane stale) wymagają admina, gdy tryb
+    # dewelopera Windows jest wyłączony. Bez admina RAM-dysk ImDisk i tak da się
+    # utworzyć (osobny prompt UAC), ale symlinki nie powstaną.
     auto_elevate: bool = True
     # Opcje naprawy Kombajnu (checkboxy w pasku) — trwałe między sesjami.
     fix_clean: bool = False          # nieznane → ToSort
     fix_incomplete: bool = False     # buduj też niekompletne gry
     fix_del_tosort: bool = True      # usuń z ToSort pliki już na miejscu
     fix_convert: bool = False        # konwertuj do formatu docelowego
-    fix_dedup: bool = True           # kopie potwierdzonych → symlinki
+    fix_dedup: bool = True           # kopie potwierdzonych → hardlinki
+    # Równoległe hashowanie w skanie wg nośnika katalogu (NAS/SSD; HDD=1 zawsze).
+    # Kilka odczytów naraz ukrywa latencję sieci/kolejkę SSD — duży zysk na
+    # pierwszym skanie TB; na pojedynczym HDD szkodzi (skakanie głowicy).
+    scan_workers_nas: int = 8
+    scan_workers_ssd: int = 4
+    # Ręczne nadpisanie nośnika per katalog: {ścieżka: "nas"|"ssd"|"hdd"}.
+    # Puste => auto-wykrywanie (dysk sieciowy vs lokalny). Przełącznik w GUI.
+    storage_overrides: dict = field(default_factory=dict)
+    # Stan interfejsu (pamiętany między sesjami):
+    #   ui_geometry         — pozycja/rozmiar okna (base64 saveGeometry),
+    #   ui_collapsed_groups — klucze zwiniętych grup-katalogów w drzewie DAT-ów.
+    ui_geometry: str = ""
+    ui_collapsed_groups: list = field(default_factory=list)
 
     @property
     def tosort_dirs(self) -> list:
@@ -171,10 +200,9 @@ class Settings:
         p = self.path()
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {k: v for k, v in asdict(self).items() if not k.startswith("_")}
-        # zapis atomowy
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
+        from .fileops import atomic_write_text
+        atomic_write_text(p, json.dumps(payload, indent=2, ensure_ascii=False),
+                          backup=True)
         return p
 
     # --- Wygodne akcesory --------------------------------------------------

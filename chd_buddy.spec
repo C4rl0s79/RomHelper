@@ -4,14 +4,22 @@
 
 block_cipher = None
 
+# Wszystkie submoduły pakietu jawnie — `main.py` importuje UI LENIWIE (w funkcji),
+# więc analiza statyczna PyInstallera bywała gubiona przy zaśmieconym cache `build/`
+# (efekt: niekompletny exe „No module named chd_buddy.ui.suite_window"). Jawna
+# lista jest odporna na to niezależnie od stanu cache.
+from PyInstaller.utils.hooks import collect_submodules
+_hidden = collect_submodules("chd_buddy")
+
 a = Analysis(
     ["chd_buddy/main.py"],
     pathex=["."],
-    binaries=[],
+    # klasyczny zlib (TorrentZip bitowo jak RomVault; Python 3.14 ma zlib-ng)
+    binaries=[("chd_buddy/bin/chd_zlib1.dll", ".")],
     datas=[
         # ("resources", "resources"),  # jeśli dodasz ikony/style
     ],
-    hiddenimports=[],
+    hiddenimports=_hidden,
     hookspath=[],
     excludes=["tkinter", "test", "unittest"],
     cipher=block_cipher,
@@ -24,11 +32,11 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="CHD Buddy",
+    name="ROM Helper",
     debug=False,
     strip=False,
     upx=True,
     console=False,          # GUI bez okna konsoli
     disable_windowed_traceback=False,
-    icon=None,              # ustaw ścieżkę do .ico jeśli masz
+    icon="assets/icon.ico",
 )

@@ -82,13 +82,19 @@ class MultiDatSettingsDialog(QDialog):
         self._add_row(form, "only_complete", tr("Kompletność:"), self.chk_complete,
                       lambda: self.chk_complete.isChecked())
 
-        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → symlinki"))
+        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → hardlinki"))
         self._add_row(form, "dedup_copies", tr("Dedup:"), self.chk_dedup,
                       lambda: self.chk_dedup.isChecked())
 
         self.chk_trans = QCheckBox(tr("podmieniaj (Japan) na tłumaczenia [T-En]"))
         self._add_row(form, "prefer_translations", tr("Tłumaczenia:"),
                       self.chk_trans, lambda: self.chk_trans.isChecked())
+
+        self.cmb_role = QComboBox()
+        self.cmb_role.addItem(tr("kolekcja (parent/child)"), "collection")
+        self.cmb_role.addItem(tr("tłumaczenia (pula wariantów)"), "translations")
+        self._add_row(form, "role", tr("Rola DAT-u:"), self.cmb_role,
+                      lambda: self.cmb_role.currentData())
 
         self.chk_skip = QCheckBox(tr("pomiń te DAT-y (nie raportuj / nie buduj)"))
         self._add_row(form, "skip", tr("Pomiń:"), self.chk_skip,

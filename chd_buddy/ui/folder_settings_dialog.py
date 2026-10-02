@@ -57,10 +57,23 @@ class FolderSettingsDialog(QDialog):
         form = QFormLayout()
         lay.addLayout(form)
 
-        self.chk_parent = QCheckBox(tr("wszystkie DAT-y tego katalogu są RODZICAMI "
-                                    "swoich platform (trzymają pliki fizyczne)"))
-        self.chk_parent.setChecked(bool(cur.get("parent_priority", False)))
-        form.addRow(tr("Rola:"), self.chk_parent)
+        # wymuszenie: DAT-y tego katalogu nigdy nie linkują (kolejność =
+        # hierarchia z drzewa; to tylko wyjątek od linkowania)
+        self.chk_physical = QCheckBox(tr("zawsze kopie fizyczne (bez linków do "
+                                      "DAT-ów wyżej)"))
+        self.chk_physical.setChecked(not bool(cur.get("dedup_copies", True)))
+        form.addRow(tr("Wymuszenie:"), self.chk_physical)
+
+        # ROLA wszystkich DAT-ów w katalogu: kolekcja albo pula tłumaczeń
+        self.cmb_role = QComboBox()
+        self.cmb_role.addItem(tr("kolekcja (parent/child)"), "collection")
+        self.cmb_role.addItem(tr("tłumaczenia (pula wariantów do podmiany)"),
+                              "translations")
+        self._select(self.cmb_role, cur.get("role", "collection"))
+        self.cmb_role.setToolTip(tr(
+            "„tłumaczenia” = wszystkie DAT-y w tym katalogu to źródło fanowskich "
+            "tłumaczeń (pula wariantów do podmiany w innych DAT-ach)."))
+        form.addRow(tr("Rola DAT-u:"), self.cmb_role)
 
         self.cmb_format = QComboBox()
         for k, l in _FORMATS:
@@ -126,13 +139,14 @@ class FolderSettingsDialog(QDialog):
 
     def _save(self) -> None:
         updates = {
-            "parent_priority": self.chk_parent.isChecked(),
+            "dedup_copies": not self.chk_physical.isChecked(),
             "format": self.cmb_format.currentData(),
             "naming": self.cmb_naming.currentData(),
             "rom_root": self.e_root.text().strip(),
             "subdir_per_game": self.chk_subdir.isChecked(),
             "only_complete": self.chk_complete.isChecked(),
             "prefer_translations": self.chk_trans.isChecked(),
+            "role": self.cmb_role.currentData(),
         }
         try:
             save_rule(self.dat_root, self.folder_key, updates)
