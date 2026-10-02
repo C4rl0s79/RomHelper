@@ -14,7 +14,8 @@ _hidden = collect_submodules("chd_buddy")
 a = Analysis(
     ["chd_buddy/main.py"],
     pathex=["."],
-    binaries=[],
+    # klasyczny zlib (TorrentZip bitowo jak RomVault; Python 3.14 ma zlib-ng)
+    binaries=[("chd_buddy/bin/chd_zlib1.dll", ".")],
     datas=[
         # ("resources", "resources"),  # jeśli dodasz ikony/style
     ],

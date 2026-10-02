@@ -247,6 +247,22 @@ def _pick(rows: Sequence, canonical: Path, target_dir: Path):
     return None, ""
 
 
+_EMPTY_SUMS = {"da39a3ee5e6b4b0d3255bfef95601890afd80709",   # sha1("")
+               "d41d8cd98f00b204e9800998ecf8427e",           # md5("")
+               "00000000", "-"}                              # crc("") / brak
+
+
+def _is_empty_rom(rom) -> bool:
+    """PUSTY znacznik (0 B): sumy brak albo sumy PUSTEGO pliku. Każdy pusty plik
+    ma te sumy, więc NIE niosą tożsamości — nie szukamy po nich (TeknoParrot
+    „Missing in Action" dopasowywał przerwane 0 B zipy z ToSort). Rozmiar 0 z
+    PRAWDZIWYMI sumami (BIOS „System": rozmiar nieznany) to zwykły plik."""
+    if (rom.size or 0) != 0:
+        return False
+    return all((v or "").lower() in _EMPTY_SUMS or not v
+               for v in (rom.sha1, rom.md5, rom.crc))
+
+
 def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
               game_multi: bool = False) -> RomStatus:
     """Status pojedynczego ROM-a z DAT-a względem indeksu (bez CHD —
@@ -258,7 +274,7 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
     # na miejscu; inaczej CREATABLE (rebuilder utworzy pusty plik). CREATABLE
     # liczy się jak „do naprawy", nie „brak" — bez tego gry MSU-1 (każda ma .msu)
     # miały wieczne „brak", choć wszystkie realne pliki są.
-    if (rom.size or 0) == 0 and not rom.sha1 and not rom.md5:
+    if _is_empty_rom(rom):
         status = RomStatus(entry, game, rom, RomState.CREATABLE,
                            game_multi=game_multi)
         # z INDEKSU, nie z NAS: dopasowanie nie dotyka dysku (isfile+getsize
@@ -347,7 +363,7 @@ def _archives_with_game(game, index: FileIndex) -> dict:
     gdzie CAŁA gra siedzi w jednym pliku <gra>.zip."""
     per: dict[str, dict[int, str]] = {}
     for i, rom in enumerate(game.roms):
-        if (rom.size or 0) == 0:
+        if _is_empty_rom(rom):
             # PUSTY znacznik (size=0): suma „pustego pliku" ma KAŻDE archiwum z
             # pustym wpisem w całej kolekcji — nie niesie tożsamości, a wyszukanie
             # po niej dawało tysiące archiwów na grę (DSi: ~5 min dopasowania).
@@ -390,7 +406,7 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
     # Pytamy o członków WYŁĄCZNIE archiwa, które mają już WSZYSTKIE niepuste
     # ROM-y gry (zwykle 1–2) — nie każde archiwum z jakimkolwiek wspólnym ROM-em
     # (DSi: plik wspólny dla ~1200 gier → milion zapytań SQL na DAT).
-    empty_idx = {i for i, r in enumerate(game.roms) if (r.size or 0) == 0}
+    empty_idx = {i for i, r in enumerate(game.roms) if _is_empty_rom(r)}
     nonempty = need - empty_idx
     if empty_idx and per and nonempty:
         for a, m in per.items():
@@ -449,10 +465,17 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
         # (tanio, z centralnego katalogu). Emulatory takich nie czytają → repack.
         if not archive.lower().endswith(".zip"):
             return False
+        # 0.6.95: także zip, który NIE jest TorrentZipem (tz=0) — przepakowanie
+        # do postaci bitowo powtarzalnej (dedup, zgodność z RomVaultem); czy
+        # przepakować naprawdę (metoda zstd, zip opisany jako plik), decyduje
+        # rebuilder
         try:
             r = index.lookup(archive)
-            return bool(r is not None and "bad_zip_method" in r.keys()
-                        and r["bad_zip_method"] == 1)
+            if r is None:
+                return False
+            keys = r.keys()
+            return bool(("bad_zip_method" in keys and r["bad_zip_method"] == 1)
+                        or ("tz" in keys and r["tz"] == 0))
         except Exception:
             return False
 
@@ -511,6 +534,20 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
                _names_ok(members), superset=sup)
 
 
+# rozszerzenia, które jednoznacznie oznaczają obraz PŁYTY (sam .bin bywa
+# też kartridżem — np. Atari 2600 — więc liczy się tylko z .cue obok)
+_DISC_EXTS = {"iso", "cue", "gdi", "cdi", "img", "toc", "chd", "mdf", "nrg"}
+
+
+def _disc_like(game) -> bool:
+    """Gra jest obrazem płyty (wg nazw ROM-ów z DAT-u)."""
+    for r in getattr(game, "roms", ()) or ():
+        n = (getattr(r, "name", "") or "").lower()
+        if "." in n and n.rsplit(".", 1)[-1] in _DISC_EXTS:
+            return True
+    return False
+
+
 def _find_game_chd(game, index: FileIndex):
     """Szuka pliku .chd, którego zawartość odpowiada CAŁEJ grze.
 
@@ -530,8 +567,56 @@ def _find_game_chd(game, index: FileIndex):
     return None
 
 
+def disk_path(entry: DatEntry, game: str, disk: DatRom,
+              alone: bool = True) -> Path:
+    """Miejsce pliku CHD dysku. Płasko `<katalog>/<gra>.chd` tylko, gdy gra to
+    SAM ten dysk (`alone`: bez ROM-ów, jeden dysk) i nazwa dysku = nazwa gry
+    (dir2dat psx/ps2/dc). Inaczej `<katalog>/<set>/<dysk>.chd` — układ, którego
+    szuka MAME/Naomi (beachspi/gds-0014.chd; simpbowl/simpbowl.chd obok
+    simpbowl.zip — 0.6.93)."""
+    stem = disk.name[:-4] if disk.name.lower().endswith(".chd") else disk.name
+    if alone and stem == game:
+        return entry.target_dir / disk.name
+    return entry.target_dir / game / disk.name
+
+
+def match_disk(entry: DatEntry, game: str, disk: DatRom,
+               index: FileIndex, alone: bool = True) -> RomStatus:
+    """Status dysku (`<disk>`): plik CHD o SHA-1 NAGŁÓWKA = suma z DAT-u.
+    Zwykły plik (nie archiwum, nie „cała gra z CHD"): jest / zła nazwa / gdzie
+    indziej / brak — resztę (link, przeniesienie) robi rebuilder jak dla pliku."""
+    canonical = disk_path(entry, game, disk, alone)
+    st = RomStatus(entry, game, disk, RomState.MISSING,
+                   canonical_override=str(canonical))
+    row, kind = _pick(index.find_chd_sha1(disk.sha1), canonical,
+                      entry.target_dir)
+    if row is None:
+        return st
+    st.source_path = row["path"]
+    st.state = {"canonical": RomState.HAVE, "in_dir": RomState.WRONG_NAME,
+                "other": RomState.ELSEWHERE}[kind]
+    if (st.state != RomState.HAVE
+            and _link_satisfies(canonical, row["path"], index)):
+        st.state = RomState.HAVE
+    return st
+
+
 def match_game(entry: DatEntry, game, index: FileIndex,
                subs: Optional[dict] = None) -> list[RomStatus]:
+    """Statusy gry: ROM-y (niżej) + dyski CHD (`<disk>`, `match_disk`).
+    Dyski są osobno — ROM-y idą dotychczasową drogą bez zmian."""
+    disks = getattr(game, "disks", None) or ()
+    if not disks:
+        return _match_game_roms(entry, game, index, subs)
+    import dataclasses
+    sts = (_match_game_roms(entry, dataclasses.replace(game, disks=[]), index,
+                            subs) if game.roms else [])
+    alone = not game.roms and len(disks) == 1     # gra = sam ten dysk
+    return sts + [match_disk(entry, game.name, d, index, alone) for d in disks]
+
+
+def _match_game_roms(entry: DatEntry, game, index: FileIndex,
+                     subs: Optional[dict] = None) -> list[RomStatus]:
     """Statusy wszystkich ROM-ów gry, ŚWIADOME formatu przechowywania.
 
     Kluczowe: format docelowy (``entry.store_format``) NADPISuje rozszerzenia
@@ -631,9 +716,15 @@ def match_game(entry: DatEntry, game, index: FileIndex,
         return statuses                       # luźne pliki już na miejscu
 
     fmt = getattr(entry, "store_format", "keep")
+    # (1b) PIERWSZEŃSTWO CHD (user 01.10): gra PŁYTOWA w DAT-cie niepłytowym
+    # (No-Intro: wydanie cyfrowe z tymi samymi sumami co płyta z Redump) —
+    # gdy w kolekcji jest CHD tej gry, gra = ten CHD (link), nie drugi raz
+    # te same dane w zipie. Kartridże: CHD nie jest szukany.
+    chd_first = (_find_game_chd(game, index)
+                 if fmt in ("zip", "7z", "keep") and _disc_like(game) else None)
     # (2) kartridż: cała gra jako jedno archiwum. Dla „keep" też akceptujemy
     # archiwum w katalogu docelowym (nie wymuszamy wypakowania).
-    if fmt in ("zip", "7z", "keep"):
+    if fmt in ("zip", "7z", "keep") and chd_first is None:
         want = fmt if fmt in ("zip", "7z") else None
         arc = _match_game_archive(entry, game, index, want,
                                   allow_move=fmt in ("zip", "7z"))
@@ -644,7 +735,8 @@ def match_game(entry: DatEntry, game, index: FileIndex,
     # Bez tego DZIECKO (np. 1G1R), znajdując komplet luźnych ścieżek w ToSort
     # ZIP-ie, wypakowywałoby je FIZYCZNIE do swojego katalogu — zamiast zrobić
     # LINK do CHD rodzica. Gdy CHD (rodzica albo własny) istnieje → via_chd.
-    chd_row = _find_game_chd(game, index) if fmt in ("chd", "rvz") else None
+    chd_row = chd_first or (_find_game_chd(game, index)
+                            if fmt in ("chd", "rvz") else None)
 
     complete = all(s.state not in (RomState.MISSING, RomState.NO_HASH)
                    for s in statuses)
@@ -811,6 +903,10 @@ def deep_probe_chds(
 
     identified = 0
     seen: set[str] = set()
+    hdr_only: set[str] = set()      # nieudana identyfikacja — czytamy tylko nagłówek
+    # JEDNA treść = JEDEN odczyt: hardlinki/kopie (ta sama suma pliku + rozmiar)
+    # dostaną wynik od bliźniaka po sondzie (fill_from_twins niżej)
+    content_seen: set = set()
     # wiedza od BLIŹNIAKÓW (hardlinki/kopie — ta sama suma) najpierw, z indeksu:
     # żaden CHD, którego treść indeks już zna, nie idzie do chdman
     try:
@@ -858,8 +954,8 @@ def deep_probe_chds(
                 # nagłówka (bez ekstrakcji). Ponowną PEŁNĄ identyfikację wymusza
                 # zmiana pliku (mtime) albo pełny skan katalogu.
                 bc = row["bad_container"] if "bad_container" in row.keys() else 0
-                if bc != -1:
-                    continue
+                if bc != -1 and row["chd_sha1"]:
+                    continue       # znany kontener i SHA-1 nagłówka — nic do czytania
             # PORAŻKA TEŻ JEST WYNIKIEM: plik już przeszedł głęboką
             # identyfikację bez dopasowania i się NIE ZMIENIŁ => nie mielimy
             # go ponownie co skan. Ponowną próbę wymusza pełny skan katalogu.
@@ -868,10 +964,17 @@ def deep_probe_chds(
             except (KeyError, IndexError):
                 deep_fail = 0
             if deep_fail and deep_fail == row["mtime_ns"]:
-                continue
+                if row["chd_sha1"]:
+                    continue
+                hdr_only.add(key)     # tylko nagłówek (SHA-1), bez ponownej ekstrakcji
             # BEZ `is_file()` per plik: to szeregowa runda SMB na kandydata
             # („20 s bez postępu” na tej linii, 29.09). Indeks po skanie jest
             # źródłem prawdy; zniknięty plik obsłuży OSError z chd.info.
+            ck = (row["sha1"], row["size"]) if row["sha1"] else None
+            if ck is not None:
+                if ck in content_seen:
+                    continue      # bliźniak tej treści już w kolejce
+                content_seen.add(ck)
             candidates.append(row)
     total_cand = len(candidates) or 1
     if candidates:
@@ -982,6 +1085,10 @@ def deep_probe_chds(
                 res = fut.result()
                 tag, row, info = res[0], res[1], res[2]
                 path = Path(row["path"])
+                # SHA-1 NAGŁÓWKA = suma `<disk>` w DAT-ach MAME/dir2dat
+                if info is not None and getattr(info, "sha1", "") \
+                        and not row["chd_sha1"]:
+                    index.set_chd_sha1(path, info.sha1)
                 if tag == "known":
                     # media z DAT-u jeśli odcisk jest w bieżącej puli; gdy plik
                     # naprawiony do INNEGO (niezaładowanego) DAT-u — media=None
@@ -1001,7 +1108,7 @@ def deep_probe_chds(
                     _flag_container(path, info, known[hit].media)
                     identified += 1
                     _log(f"CHD OK (nagłówek): {path} -> {known[hit].game}")
-                else:
+                elif os.path.normcase(row["path"]) not in hdr_only:
                     need_deep.append((row, info))   # policzony w fazie głębokiej
                 _head_tick(path.name)
         finally:
@@ -1150,4 +1257,9 @@ def deep_probe_chds(
             # ekstrakcjami, a przy zamknięciu ramdysk był zajęty). cancel_futures
             # porzuca tylko to, co jeszcze NIE ruszyło.
             ex.shutdown(wait=True, cancel_futures=_aborted())
+    # wyniki sondy (nagłówek, odcisk, kontener, porażka) → bliźniaki treści
+    try:
+        index.fill_from_twins(_log)
+    except Exception as e:
+        _log(f"UWAGA: wiedza od bliźniaków niedostępna ({e})")
     return identified

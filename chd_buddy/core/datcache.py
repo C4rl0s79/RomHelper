@@ -21,7 +21,7 @@ from .settings import app_base_dir
 
 CACHE_FILENAME = "dat_parse_cache.pkl"     # stary MONOLIT (migrowany → katalog)
 CACHE_DIRNAME = "dat_parse_cache"          # v3+: OSOBNY plik per DAT (obok exe)
-CACHE_VERSION = 3      # v3: DatGame.cloneof/romof + DatRom.merge (MAME)
+CACHE_VERSION = 5      # v5: dir2dat — tory/cue łączone w grę; v4: DatGame.disks (<disk> → CHD); v3: cloneof/romof/merge
 
 REPORT_CACHE_FILENAME = "report_state_cache.pkl"   # stary format: jeden plik
 REPORT_STATES_DIRNAME = "report_states"            # nowy: plik per DAT
@@ -64,9 +64,25 @@ def _compact(rep) -> dict:
     return games
 
 
+def _tmp_for(dst: Path) -> Path:
+    """Plik tymczasowy zapisu cache — Z NUMEREM PROCESU: dwa procesy (GUI +
+    drugi przebieg) nie piszą tego samego pliku (01.10: WinError 32 →
+    poprawny DAT „uszkodzony" → jego katalog uznany za sierotę)."""
+    return dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+
+
+def _drop_tmp(tmp: Path) -> None:
+    """Sprzątanie po nieudanym zapisie cache — NIGDY nie rzuca (zapis cache
+    jest przy okazji; jego błąd nie może zepsuć wczytania DAT-u)."""
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _write_report_file(dirpath: Path, key: str, games: dict, saved_at: str) -> None:
     dst = _report_file(dirpath, key)
-    tmp = dst.with_suffix(".pkl.tmp")
+    tmp = _tmp_for(dst)
     try:
         with open(tmp, "wb") as f:
             pickle.dump({"version": REPORT_CACHE_VERSION, "saved_at": saved_at,
@@ -74,7 +90,7 @@ def _write_report_file(dirpath: Path, key: str, games: dict, saved_at: str) -> N
                         f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, dst)
     except (OSError, pickle.PickleError):
-        tmp.unlink(missing_ok=True)
+        _drop_tmp(tmp)
 
 
 STALE_MARKER = ".nieaktualny"     # naprawa zmieniła indeks, a stan nie przeliczony
@@ -261,7 +277,7 @@ class DatParseCache:
     def _write(self, key: str, sig, name: str, games: list[DatGame]) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         dst = _cache_file(self.dir, key)
-        tmp = dst.with_suffix(".pkl.tmp")
+        tmp = _tmp_for(dst)
         try:
             with open(tmp, "wb") as f:
                 pickle.dump({"version": CACHE_VERSION, "sig": tuple(sig),
@@ -269,7 +285,7 @@ class DatParseCache:
                             f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, dst)
         except (OSError, pickle.PickleError):
-            tmp.unlink(missing_ok=True)
+            _drop_tmp(tmp)
 
     def get(self, dat: Path, sig=None) -> Optional[tuple[str, list[DatGame]]]:
         """Zwraca (name, games) z cache, jeśli plik DAT-a niezmieniony.

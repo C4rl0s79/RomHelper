@@ -1954,6 +1954,7 @@ class SuiteWindow(QMainWindow):
                                 tr("Wskaż istniejący katalog DAT-ów."))
             return
         roms = self.row_roms.path or dats
+        _tosorts = list(self.settings.tosort_dirs)
 
         def job(log: Callable[[str], None], progress, cancel):
             from ..core.datstore import DatStore
@@ -1985,7 +1986,12 @@ class SuiteWindow(QMainWindow):
             log("Wczytuję wynik ostatniego skanu…")
             saved = load_report_states(known_keys={
                 str(Path(os.path.abspath(e.dat_path))) for e in entries})
-            return entries, saved
+            # liczby/reguły/ToSort dla drzewa — też tutaj (0.6.96)
+            from ..core.viewdata import prepare_view
+            view = prepare_view(entries, saved=saved, dat_root=dats,
+                                tosort_dirs=_tosorts, log=log,
+                                progress=progress)
+            return entries, saved, view
 
         self._run(job, self._fill_dats_loaded)
 
@@ -1994,8 +2000,10 @@ class SuiteWindow(QMainWindow):
         Jeśli jest zapamiętany raport — pokaż ostatni znany stan (kolory).
         `result` = (entries, (saved_at, states)) z wątku tła; lista entries
         (np. przerwane wczytywanie) → stany doczytujemy tu (bez NAS)."""
+        view = None
         if isinstance(result, tuple):
-            entries, (self._saved_at, self._saved_states) = result
+            entries, (self._saved_at, self._saved_states) = result[0], result[1]
+            view = result[2] if len(result) > 2 else None
         else:
             entries = result or []
             from ..core.datcache import load_report_states
@@ -2005,7 +2013,7 @@ class SuiteWindow(QMainWindow):
         self._reports_by_id = {}
         self._entries = entries
         has_saved = bool(self._saved_states)
-        self._fill_dats(entries, with_stats=has_saved)
+        self._fill_dats(entries, with_stats=has_saved, view=view)
         extra = (f" Pokazuję ostatni skan z {self._saved_at} — Skanuj i "
                  f"raportuj odświeży." if has_saved else
                  " Przycisk Skanuj i raportuj doda statusy jest/brak.")
@@ -2799,14 +2807,21 @@ class SuiteWindow(QMainWindow):
                     log("⏹ PRZERWANO dopasowanie — poprzedni wynik zostaje.")
                     return all_entries, None
                 progress(len(reports), len(enabled), "dopasowanie")
-                return all_entries, reports
+                # widok drzewa (zapis/odczyt stanu, liczby, NAS) — w wątku
+                from ..core.viewdata import prepare_view
+                view = prepare_view(
+                    all_entries, reports=reports, save=True, dat_root=dats,
+                    tosort_dirs=list(settings.tosort_dirs),
+                    rom_root=settings.rom_root, log=log, progress=progress)
+                return all_entries, reports, view
 
         self._run(job, self._fill_reports, title="Skanowanie kolekcji")
 
     def _fill_reports(self, result) -> None:
         """Wypełnia lewy panel DAT-ami ZE STATYSTYKAMI. Wyłączone DAT-y są
         widoczne (bez statystyk), włączone — z liczbami komplet/naprawa/brak."""
-        all_entries, reports = result
+        all_entries, reports = result[0], result[1]
+        view = result[2] if len(result) > 2 else None
         self._entries = all_entries
         # PRZERWANY SKAN (reports is None): NIE nadpisujemy wyniku. Odświeżamy
         # tylko drzewo DAT-ów (mogły się zmienić) z kolorami z OSTATNIEGO
@@ -2831,14 +2846,20 @@ class SuiteWindow(QMainWindow):
         # TŁUMACZENIA: trwały wybór podmian + indeks dostępnych wariantów
         # (z DAT-ów o roli „translations") do dropdownu i filtra języka.
         try:
-            from ..core.translations import (TranslationStore,
-                                             build_variant_index)
-            from ..core.dirrules import DirRules
-            self._trans_store = TranslationStore(
-                Path(self.settings.rom_root) / TranslationStore.FILENAME)
-            _dr = DirRules(Path(self.row_dats.path))
-            self._variant_index = build_variant_index(
-                reports, lambda e: _dr.for_entry(e))
+            if view is not None and "variant_error" in view:
+                raise RuntimeError(view["variant_error"])
+            if view is not None and view.get("variant_index") is not None:
+                self._trans_store = view["trans_store"]       # z wątku
+                self._variant_index = view["variant_index"]
+            else:
+                from ..core.translations import (TranslationStore,
+                                                 build_variant_index)
+                from ..core.dirrules import DirRules
+                self._trans_store = TranslationStore(
+                    Path(self.settings.rom_root) / TranslationStore.FILENAME)
+                _dr = DirRules(Path(self.row_dats.path))
+                self._variant_index = build_variant_index(
+                    reports, lambda e: _dr.for_entry(e))
             self._refresh_lang_filter()
         except Exception as e:                    # tłumaczenia nie mogą ubić skanu
             self._trans_store = None
@@ -2849,20 +2870,29 @@ class SuiteWindow(QMainWindow):
         # otwarciu widać ostatni skan, a DAT-y wyłączone w tym skanie zachowują
         # swój ostatni stan. Świeży raport i tak ma pierwszeństwo w widoku
         # (`_game_statuses_for` bierze najpierw `_reports_by_id`).
-        try:
-            from ..core.datcache import load_report_states, save_report_states
-            save_report_states(reports)
-            self._saved_at, self._saved_states = load_report_states(
-                known_keys={self._dat_key(e) for e in all_entries})
-        except Exception as e:      # zapis cache nie może ubić raportu
-            self._saved_states = {}
-            self._log(f"UWAGA: nie zapisano cache raportu: {e}")
-        self._fill_dats(all_entries, with_stats=True)
+        if view is not None:        # zapis + odczyt stanu zrobione w wątku
+            self._saved_at, self._saved_states = view["saved_at"], view["states"]
+            if view.get("error"):
+                self._log(f"UWAGA: {view['error']}")
+        else:
+            try:
+                from ..core.datcache import (load_report_states,
+                                             save_report_states)
+                save_report_states(reports)
+                self._saved_at, self._saved_states = load_report_states(
+                    known_keys={self._dat_key(e) for e in all_entries})
+            except Exception as e:      # zapis cache nie może ubić raportu
+                self._saved_states = {}
+                self._log(f"UWAGA: nie zapisano cache raportu: {e}")
+        self._fill_dats(all_entries, with_stats=True, view=view)
         # łączne podsumowanie na poziomie GRY (spójne z listą i kolumnami)
-        stats = [r.game_stats() for r in reports]
-        complete = sum(s[1] for s in stats)
-        fix = sum(s[2] for s in stats)
-        miss = sum(s[3] for s in stats)
+        if view is not None and view.get("summary"):
+            _n, complete, fix, miss = view["summary"]
+        else:
+            stats = [r.game_stats() for r in reports]
+            complete = sum(s[1] for s in stats)
+            fix = sum(s[2] for s in stats)
+            miss = sum(s[3] for s in stats)
         self._log(f"Raport: {len(reports)} DAT-ów — gry: komplet {complete}, "
                   f"do naprawy {fix}, brak {miss} (zapamiętane). Kliknij DAT, "
                   f"by zobaczyć gry; kliknij grę, by zobaczyć pliki i sumy.")
@@ -2916,39 +2946,49 @@ class SuiteWindow(QMainWindow):
         finally:
             self._filling = _prev
 
-    def _on_live_reload(self, states: dict) -> None:
+    def _on_live_reload(self, view) -> None:
         """Stan WSZYSTKICH DAT-ów po etapie 1 — policzony w wątku naprawy
-        (`states_from_reports`); tu tylko podstawienie i przerysowanie drzewa,
-        BEZ czytania dysku w wątku okna (3,8 s = „nie odpowiada")."""
+        (`states_from_reports` + `viewdata.live_view`: liczby, reguły, ToSort);
+        tu tylko podstawienie i przerysowanie drzewa, BEZ czytania dysku ani
+        liczenia gier w wątku okna (3,8 s = „nie odpowiada")."""
         try:
             from datetime import datetime
+            if not (isinstance(view, dict) and "counts" in view):
+                view = {"states": view}           # sam stan (stary format)
             self._reports_by_id = {}
-            self._saved_states.update(states or {})
+            self._saved_states.update(view.get("states") or {})
             self._saved_at = datetime.now().isoformat(timespec="seconds")
-            self._fill_dats(self._entries or [], with_stats=True)
+            self._fill_dats(self._entries or [], with_stats=True,
+                            view=view if "counts" in view else None)
         except Exception as e:
             self._log(f"UWAGA: nie odświeżono liczb: {e}")
 
-    def _fill_dats(self, entries, with_stats: bool) -> None:
+    def _fill_dats(self, entries, with_stats: bool, view=None) -> None:
         """Lewy panel: grupy-katalogi → DAT-y (liście) z CHECKBOXEM (odznacz =
-        nie skanuj tego DAT-a). Statystyki per DAT z raportu; wyłączone szare."""
+        nie skanuj tego DAT-a). Statystyki per DAT z raportu; wyłączone szare.
+
+        `view` (core/viewdata, 0.6.96) — liczby per DAT, reguły skip i liczniki
+        ToSort policzone w WĄTKU ROBOCZYM; tu tylko rysowanie (bez NAS i bez
+        przeliczania ~1 mln gier na wątku okna = „Brak odpowiedzi")."""
         from ..core.dirrules import DirRules
+        from ..core.viewdata import tree_extras
         self._filling = True
         self.tree.clear()
         self.game_list.clear()
         self.rom_list.clear()
         dat_root = Path(self.row_dats.path)
-        rules = DirRules(dat_root) if dat_root.is_dir() else None
+        if view is None:
+            view = tree_extras(entries, dat_root, self.settings.tosort_dirs)
+            v_counts = None
+        else:
+            v_counts = view.get("counts")
+        v_skip = view.get("skip") or {}
+        rules = None
+        if any(self._dat_key(e) not in v_skip for e in entries):
+            rules = DirRules(dat_root) if dat_root.is_dir() else None
         # ToSort-y jako pozycje drzewa (jak w RomVaulcie): główny + dodatkowe.
         # Prawy klik: wymuś pełny skan / dodaj kolejny katalog / usuń z listy.
-        for i, ts in enumerate(self.settings.tosort_dirs):
-            exists = Path(ts).is_dir()
-            n_files = ""
-            if exists:
-                try:
-                    n_files = str(sum(1 for x in Path(ts).iterdir()))
-                except OSError:
-                    n_files = "?"
+        for i, (ts, exists, n_files) in enumerate(view.get("tosort") or ()):
             label = ("🗃 ToSort" if i == 0 else "🗃 ToSort (dodatkowy)")
             it = QTreeWidgetItem(
                 [f"{label}: {ts}" + ("" if exists else "  [BRAK KATALOGU]"),
@@ -2967,11 +3007,22 @@ class SuiteWindow(QMainWindow):
         # tylko przy jego ZMIANIE (nie przy zmianie tekstu/koloru wiersza)
         self._dat_checked = {}
         for e in self._display_order(entries, dat_root, lambda x: x):
-            skip = rules.for_entry(e)["skip"] if rules else False
-            states = self._game_states_for(e) if with_stats else None
-            if states:
-                from ..core.matcher import game_stats_from_states
-                total, complete, fix, miss = game_stats_from_states(states)
+            k = self._dat_key(e)
+            skip = (v_skip[k] if k in v_skip
+                    else (rules.for_entry(e)["skip"] if rules else False))
+            cnt = None
+            if with_stats:
+                if v_counts is not None and k in v_counts:
+                    cnt = v_counts[k]          # policzone w wątku roboczym
+                else:
+                    # bez widoku albo DAT spoza widoku (np. odświeżenie na
+                    # żywo dało stan tylko części DAT-ów) — z pamięci okna
+                    states = self._game_states_for(e)
+                    if states:
+                        from ..core.matcher import game_stats_from_states
+                        cnt = game_stats_from_states(states)
+            if cnt:
+                total, complete, fix, miss = cnt
                 item = QTreeWidgetItem([e.name, str(total), str(complete),
                                         str(fix), str(miss)])
                 self._paint_dat_item(item, complete, fix, miss, skip)
@@ -3147,15 +3198,37 @@ class SuiteWindow(QMainWindow):
             self._fill_dats(self._entries or [], with_stats=True)
             live = self._live
 
+        _tosorts = list(settings.tosort_dirs)
+        _rom_root = settings.rom_root
+
         def job(log: Callable[[str], None], progress, cancel, detail, slot):
             from ..core.fileindex import FileIndex
             from ..core.repair import repair_collection
+            from ..core.viewdata import live_view, prepare_view
+
+            def _reload(states):
+                # liczby/reguły/ToSort dla drzewa liczone TU (wątek naprawy)
+                live.reload.emit(live_view(entries, states, dats, _tosorts))
             with FileIndex(Path(db) if db else None) as idx:
-                return repair_collection(
+                stats = repair_collection(
                     opts, settings, entries, idx, log=log, progress=progress,
                     cancel=cancel, detail=detail, slot=slot,
                     on_game=(live.game.emit if live else None),
-                    on_reload=(live.reload.emit if live else None))
+                    on_reload=(_reload if live else None))
+            # KONIEC: wszystko, czego drzewo potrzebuje, liczone jeszcze w
+            # wątku (0.6.96) — okno po zamknięciu postępu tylko rysuje
+            if stats is not None:
+                stats.view = None
+                reps = getattr(stats, "reports", None) if dry else None
+                if not dry or reps is not None:
+                    try:
+                        stats.view = prepare_view(
+                            entries, reports=reps, save=dry, dat_root=dats,
+                            tosort_dirs=_tosorts, rom_root=_rom_root, log=log,
+                            progress=progress)
+                    except Exception as e:
+                        log(f"UWAGA: nie przygotowano widoku: {e}")
+            return stats
 
         def done(stats) -> None:
             if stats is None:           # bezpiecznik przerwał — nic nie ruszono
@@ -3175,7 +3248,8 @@ class SuiteWindow(QMainWindow):
             if dry:
                 # podgląd = aktualny stan z indeksu → odśwież liczby na ekranie
                 if getattr(stats, "reports", None) is not None:
-                    self._fill_reports((entries, stats.reports))
+                    self._fill_reports((entries, stats.reports,
+                                        getattr(stats, "view", None)))
                 self._plan = stats
                 QMessageBox.information(
                     self, tr("Znajdź naprawy"),
@@ -3189,11 +3263,17 @@ class SuiteWindow(QMainWindow):
             # Liczby: naprawa zapisała je NA BIEŻĄCO (per DAT) — tylko wczytaj
             # (sekundy), bez przeliczania całej kolekcji
             try:
-                from ..core.datcache import load_report_states
                 self._reports_by_id = {}      # stan sprzed naprawy — nieaktualny
-                self._saved_at, self._saved_states = load_report_states(
-                    known_keys={self._dat_key(e) for e in (self._entries or [])})
-                self._fill_dats(self._entries or [], with_stats=True)
+                view = getattr(stats, "view", None)
+                if view is not None:          # policzone w wątku naprawy
+                    self._saved_at, self._saved_states = (view["saved_at"],
+                                                          view["states"])
+                else:
+                    from ..core.datcache import load_report_states
+                    self._saved_at, self._saved_states = load_report_states(
+                        known_keys={self._dat_key(e)
+                                    for e in (self._entries or [])})
+                self._fill_dats(self._entries or [], with_stats=True, view=view)
             except Exception as e:
                 self._log(f"UWAGA: nie odświeżono liczb: {e}")
 

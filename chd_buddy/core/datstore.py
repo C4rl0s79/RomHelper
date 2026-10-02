@@ -68,7 +68,8 @@ class DatEntry:
 
     def load(self) -> "DatEntry":
         if not self.games:
-            self.games = list(parse_dat(self.dat_path))
+            from .frontend import drop_frontend_games
+            self.games = drop_frontend_games(parse_dat(self.dat_path))
         return self
 
 
@@ -241,6 +242,18 @@ def _find_dats(root: Path, log=None, cancel=None) -> list:
     return sorted(out)
 
 
+# DAT-y, których OSTATNIE `discover` w tym procesie NIE wczytało (błąd
+# odczytu/parsowania, pusty). Finał naprawy pyta o to przed sprzątaniem
+# sierot: katalog niewczytanego DAT-u wygląda na sierotę (01.10: 1608 plików
+# 1G1R FBNeo → ToSort po chwilowym błędzie zapisu cache).
+_FAILED_DATS: list = []
+
+
+def failed_dats() -> list:
+    """Ścieżki DAT-ów niewczytanych przez ostatnie `discover` (kopia)."""
+    return list(_FAILED_DATS)
+
+
 class DatStore:
     """Odkrywa DAT-y w dat_root i mapuje je na katalogi w rom_root."""
 
@@ -370,15 +383,16 @@ class DatStore:
         import pickle
         hashes = {k: v for k, v in hashes.items() if k in present}   # prune
         p = self._sha1_cache_path()
+        from .datcache import _drop_tmp, _tmp_for
+        tmp = _tmp_for(p)
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".pkl.tmp")
             with open(tmp, "wb") as f:
                 pickle.dump({"version": 1, "hashes": hashes}, f,
                             protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, p)
         except (OSError, pickle.PickleError):
-            pass
+            _drop_tmp(tmp)
 
     def _dedupe_collisions(self, files: list[Path], log,
                            sizes: dict[Path, int] | None = None,
@@ -523,6 +537,7 @@ class DatStore:
 
         entries: list[DatEntry] = []
         skipped = 0
+        failed: list = []
         for i, dat in enumerate(files):
             if _cancelled():
                 if log:
@@ -547,12 +562,20 @@ class DatStore:
                     games = list(parse_dat(dat))
             except Exception as e:                      # noqa: BLE001
                 skipped += 1
+                failed.append(dat)
                 if log:
                     log(f"POMIJAM uszkodzony DAT (nie sparsowano): {dat} — "
                         f"{type(e).__name__}: {e}")
                 continue
-            if not games:                               # pusty / nie-DAT / śmieci
+            # „gry" frontendu z DAT-ów dir2dat (images, gamelist.xml…) — nie gry
+            from .frontend import drop_frontend_games
+            _had = bool(games)
+            games = drop_frontend_games(games)
+            # DAT z SAMYMI plikami frontendu (fpinball, switch) to poprawny,
+            # PUSTY DAT — jego katalog nie jest sierotą (bezpiecznik 0.6.93)
+            if not games and not _had:                  # pusty / nie-DAT / śmieci
                 skipped += 1
+                failed.append(dat)
                 if log:
                     log(f"POMIJAM DAT bez gier (pusty/nieczytelny): {dat}")
                 continue
@@ -577,6 +600,7 @@ class DatStore:
         if skipped and log:
             log(f"UWAGA: pominięto {skipped} uszkodzonych DAT-ów "
                 f"(puste/nie-XML) — patrz komunikaty wyżej.")
+        _FAILED_DATS[:] = failed
 
         return self.sort_entries(entries)
 

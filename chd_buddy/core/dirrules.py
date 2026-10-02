@@ -93,15 +93,24 @@ ES_FOLDER: dict[str, str] = {
     "JAGUARCD": "atarijaguarcd", "AMIGACD32": "amigacd32",
     "ODYSSEY2": "odyssey2", "INTELLIVISION": "intellivision",
     "NEOGEOCD": "neogeocd",
+    # 0.6.94 — nazwy jak w RetroBacie usera
+    "WSWAN": "wswan", "WSWANC": "wswanc", "NGP": "ngp", "NGPC": "ngpc",
+    "ZXSPECTRUM": "zxspectrum", "X68000": "x68000", "N64DD": "n64dd",
+    "GAMEPOCK": "gamepock", "ARCHIMEDES": "archimedes", "AMIGACDTV": "amigacdtv",
+    "FMTOWNS": "fmtowns", "PCENGINECD": "pcenginecd", "CDI": "cdi",
+    "PS4": "ps4", "PS5": "ps5", "XBOXONE": "xboxone",
+    "XBOXSERIESX": "xboxseriesx",
 }
 
 # Systemy PŁYTOWE (format auto → CHD, poza GameCube/Wii → RVZ).
 # Płytowe systemy, których emulatory NIE czytają CHD (RPCS3, Xemu, Xenia) —
 # „auto" zostawia obraz jak jest (ISO); zip tylko z jawnej reguły „archiwum".
-NO_CHD_DISC_SYSTEMS = {"PS3", "XBOX", "X360"}
+NO_CHD_DISC_SYSTEMS = {"PS3", "XBOX", "X360", "PS4", "PS5", "XBOXONE",
+                       "XBOXSERIESX"}
 
 DISC_SYSTEMS = {"PS1", "PS2", "PS3", "PSP", "SATURN", "DC", "NAOMI", "3DO",
-                "PCENGINE", "NEOGEOCD", "SEGACD", "MEGACD", "GCN", "WII"}
+                "PCENGINE", "NEOGEOCD", "SEGACD", "MEGACD", "GCN", "WII",
+                "PCENGINECD", "CDI"}
 
 
 def save_rule(dat_root: Path, key: str, updates: dict, *,
@@ -224,6 +233,14 @@ def _dat_is_cartridge(entry) -> bool:
     return checked > 0
 
 
+def _dat_group(entry) -> str:
+    """Grupa DAT-u z JSON-a RomVaulta (`group`: ReDump/NoIntro/…) —
+    znormalizowana („redump", „nointro"); "" gdy brak JSON-a."""
+    meta = getattr(entry, "meta", None) or {}
+    g = str(meta.get("group", "") or "").lower()
+    return "".join(ch for ch in g if ch.isalnum())
+
+
 def resolve_format(fmt: str, entry) -> str:
     """Rozwiązuje format 'auto' na konkret wg typu systemu (i TREŚCI DAT-u dla
     systemów dwumedialnych jak PC Engine)."""
@@ -234,6 +251,14 @@ def resolve_format(fmt: str, entry) -> str:
         return "rvz"
     if short in NO_CHD_DISC_SYSTEMS:
         return "keep"          # ISO jak jest (RPCS3/Xemu/Xenia bez CHD i zipa)
+    # GRUPA z JSON-a RomVaulta przy DAT-cie (user 01.10): Redump = płyty →
+    # CHD (system z obsługą CHD) albo obraz jak jest (ISO); No-Intro = zip.
+    # Pewniejsze niż zgadywanie z nazwy („3DO Interactive Multiplayer" → zip).
+    group = _dat_group(entry)          # „redump", „nointro", „propernointro"…
+    if "redump" in group:
+        return "chd" if short in DISC_SYSTEMS else "keep"
+    if "nointro" in group:
+        return "zip"
     if short in DISC_SYSTEMS:
         # system „płytowy", ale DAT może być kartridżowy (PC Engine HuCard) —
         # sprawdź treść: brak plików płytowych → ZIP, nie CHD.

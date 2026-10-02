@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from .paths import is_protected
+
 LogCB = Callable[[str], None]
 ProgCB = Callable[[int, int, str], None]
 
@@ -56,7 +58,8 @@ def purge_orphan_descriptors(index, roots: Iterable, *, log: LogCB = lambda m: N
             other = [p for p in files if not p.lower().endswith(DESC_EXTS)
                      and not p.lower().endswith(JUNK_EXTS)]
             if not other:                       # żadnego toru w katalogu
-                victims.extend(descs)
+                # biblioteka cue (<ToSort>/cues) — tylko odczyt, nie kasujemy
+                victims.extend(d for d in descs if not is_protected(d))
         total = len(victims) or 1
         for i, p in enumerate(sorted(victims), 1):
             if cancel is not None and cancel.is_set():

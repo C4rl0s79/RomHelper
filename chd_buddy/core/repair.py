@@ -72,6 +72,10 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     dats, roms, dry = opts.dats, opts.roms, opts.dry
     tosort, tosorts = opts.tosort, list(opts.tosorts or [])
     convert, clean = opts.convert, opts.clean
+    # biblioteka cue (<ToSort>/cues) — źródło tylko do odczytu, nigdy
+    # kasowane ani przenoszone (user 01.10)
+    from .paths import protect, protected_dirs_for
+    protect(protected_dirs_for([tosort, *tosorts]))
 
     rules = DirRules(dats)
     if rules.fatal:                        # bezpiecznik: bez reguł nic nie ruszamy
@@ -244,6 +248,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     # ich listę daje podgląd konwersji (z indeksu, bez NAS), a zrobi je etap 2.
     log("══ ETAP 1/2: szybkie operacje (linki, przeniesienia, zmiany nazw) "
         "we wszystkich katalogach")
+    rb.defer_slow = True          # przepakowania zipów → etap 2
     _plan_finals: dict = {}                     # plan konwersji (dzieci → rodzic)
     for rep_i, rep in enumerate(reports):
         if cancel.is_set():
@@ -302,6 +307,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     # sprzątanie katalogu, kasowanie źródeł. Przepis PRZELICZONY z indeksu —
     # etap 1 zmienił kolekcję (podgląd: indeks bez zmian → te same raporty).
     log("══ ETAP 2/2: konwersje, odbudowa CHD, sprzątanie (katalog po katalogu)")
+    rb.defer_slow = False
     if not dry:
         progress(0, 0, tr("dopasowanie z indeksu…"))
         reports = match_reports(
@@ -421,6 +427,11 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
         if not rb.cancelled:
             done_reports.append(rep)
 
+    # „Przerwij" MIĘDZY DAT-ami kończy pętlę przez `cancel`, ale nie ustawia
+    # flagi rebuildera — bez tego finał (sieroty, dedup) szedł dalej jeszcze
+    # godzinę po przerwaniu (30.09: 15:18 → 16:13)
+    if cancel.is_set():
+        rb.cancelled = True
     # FINAŁ GLOBALNY: dedup (dziecko→rodzic) + sprzątanie zbędnych archiwów i
     # pustych katalogów w ToSort. Wymaga PEŁNEGO obrazu, więc PO pętli i
     # pomijany przy przerwaniu.
@@ -448,7 +459,15 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
     # SIEROTY: katalogi/pliki BEZ DAT-a (np. MAME) → ToSort. Używa WSZYSTKICH
     # odkrytych DAT-ów, więc platforma tylko WYŁĄCZONA NIE jest ruszana. Tylko
     # gdy włączone „sprzątanie" i bez przerwania (pełny obraz).
-    if clean and not rb.cancelled and tosort:
+    from .datstore import failed_dats
+    _failed = failed_dats()
+    if clean and not rb.cancelled and tosort and _failed:
+        # BEZPIECZNIK: katalog DAT-u, którego nie wczytano, wyglądałby na
+        # sierotę → jego pliki do ToSort / skasowane (01.10, 1608 plików)
+        log(f"POMIJAM sprzątanie sierot: nie wczytano {len(_failed)} DAT-ów "
+            f"(np. {_failed[0]}) — ich katalogi wyglądałyby na sieroty. "
+            f"Wczytaj DAT-y ponownie i powtórz naprawę.")
+    elif clean and not rb.cancelled and tosort:
         progress(0, 0, tr("finał: nieznane pliki → ToSort…"))
         from .dirrules import stray_dirs as _stray
         _strays = _stray(_ents, rules, roms)

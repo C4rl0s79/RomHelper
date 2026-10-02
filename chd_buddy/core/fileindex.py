@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS files (
     -- => „do naprawy" (przepakowanie na deflate). Skan zapisuje to z centralnego
     -- katalogu ZIP-a (tanio), żeby naprawa NIE otwierała wszystkich zipów.
     bad_zip_method INTEGER NOT NULL DEFAULT -1,
+    tz INTEGER NOT NULL DEFAULT -1,
     -- CHD gry CD: czy UKŁAD ścieżek (liczba/rodzaj torów) zgadza się z DAT.
     -- -1 = niesprawdzony, 1 = zgodny. Odbudowa CHD pomija zgodne BEZ czytania
     -- nagłówka z NAS (dawniej każdy przebieg sprawdzał setki PSX/Saturn/DC).
@@ -398,6 +399,12 @@ class FileIndex:
         except sqlite3.OperationalError:
             pass                       # kolumna już jest
         try:
+            # 0.6.95: zip jest TorrentZipem (1) / nie (0) / nie sprawdzono (-1)
+            self._db.execute(
+                "ALTER TABLE files ADD COLUMN tz INTEGER NOT NULL DEFAULT -1")
+        except sqlite3.OperationalError:
+            pass                       # kolumna już jest
+        try:
             self._db.execute(
                 "ALTER TABLE files ADD COLUMN layout_ok "
                 "INTEGER NOT NULL DEFAULT -1")
@@ -414,6 +421,15 @@ class FileIndex:
                              "TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass                       # kolumna już jest
+        # SHA-1 z NAGŁÓWKA CHD (chdman info „SHA1") = suma dysku w DAT-ach
+        # MAME/dir2dat (`<disk sha1>`); '' = jeszcze nie odczytany
+        try:
+            self._db.execute("ALTER TABLE files ADD COLUMN chd_sha1 "
+                             "TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass                       # kolumna już jest
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_files_chd_sha1 "
+                         "ON files(chd_sha1)")
         self._db.commit()
 
     # --- cykl życia ---------------------------------------------------------
@@ -463,8 +479,8 @@ class FileIndex:
             "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
             "  md5=excluded.md5, sha1=excluded.sha1, "
             "  data_sha1=excluded.data_sha1, is_link=0, missing=0, "
-            "  scanned_at=excluded.scanned_at, deep_fail=0, "
-            "  bad_container=-1, layout_ok=-1, "  # plik się zmienił → od nowa
+            "  scanned_at=excluded.scanned_at, deep_fail=0, chd_sha1='', "
+            "  bad_container=-1, layout_ok=-1, tz=-1, "  # plik się zmienił → od nowa
             "  cd_tracks=excluded.cd_tracks, cd_typed=excluded.cd_typed, "
             "  link_of=''",
             (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, "", now, -1, -1),
@@ -804,12 +820,73 @@ class FileIndex:
                 ex.shutdown(wait=True)
             stats.missing = self._mark_missing(root, seen, _skip_norm)
             self._db.commit()
+            # TorrentZip: jednorazowo dla zipów bez oznaczenia (stare wpisy)
+            self.fill_tz(root, workers=max(1, workers), detail=detail,
+                         log=log, cancel=cancel)
             return stats
         finally:
             # ZAWSZE domknij pulę wątków, nawet gdy pętla wysypała się
             # nieoczekiwanie — inaczej wątki-workery wiszą do końca procesu.
             if ex is not None:
                 ex.shutdown(wait=False, cancel_futures=True)
+
+    def set_tz(self, path: Path | str, value: int) -> None:
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET tz=? WHERE path=?", (int(value), key))
+        self._db.commit()
+
+    def fill_tz(self, root, *, workers: int = 8, detail=None, log=None,
+                cancel=None) -> int:
+        """Oznacza zipy pod `root` bez znanego `tz` (-1): TorrentZip czy nie.
+        Czyta tylko KOŃCÓWKĘ pliku, RÓWNOLEGLE (NAS), raz na TREŚĆ: hardlinki
+        i kopie tej samej treści (sha1+rozmiar) dostają wynik bez odczytu.
+        Przerywalne; niedokończone zostają -1 (następny skan dokończy)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from .paths import dir_prefix
+        from .torrentzip import torrentzip_status
+        pref = dir_prefix(root)
+        rows = self._db.execute(
+            "SELECT path, sha1, size FROM files WHERE tz=-1 AND missing=0 "
+            "AND is_link=0 AND lower(path) LIKE '%.zip'").fetchall()
+        groups: dict = {}
+        for r in rows:
+            if not os.path.normcase(r["path"]).startswith(pref):
+                continue
+            groups.setdefault(((r["sha1"] or "").lower(), r["size"]),
+                              []).append(r["path"])
+        if not groups:
+            return 0
+        if log:
+            log(f"TorrentZip: sprawdzam {len(groups)} zipów bez oznaczenia "
+                f"({root}) — jednorazowo, odczyt końcówki pliku.")
+        done = 0
+        total = len(groups)
+        with ThreadPoolExecutor(max_workers=max(1, min(32, workers * 2))) as ex:
+            futs = {ex.submit(torrentzip_status, paths[0]): (k, paths)
+                    for k, paths in groups.items()}
+            for f in as_completed(futs):
+                if cancel is not None and cancel.is_set():
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    break
+                (sha1, size), paths = futs[f]
+                v = f.result()
+                if v >= 0:
+                    if sha1:
+                        self._db.execute(
+                            "UPDATE files SET tz=? WHERE sha1=? AND size=? AND tz=-1",
+                            (v, sha1, size))
+                    else:
+                        self._db.executemany("UPDATE files SET tz=? WHERE path=?",
+                                             [(v, p) for p in paths])
+                done += 1
+                if done % 200 == 0 or done == total:
+                    self._db.commit()
+                    if detail:
+                        detail(done, total, f"TorrentZip: {os.path.basename(paths[0])}")
+        self._db.commit()
+        if detail:
+            detail(-1, 0, "")
+        return done
 
     def prune_ghosts(self, log=None, skip_roots=None) -> int:
         """Oznacza missing=1 wpisy, których PLIK już nie istnieje.
@@ -882,9 +959,9 @@ class FileIndex:
     # świeży hardlink CHD, pojedynczo (1344 PS1/PS2, 29.09).
     _CONTENT_COLS = ("crc32", "md5", "sha1", "data_sha1", "deep_fail",
                      "bad_container", "bad_zip_method", "layout_ok",
-                     "cd_tracks", "cd_typed")
+                     "cd_tracks", "cd_typed", "chd_sha1", "tz")
     _PROBE_COLS = ("data_sha1", "deep_fail", "bad_container", "layout_ok",
-                   "cd_tracks", "cd_typed")
+                   "cd_tracks", "cd_typed", "chd_sha1")
 
     @classmethod
     def _copy_content(cls, cur, key: str, src, size: int, mtime_ns: int,
@@ -905,7 +982,8 @@ class FileIndex:
 
     # wartość „nieznane” kolumn sondy (świeży wpis, zanim cokolwiek sprawdzono)
     _PROBE_UNKNOWN = {"data_sha1": "", "deep_fail": 0, "bad_container": -1,
-                      "layout_ok": -1, "cd_tracks": -1, "cd_typed": -1}
+                      "layout_ok": -1, "cd_tracks": -1, "cd_typed": -1,
+                      "chd_sha1": ""}
 
     @classmethod
     def _borrow_probe(cls, cur, key: str, sha1: str, size: int) -> bool:
@@ -982,7 +1060,7 @@ class FileIndex:
             "SELECT path, sha1, size FROM files WHERE missing=0 AND is_link=0 "
             "AND sha1<>'' AND lower(path) LIKE '%.chd' AND (data_sha1='' "
             "OR bad_container=-1 OR layout_ok=-1 OR cd_tracks=-1 "
-            "OR cd_typed=-1)").fetchall()
+            "OR cd_typed=-1 OR chd_sha1='')").fetchall()
         cur = self._db.cursor()
         n = 0
         for r in rows:
@@ -1092,7 +1170,8 @@ class FileIndex:
         return False
 
     @staticmethod
-    def _index_members(cur, key: str, path: Path, log, full: bool = False) -> int:
+    def _index_members(cur, key: str, path: Path, log, full: bool = False,
+                       on_progress=None) -> int:
         """Indeksuje zawartość archiwum.
 
         Szybko (full=False): tylko metadane — CRC32+rozmiar z centralnego
@@ -1136,7 +1215,8 @@ class FileIndex:
                         meta[i.filename] = (i.file_size,
                                             f"{i.CRC & 0xFFFFFFFF:08x}", "", "")
                     if full:
-                        FileIndex._hash_zip_members(zf, meta, log, path)
+                        FileIndex._hash_zip_members(zf, meta, log, path,
+                                                    on_progress)
         except Exception as e:  # uszkodzone archiwum nie może ubić skanu
             if log:
                 log(f"ARCHIWUM nieczytelne: {path} ({e})")
@@ -1148,10 +1228,12 @@ class FileIndex:
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(archive, name) DO UPDATE SET size=excluded.size, "
             "  crc32=excluded.crc32, md5=excluded.md5, sha1=excluded.sha1", rows)
-        # ZAPISZ metodę tylko dla .zip (dla .7z pojęcie nie ma sensu → 0)
+        # ZAPISZ metodę tylko dla .zip (dla .7z pojęcie nie ma sensu → 0);
+        # przy okazji: czy to TorrentZip (końcówka pliku — plik i tak czytany)
         if path.suffix.lower() == ".zip":
-            cur.execute("UPDATE files SET bad_zip_method=? WHERE path=?",
-                        (bad_method, key))
+            from .torrentzip import torrentzip_status
+            cur.execute("UPDATE files SET bad_zip_method=?, tz=? WHERE path=?",
+                        (bad_method, torrentzip_status(path), key))
         return len(rows)
 
     @staticmethod
@@ -1170,13 +1252,17 @@ class FileIndex:
             return -1
 
     @staticmethod
-    def _hash_zip_members(zf, meta: dict, log, path: Path) -> None:
-        """Wypakowuje strumieniowo każdy plik ZIP-a i liczy CRC/MD5/SHA-1."""
-        for name in list(meta):
+    def _hash_zip_members(zf, meta: dict, log, path: Path,
+                          on_progress=None) -> None:
+        """Wypakowuje strumieniowo każdy plik ZIP-a i liczy CRC/MD5/SHA-1.
+        on_progress(done, total, etykieta) — pasek szczegółowy (opcjonalny)."""
+        names = list(meta)
+        for i, name in enumerate(names, 1):
             crc = 0
             md5 = hashlib.md5()
             sha1 = hashlib.sha1()
             size = 0
+            label = f"indeksuję {path.name}: {name} ({i}/{len(names)})"
             try:
                 with zf.open(name) as fh:
                     while True:
@@ -1187,6 +1273,8 @@ class FileIndex:
                         md5.update(b)
                         sha1.update(b)
                         size += len(b)
+                        if on_progress is not None:
+                            on_progress(size, meta[name][0], label)
             except Exception as e:
                 if log:
                     log(f"ARCHIWUM: nie wypakowano {path.name}::{name} ({e})")
@@ -1284,7 +1372,10 @@ class FileIndex:
         by_crc: dict = {}
         by_md5: dict = {}
         by_data: dict = {}
+        by_chd: dict = {}
         for r in self._db.execute("SELECT * FROM files WHERE missing=0"):
+            if r["chd_sha1"]:
+                by_chd.setdefault(r["chd_sha1"], []).append(r)
             if r["sha1"]:
                 by_sha1.setdefault(r["sha1"], []).append(r)
             if r["crc32"] and r["size"] is not None:
@@ -1303,7 +1394,8 @@ class FileIndex:
             if r["crc32"] and r["size"] is not None:
                 m_crc.setdefault((r["crc32"], r["size"]), []).append(r)
         self._mcache = {"sha1": by_sha1, "crc": by_crc, "md5": by_md5,
-                        "data": by_data, "msha": m_sha, "mcrc": m_crc}
+                        "data": by_data, "msha": m_sha, "mcrc": m_crc,
+                        "chd": by_chd}
         # miliony wierszy w RAM na czas dopasowania — nie każ pełnemu GC ich
         # przeglądać co kilkanaście sekund (pauza całego programu do ~2 s)
         from .gcpause import settle
@@ -1327,6 +1419,22 @@ class FileIndex:
             args.append(s)
         q += ")"
         return self._db.execute(q, args).fetchall()
+
+    def find_chd_sha1(self, sha1: str) -> list[sqlite3.Row]:
+        """Pliki CHD o danym SHA-1 NAGŁÓWKA (suma `<disk>` w DAT-ach MAME)."""
+        s = (sha1 or "").lower()
+        if not s:
+            return []
+        if self._mcache is not None:
+            return list(self._mcache["chd"].get(s, ()))
+        return self._db.execute(
+            "SELECT * FROM files WHERE missing=0 AND chd_sha1=?", (s,)).fetchall()
+
+    def set_chd_sha1(self, path: Path | str, sha1: str) -> None:
+        key = str(Path(os.path.abspath(path)))
+        self._db.execute("UPDATE files SET chd_sha1=? WHERE path=?",
+                         ((sha1 or "").lower(), key))
+        self._db.commit()
 
     def find_md5(self, md5: str) -> list[sqlite3.Row]:
         """Pliki o danym MD5 (fallback gdy DAT nie ma/nie trafił SHA-1)."""
@@ -1404,12 +1512,21 @@ class FileIndex:
                 return r["name"]
         return None
 
-    def reindex_archive(self, path: Path | str, full: bool = True) -> None:
+    def reindex_archive(self, path: Path | str, full: bool = True,
+                        on_progress=None) -> None:
         """Przeindeksowuje świeżo utworzone/zmienione archiwum: wpis pliku
-        (własne sumy) + członkowie (z SHA-1 gdy full)."""
+        (własne sumy) + członkowie (z SHA-1 gdy full).
+        on_progress(done, total, etykieta) — pasek szczegółowy (opcjonalny):
+        oba odczyty z NAS (sumy pliku, sumy członków) nie są „ciszą"."""
         p = Path(os.path.abspath(path))
         key = str(p)
-        crc, md5, sha1 = hash_file(p)
+        _hp = None
+        if on_progress is not None:
+            _hl = f"indeksuję {p.name}"
+
+            def _hp(d, t, _cb=on_progress, _l=_hl):
+                _cb(d, t, _l)
+        crc, md5, sha1 = hash_file(p, on_progress=_hp)
         st = os.lstat(p)
         now = datetime.now().isoformat(timespec="seconds")
         cur = self._db.cursor()
@@ -1423,7 +1540,8 @@ class FileIndex:
             "  scanned_at=excluded.scanned_at",
             (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, now))
         cur.execute("DELETE FROM members WHERE archive=?", (key,))
-        self._index_members(cur, key, p, None, full=full)
+        self._index_members(cur, key, p, None, full=full,
+                            on_progress=on_progress)
         self._db.commit()
 
     def record_file(self, path: Path | str, crc32: str, md5: str, sha1: str) -> None:
@@ -1439,7 +1557,7 @@ class FileIndex:
             "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
             "  md5=excluded.md5, sha1=excluded.sha1, is_link=0, missing=0, "
             "  scanned_at=excluded.scanned_at, layout_ok=-1, cd_tracks=-1, "
-            "  cd_typed=-1, link_of=''",
+            "  cd_typed=-1, chd_sha1='', link_of='', tz=-1",
             (str(p), st.st_size, st.st_mtime_ns, crc32.lower(), md5.lower(),
              sha1.lower(), now))
         # kopia znanej treści (np. CHD kopiowane dla innej platformy): wynik

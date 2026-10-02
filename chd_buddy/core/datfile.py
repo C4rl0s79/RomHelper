@@ -14,6 +14,7 @@ czyścimy elementy w locie, żeby nie trzymać całego drzewa w pamięci.
 """
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,7 @@ class DatRom:
     crc: str = ""
     md5: str = ""
     sha1: str = ""
+    disk: bool = False   # plik CHD z `<disk>` (sha1 = SHA-1 nagłówka CHD)
     merge: str = ""      # MAME: ten ROM jest WSPÓŁDZIELONY z rodzicem pod nazwą
                          # `merge` (w secie split/merged bierze się go z parenta)
 
@@ -41,6 +43,10 @@ class DatGame:
     romof: str = ""      # MAME: skąd dziedziczy ROM-y (zwykle == cloneof;
                          # dla gry zależnej od BIOS-u wskazuje set BIOS, np. pgm)
     isbios: bool = False # MAME: to set BIOS (isbios="yes"), np. pgm/neogeo/skns
+    # DYSKI (`<disk>`): pliki CHD gry, OSOBNO od `roms` (nie pakowane do zipa,
+    # nie konwertowane, poza odciskami gier). DatRom: name=`<dysk>.chd`,
+    # sha1 = SHA-1 z NAGŁÓWKA CHD (chdman info „SHA1"), size=0.
+    disks: List[DatRom] = field(default_factory=list)
 
     @property
     def media(self) -> MediaType:
@@ -187,7 +193,56 @@ def parse_dat_header(path: Path) -> dict:
     return out
 
 
+def _disk(name: str, sha1: str, merge: str = "", status: str = ""):
+    """`<disk>` → DatRom pliku `<dysk>.chd`; None, gdy nie do zbudowania:
+    bez sumy / `nodump` albo `merge` (klon MAME — dysk leży u rodzica)."""
+    name, sha1 = (name or "").strip(), (sha1 or "").strip().lower()
+    if not name or not sha1 or (status or "").strip().lower() == "nodump" \
+            or (merge or "").strip():
+        return None
+    return DatRom(name=f"{name}.chd", sha1=sha1, disk=True)
+
+
 def parse_dat(path: Path):
+    """Gry z pliku DAT (Logiqx XML albo ClrMamePro). dir2dat opisuje katalog
+    plik po pliku: archiwum gry to osobna „gra" `x.zip`, a katalog z dyskiem
+    `x` — łączymy je w JEDNĄ grę `x` (ROM-y z archiwum + dyski), jak w MAME."""
+    games = list(_parse_raw(path))
+    names = {g.name for g in games}
+    target: dict = {}                 # nazwa bazowa → gra docelowa
+    out = []
+    for g in games:
+        base = _dir2dat_base(g.name, names)
+        if base in target:            # kolejny kawałek tej samej gry
+            other = target[base]
+            other.roms = other.roms + g.roms
+            other.disks = other.disks + g.disks
+            continue
+        g.name = base
+        target[base] = g
+        out.append(g)
+    yield from out
+
+
+# dir2dat zapisuje KAŻDY plik luzem jako osobną „grę": archiwum `x.zip`, opis
+# płyty `x.cue` (przy kolizji z `x` od `x.bin`), tory `x (Track N)`. Redump/
+# No-Intro nie mają gier o takich nazwach (tory to ROM-y jednej gry).
+_DIR2DAT_EXTS = (".zip", ".7z", ".cue", ".gdi", ".toc", ".ccd", ".mds")
+_TRACK_RE = re.compile(r"^(.*\S) \(Track \d+\)$", re.IGNORECASE)
+
+
+def _dir2dat_base(name: str, names) -> str:
+    """Nazwa gry, do której należy „gra" dir2dat `name` (zwykle ona sama)."""
+    low = name.lower()
+    if low.endswith(_DIR2DAT_EXTS):
+        return name.rsplit(".", 1)[0]
+    m = _TRACK_RE.match(name)
+    if m:
+        return m.group(1)
+    return name
+
+
+def _parse_raw(path: Path):
     """Generator gier z pliku DAT. Logiqx XML albo ClrMamePro (auto-wykrycie)."""
     if not _looks_xml(path):
         yield from _parse_cmpro(path)
@@ -211,9 +266,12 @@ def parse_dat(path: Path):
                 sha1=(r.get("sha1") or "").strip(),
                 merge=(r.get("merge") or "").strip(),
             ))
-        if roms:
+        disks = [d for d in (_disk(x.get("name", ""), x.get("sha1", ""),
+                                   x.get("merge", ""), x.get("status", ""))
+                             for x in elem.findall("disk")) if d]
+        if roms or disks:
             # MAME: relacje rodzic/klon (świadomość merged/split/non-merged)
-            yield DatGame(name=name, roms=roms,
+            yield DatGame(name=name, roms=roms, disks=disks,
                           cloneof=(elem.get("cloneof") or "").strip(),
                           romof=(elem.get("romof") or "").strip(),
                           isbios=(elem.get("isbios") or "").strip().lower()
@@ -228,7 +286,7 @@ import re as _re
 _CMPRO_TOK = _re.compile(r'"([^"]*)"|(\()|(\))|([^\s()]+)')
 _CMPRO_GAME_KW = {"game", "machine", "set", "resource"}
 # bloki wewnątrz gry, które POMIJAMY (nie niosą ROM-ów potrzebnych do matchu)
-_CMPRO_SKIP_BLOCK = {"disk", "release", "biosset", "sample", "archive", "chip",
+_CMPRO_SKIP_BLOCK = {"release", "biosset", "sample", "archive", "chip",
                      "video", "sound", "input", "dipswitch", "driver", "device"}
 _CMPRO_ROM_KEYS = {"name", "size", "crc", "md5", "sha1", "merge", "flags",
                    "date", "status", "serial"}
@@ -290,6 +348,7 @@ def _cmpro_read_game(toks: list, i: int, n: int):
     """Czyta blok `game ( … )`. `i` wskazuje ZA `(`. Zwraca (DatGame|None, i)."""
     name = cloneof = romof = ""
     roms: List[DatRom] = []
+    disks: List[DatRom] = []
     while i < n and toks[i][0] != ")":
         t, v = toks[i]
         if t == "word":
@@ -298,6 +357,12 @@ def _cmpro_read_game(toks: list, i: int, n: int):
                 rom, i = _cmpro_read_rom(toks, i + 2, n)
                 if rom:
                     roms.append(rom)
+                continue
+            if key == "disk" and i + 1 < n and toks[i + 1][0] == "(":
+                d, i = _cmpro_read_rom(toks, i + 2, n)   # name/sha1/merge
+                d = _disk(d.name, d.sha1, d.merge) if d else None
+                if d:
+                    disks.append(d)
                 continue
             if key in _CMPRO_SKIP_BLOCK and i + 1 < n and toks[i + 1][0] == "(":
                 i = _cmpro_skip(toks, i + 2, n)
@@ -321,8 +386,9 @@ def _cmpro_read_game(toks: list, i: int, n: int):
         i += 1
     if i < n and toks[i][0] == ")":
         i += 1
-    game = DatGame(name=name, roms=roms, cloneof=cloneof, romof=romof)
-    return (game if roms else None), i
+    game = DatGame(name=name, roms=roms, disks=disks, cloneof=cloneof,
+                   romof=romof)
+    return (game if roms or disks else None), i
 
 
 def _parse_cmpro(path: Path):

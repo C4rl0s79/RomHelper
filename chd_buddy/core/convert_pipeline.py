@@ -66,13 +66,26 @@ class StagePipeline:
                  finalize: Callable, release: Optional[Callable] = None,
                  ram_budget: int = 0, log: Optional[Callable] = None,
                  cancel=None, build_workers: int = 1, ordered: bool = True,
-                 gather_workers: int = 1):
+                 gather_workers: int = 1,
+                 shrink_after_build: Optional[Callable] = None,
+                 on_admit_wait: Optional[Callable] = None,
+                 stop_new=None):
         self._gather = gather
         self._build = build
         self._upload = upload
         self._finalize = finalize
         self._release = release or (lambda _p: None)
         self._ram_budget = max(0, int(ram_budget))
+        # po udanym build: nowy (mniejszy) koszt RAM zadania — reszta budżetu
+        # wraca od razu, nie dopiero po wysyłce (odbudowa CHD: do wysyłki trzeba
+        # tylko nowego CHD, obraz źródłowy już skasowany)
+        self._shrink = shrink_after_build
+        # pobieranie czeka na budżet RAM → (payload, zajęte, budżet) do paska
+        self._on_wait = on_admit_wait
+        # PRZERWANIE użytkownika: żadne NOWE pobieranie (zadanie w kolejce /
+        # czekające na RAM jest pomijane); rozpoczęte pobieranie, przeróbka i
+        # wysyłka DOKAŃCZAJĄ się (user 02.10: po „Przerwij" pobierał kolejne)
+        self._stop_new = stop_new
         self._log = log or (lambda _m: None)
         self._cancel = cancel
         # RÓWNOLEGŁA KONWERSJA: N wątków build (chdman/DolphinTool). Dla MAŁYCH
@@ -149,7 +162,16 @@ class StagePipeline:
         with self._cv:
             while (self._ram_budget > 0 and self._used > 0
                    and self._used + job.cost > self._ram_budget
-                   and not self._is_cancelled()):
+                   and not self._no_new()):
+                if self._on_wait is not None:
+                    used = self._used
+                    self._cv.release()
+                    try:
+                        self._on_wait(job.payload, used, self._ram_budget)
+                    except Exception:
+                        pass
+                    finally:
+                        self._cv.acquire()
                 self._cv.wait(timeout=0.5)
             self._used += job.cost
             job.reserved = True
@@ -160,6 +182,11 @@ class StagePipeline:
 
     def _is_cancelled(self) -> bool:
         return self._cancel is not None and self._cancel.is_set()
+
+    def _no_new(self) -> bool:
+        """Nie zaczynać nowych pobrań (przerwanie albo twarde anulowanie)."""
+        return self._is_cancelled() or (self._stop_new is not None
+                                        and self._stop_new.is_set())
 
     def _next_ready_locked(self) -> Optional[_Job]:
         """Zwraca (i usuwa z _pending) następne zadanie do finalizacji. W trybie
@@ -276,13 +303,21 @@ class StagePipeline:
                 self._cv.notify_all()
 
         def _do(job):
-            self._admit(job)               # budżet RAM dopiero TERAZ
-            if self._is_cancelled():
-                return None
             # WŁASNY pasek postępu pobierania: numery ZA paskami kompresji
             # (build ma 0..N-1), więc równoległe pobierania nie piszą na jeden
+            # (nadany PRZED czekaniem na RAM — pasek pokazuje też czekanie)
             if isinstance(job.payload, dict):
                 job.payload["_gather_slot"] = self._build_workers + gather_idx
+            if not self._no_new():
+                self._admit(job)           # budżet RAM dopiero TERAZ
+            if self._no_new():
+                # przerwanie: nowego pobrania nie ma; pasek „czeka na RAM" won
+                if self._on_wait is not None:
+                    try:
+                        self._on_wait(job.payload, -1, 0)
+                    except Exception:
+                        pass
+                return None
             job.gathered = self._gather(job.payload)
             return job.gathered
         # ostatni żywy wątek pobierania → po jednym STOP dla KAŻDEGO wątku build
@@ -318,6 +353,17 @@ class StagePipeline:
             finally:
                 with self._cv:
                     self._build_active -= 1
+            if (job.built not in (None, False) and self._shrink is not None
+                    and job.reserved):
+                try:
+                    new_cost = self._shrink(job.payload)
+                except Exception:
+                    new_cost = None
+                if new_cost is not None and 0 <= int(new_cost) < job.cost:
+                    with self._cv:
+                        self._used = max(0, self._used - (job.cost - int(new_cost)))
+                        job.cost = int(new_cost)
+                        self._cv.notify_all()
             return job.built
         # ostatni żywy wątek build przekazuje STOP do uploadu (tylko raz)
         def _on_stop():

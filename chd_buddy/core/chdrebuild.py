@@ -287,7 +287,31 @@ def _rb_build(payload, gathered):
         payload["outcome"] = "errors"
         return None
     payload["new_chd"] = new_chd
+    # ŹRÓDŁA ZBĘDNE (create + weryfikacja round-trip OK): do wysyłki potrzeba
+    # tylko nowego CHD — obraz/tory kasujemy TERAZ, a potok zmniejsza
+    # rezerwację RAM (następna gra pobiera się/przerabia w trakcie wysyłki)
+    _free_sources(payload.get("scratch"), new_chd)
+    try:
+        payload["_cost_now"] = new_chd.stat().st_size + (64 << 20)
+    except OSError:
+        pass
     return new_chd
+
+
+def _free_sources(scratch, keep: Path) -> None:
+    """Usuwa ze scratchu wszystko poza plikiem `keep` (nowy CHD)."""
+    if scratch is None:
+        return
+    root = Path(scratch)
+    keep_n = os.path.normcase(str(keep))
+    for dirpath, _dirs, files in os.walk(root, topdown=False):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            if os.path.normcase(fp) != keep_n:
+                try:
+                    os.unlink(fp)
+                except OSError:
+                    pass
 
 
 def _rb_upload(payload, built):
@@ -427,6 +451,26 @@ def rebuild_bad_chds(
                 _cw = getattr(settings, "convert_workers", 0) or 0
                 _bw = (max(1, min(int(_cw), _logical)) if _cw and int(_cw) > 0
                        else max(1, min(8, _logical // 2)))
+                def _ram_wait(p, used, budget, _last={"t": 0.0}):
+                    # pasek POBIERANIA pokazuje, że czeka na RAM (a nie znika)
+                    import time as _t
+                    if slot is None:
+                        return
+                    if used < 0:                     # zadanie pominięte
+                        gi = p.get("_gather_slot")
+                        if gi is not None:
+                            slot(gi, -1, 0, "")
+                        return
+                    now = _t.monotonic()
+                    if now - _last["t"] < 1.0:
+                        return
+                    _last["t"] = now
+                    gi = p.get("_gather_slot")
+                    if gi is not None:
+                        slot(gi, 0, 0, f"pobieranie {p['chd_path'].name} czeka na "
+                                       f"RAM: zajęte {used / 1024**3:.1f} / "
+                                       f"{budget / 1024**3:.1f} GB")
+
                 _pipe = StagePipeline(
                     gather=_rb_gather,
                     build=_rb_build,
@@ -434,9 +478,12 @@ def rebuild_bad_chds(
                     finalize=lambda p, r: _rb_finalize(p, r, index, log),
                     release=_release_and_tick,
                     ram_budget=_budget, log=log, cancel=None,
+                    stop_new=cancel,
                     build_workers=_bw, ordered=False,
                     gather_workers=max(1, int(getattr(
-                        settings, "download_workers", 1) or 1)))
+                        settings, "download_workers", 1) or 1)),
+                    shrink_after_build=lambda p: p.get("_cost_now"),
+                    on_admit_wait=_ram_wait)
                 _pipe.start()
                 log(f"Odbudowa CHD: potok WŁ (do {_bw} równoległych, "
                     f"{_pipe._gather_workers} pobierań naraz, "
