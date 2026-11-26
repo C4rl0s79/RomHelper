@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from .fileops import replace_rw, unlink_rw
 from .fileindex import is_reparse_stat
 
 # Katalogi lokalnych materiałów RetroBata — nigdy nie linkowane/nie czyszczone.
@@ -146,7 +147,7 @@ def remove_link(path: Path) -> bool:
     if path.is_dir():
         os.rmdir(path)   # rmdir na symlinku katalogu usuwa link, nie zawartość
     else:
-        os.unlink(path)
+        unlink_rw(path)
     return True
 
 
@@ -158,16 +159,16 @@ def replace_with_hardlink(path: Path, target: Path) -> Optional[OSError]:
     tmp = Path(str(path) + ".rh_hardlink_tmp")
     try:
         if os.path.lexists(tmp):
-            os.unlink(tmp)
+            unlink_rw(tmp)
         os.link(str(target), str(tmp))
     except OSError as e:
         return e
     try:
-        os.replace(str(tmp), str(path))
+        replace_rw(str(tmp), str(path))
         return None
     except OSError as e:
         try:
-            os.unlink(tmp)
+            unlink_rw(tmp)
         except OSError:
             pass
         return e

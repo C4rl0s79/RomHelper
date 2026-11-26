@@ -33,6 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
+from .fileops import replace_rw, unlink_rw
 from .settings import app_base_dir
 from . import netguard
 from .storage import same_volume
@@ -194,6 +195,33 @@ def hash_file(path: Path, on_progress=None, cancel=None) -> tuple[str, str, str]
                 done += len(chunk)
                 on_progress(done, total)
     return f"{crc & 0xFFFFFFFF:08x}", md5.hexdigest(), sha1.hexdigest()
+
+
+def unlink_tracked(path, index=None) -> bool:
+    """Kasuje plik i jego wpis w indeksie. True = skasowany TERAZ; False =
+    pliku już nie było (skasował go wcześniej ten przebieg — np. rodzic po
+    konwersji, zanim dziecko z tym samym źródłem do niego doszło): to nie
+    błąd, wpis indeksu i tak znika (0.7.07). Inne błędy (blokada, prawa)
+    lecą dalej."""
+    try:
+        unlink_rw(path)
+        gone_now = True
+    except FileNotFoundError:
+        gone_now = False
+    if index is not None:
+        try:
+            index.remove_path(path)
+        except Exception:
+            pass
+    return gone_now
+
+
+def _prefix_bounds(prefix: str) -> tuple:
+    """(od, do) dla „ścieżka zaczyna się od `prefix`" jako ZAKRES na indeksie
+    ścieżki: `path >= od AND path < do` (0.7.06). Ta sama semantyka co
+    `substr(path, 1, len) = prefix` (porównanie bajtowe, z rozróżnieniem
+    wielkości liter), ale bez przeglądania całej tabeli."""
+    return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
 def is_reparse_stat(st: os.stat_result) -> bool:
@@ -430,7 +458,41 @@ class FileIndex:
             pass                       # kolumna już jest
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_files_chd_sha1 "
                          "ON files(chd_sha1)")
+        # 0.7.04: wyszukiwanie ścieżki BEZ rozróżniania wielkości liter (jak
+        # system plików Windows/SMB) — `lookup` po nazwie z DAT-u („SEED")
+        # znajduje plik „Seed"
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_files_path_nocase "
+                         "ON files(path COLLATE NOCASE)")
+        # wpisy „to hardlink X" wyszukiwane po X przy podmianie/przeniesieniu X
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_files_link_of "
+                         "ON files(link_of)")
         self._db.commit()
+
+    def _drop_case_twins(self, key: str) -> None:
+        """Plik leży na dysku DOKŁADNIE pod `key` — wpisy tej samej ścieżki w
+        innej wielkości liter (np. „…Seed…" po zmianie na „…SEED…") to ten sam
+        plik pod starą nazwą: usuń je (z członkami), żeby indeks nie liczył go
+        dwa razy."""
+        try:
+            olds = [r[0] for r in self._db.execute(
+                "SELECT path FROM files WHERE path=? COLLATE NOCASE AND path<>?",
+                (key, key))]
+            for o in olds:
+                self._db.execute("DELETE FROM members WHERE archive=?", (o,))
+                self._db.execute("DELETE FROM files WHERE path=?", (o,))
+        except sqlite3.Error:
+            pass
+
+    def _retarget_links(self, old_key: str, new_key: str = "") -> None:
+        """Wpisy `link_of` wskazujące na `old_key`: po PRZENIESIENIU celu →
+        nowa ścieżka (ten sam plik), po PODMIANIE treści celu → '' (to już
+        nie ten sam plik; fałszywe „już zlinkowane", 0.7.04)."""
+        o = os.path.normcase(os.path.abspath(old_key))
+        n = os.path.normcase(os.path.abspath(new_key)) if new_key else ""
+        try:
+            self._db.execute("UPDATE files SET link_of=? WHERE link_of=?", (n, o))
+        except sqlite3.Error:
+            pass
 
     # --- cykl życia ---------------------------------------------------------
 
@@ -485,6 +547,9 @@ class FileIndex:
             "  link_of=''",
             (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, "", now, -1, -1),
         )
+        # treść pliku się zmieniła → wpisy „to hardlink tego pliku" nieaktualne
+        cur.execute("UPDATE files SET link_of='' WHERE link_of=?",
+                    (os.path.normcase(os.path.abspath(key)),))
         stats.hashed += 1
         stats.bytes_hashed += st.st_size
         added = 1
@@ -1335,9 +1400,9 @@ class FileIndex:
         cur.executemany("INSERT OR IGNORE INTO _seen(path) VALUES (?)",
                         ((s,) for s in seen))
         sql = ("UPDATE files SET missing=1 WHERE missing=0 "
-               "AND substr(path, 1, ?) = ? "
+               "AND path >= ? AND path < ? "
                "AND path NOT IN (SELECT path FROM _seen)")
-        params: list = [len(prefix), prefix]
+        params: list = list(_prefix_bounds(prefix))
         skips = [str(s).rstrip("\\/") + os.sep for s in (skip_norm or set())]
         if skips:
             try:
@@ -1354,14 +1419,28 @@ class FileIndex:
     # --- zapytania ------------------------------------------------------------
 
     def lookup(self, path: Path | str) -> Optional[sqlite3.Row]:
+        """Wpis pliku. Najpierw dokładna ścieżka, potem BEZ rozróżniania
+        wielkości liter (system plików ich nie rozróżnia: „…SEED…" to ten sam
+        plik co „…Seed…" na dysku; `row["path"]` = nazwa z dysku)."""
         key = str(Path(os.path.abspath(path)))
-        return self._db.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone()
+        r = self._db.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone()
+        if r is None:
+            r = self._db.execute("SELECT * FROM files WHERE path=? COLLATE NOCASE "
+                                 "ORDER BY missing LIMIT 1", (key,)).fetchone()
+        return r
 
     def members_of(self, archive: Path | str) -> list[sqlite3.Row]:
         """Członkowie (pliki wewnątrz) danego archiwum z indeksu (name, sha1…)."""
         key = str(Path(os.path.abspath(archive)))
-        return list(self._db.execute(
+        rows = list(self._db.execute(
             "SELECT * FROM members WHERE archive=?", (key,)).fetchall())
+        if not rows:
+            r = self.lookup(key)                 # inna wielkość liter na dysku
+            if r is not None and r["path"] != key:
+                rows = list(self._db.execute(
+                    "SELECT * FROM members WHERE archive=?",
+                    (r["path"],)).fetchall())
+        return rows
 
     def build_match_cache(self) -> None:
         """Wczytuje CAŁY indeks (obecne pliki + członków archiwów) do słowników
@@ -1403,6 +1482,27 @@ class FileIndex:
 
     def drop_match_cache(self) -> None:
         self._mcache = None
+
+    def rom_absent(self, sha1: str, md5: str, crc: str, size: int) -> bool:
+        """True = (z cache dopasowania) żadna suma ROM-u nie występuje ani w
+        plikach, ani w członkach archiwów — te same klucze, których szuka
+        `matcher.match_rom` (SHA-1, MD5, CRC32+rozmiar). Bez cache → False
+        (nie wiem). 0.7.06: TeknoParrot = 3 mln ROM-ów, zwykle nieobecnych;
+        dotąd każdy przechodził 5 wyszukiwań z kopiowaniem list."""
+        mc = self._mcache
+        if mc is None:
+            return False
+        if sha1:
+            s = sha1.lower()
+            if s in mc["sha1"] or s in mc["msha"]:
+                return False
+        if md5 and md5.lower() in mc["md5"]:
+            return False
+        if crc and size:
+            k = (crc.lower().zfill(8), size)
+            if k in mc["crc"] or k in mc["mcrc"]:
+                return False
+        return True
 
     def find_sha1(self, sha1: str, include_chd_content: bool = True) -> list[sqlite3.Row]:
         """Pliki o danym SHA-1 (opcjonalnie także trafienia w zawartość CHD)."""
@@ -1537,17 +1637,24 @@ class FileIndex:
             "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
             "  mtime_ns=excluded.mtime_ns, crc32=excluded.crc32, "
             "  md5=excluded.md5, sha1=excluded.sha1, is_link=0, missing=0, "
-            "  scanned_at=excluded.scanned_at",
+            "  scanned_at=excluded.scanned_at, link_of=''",
             (key, st.st_size, st.st_mtime_ns, crc, md5, sha1, now))
+        # nowa treść → „to hardlink tego pliku" u innych wpisów nieaktualne
+        # (przepinanie bliźniaków zapisze je od nowa)
+        cur.execute("UPDATE files SET link_of='' WHERE link_of=?",
+                    (os.path.normcase(key),))
         cur.execute("DELETE FROM members WHERE archive=?", (key,))
         self._index_members(cur, key, p, None, full=full,
                             on_progress=on_progress)
         self._db.commit()
 
-    def record_file(self, path: Path | str, crc32: str, md5: str, sha1: str) -> None:
-        """Rejestruje świeżo utworzony plik (np. wypakowany z archiwum)."""
+    def record_file(self, path: Path | str, crc32: str, md5: str, sha1: str,
+                    st: Optional[os.stat_result] = None) -> None:
+        """Rejestruje świeżo utworzony plik (np. wypakowany z archiwum).
+        `st` — stat pliku, jeśli wołający już go ma (bez kolejnej rundy NAS)."""
         p = Path(os.path.abspath(path))
-        st = os.lstat(p)
+        if st is None:
+            st = os.lstat(p)
         now = datetime.now().isoformat(timespec="seconds")
         self._db.execute(
             "INSERT INTO files(path, size, mtime_ns, crc32, md5, sha1, "
@@ -1560,6 +1667,7 @@ class FileIndex:
             "  cd_typed=-1, chd_sha1='', link_of='', tz=-1",
             (str(p), st.st_size, st.st_mtime_ns, crc32.lower(), md5.lower(),
              sha1.lower(), now))
+        self._retarget_links(str(p))      # nowa treść — dawne hardlinki to nie on
         # kopia znanej treści (np. CHD kopiowane dla innej platformy): wynik
         # sondy z bliźniaka — inaczej skan sondowałby ją chdman po NAS
         self._borrow_probe(self._db, str(p), sha1.lower(), st.st_size)
@@ -1568,10 +1676,10 @@ class FileIndex:
     def all_under(self, root: Path | str, physical_only: bool = True) -> list[sqlite3.Row]:
         """Wszystkie zaindeksowane wpisy pod katalogiem `root`."""
         prefix = str(Path(os.path.abspath(root))).rstrip("\\/") + os.sep
-        q = "SELECT * FROM files WHERE missing=0 AND substr(path, 1, ?) = ?"
+        q = "SELECT * FROM files WHERE missing=0 AND path >= ? AND path < ?"
         if physical_only:
             q += " AND is_link=0"
-        return self._db.execute(q, (len(prefix), prefix)).fetchall()
+        return self._db.execute(q, _prefix_bounds(prefix)).fetchall()
 
     def count_under(self, root: Path | str, skip=()) -> int:
         """Liczba znanych (nie-brakujących) wpisów pod `root` — SZACUNEK
@@ -1582,7 +1690,7 @@ class FileIndex:
             prefix = str(Path(os.path.abspath(r))).rstrip("/" + os.sep) + os.sep
             return self._db.execute(
                 "SELECT COUNT(*) FROM files WHERE missing=0 "
-                "AND substr(path, 1, ?) = ?", (len(prefix), prefix)).fetchone()[0]
+                "AND path >= ? AND path < ?", _prefix_bounds(prefix)).fetchone()[0]
         total = _n(root)
         rn = os.path.normcase(os.path.abspath(str(root))).rstrip("/" + os.sep) + os.sep
         for sk in skip or ():
@@ -1600,9 +1708,9 @@ class FileIndex:
         prefix = str(Path(os.path.abspath(root))).rstrip("/" + os.sep) + os.sep
         return self._db.execute(
             "SELECT * FROM files WHERE missing=0 AND is_link=0 "
-            "AND substr(path, 1, ?) = ? AND data_sha1 != '' "
+            "AND path >= ? AND path < ? AND data_sha1 != '' "
             "AND lower(substr(path, -4)) = '.chd'",
-            (len(prefix), prefix)).fetchall()
+            _prefix_bounds(prefix)).fetchall()
 
     def rename(self, old: Path | str, new: Path | str) -> None:
         """Aktualizuje ścieżkę wpisu po przeniesieniu/zmianie nazwy pliku.
@@ -1615,10 +1723,19 @@ class FileIndex:
         wpis pliku pozostaje AKTUALNY (skan uzna go za świeży)."""
         old_key = str(Path(os.path.abspath(old)))
         new_key = str(Path(os.path.abspath(new)))
+        if self._db.execute("SELECT 1 FROM files WHERE path=?",
+                            (old_key,)).fetchone() is None:
+            r = self.lookup(old_key)              # wpis pod inną wielkością liter
+            if r is not None:
+                old_key = r["path"]
+        if old_key == new_key:
+            return
         self._note_vacated(old_key)
-        self._hand_over_members(new_key)          # nadpisywany wpis
-        self._db.execute("DELETE FROM files WHERE path=?", (new_key,))
+        if os.path.normcase(old_key) != os.path.normcase(new_key):
+            self._hand_over_members(new_key)      # nadpisywany wpis
+            self._db.execute("DELETE FROM files WHERE path=?", (new_key,))
         self._db.execute("UPDATE files SET path=? WHERE path=?", (new_key, old_key))
+        self._retarget_links(old_key, new_key)    # ten sam plik pod nową ścieżką
         # osieroceni członkowie pod nową ścieżką (gdyby coś było) → precz, potem
         # przenieś członków starego archiwum na nową ścieżkę
         self._db.execute("DELETE FROM members WHERE archive=?", (new_key,))
@@ -1768,10 +1885,11 @@ class FileIndex:
         celu (rozmiar, mtime, sumy — hardlink dzieli je z celem), BEZ pytania
         NAS. Cel nieznany indeksowi → nic (skan dopisze)."""
         key = str(Path(os.path.abspath(path)))
-        tkey = str(Path(os.path.abspath(target)))
-        t = self._db.execute("SELECT * FROM files WHERE path=?", (tkey,)).fetchone()
+        t = self.lookup(target)              # także cel pod inną wielkością liter
         if t is None or not t["sha1"]:
             return
+        tkey = t["path"]
+        self._drop_case_twins(key)
         now = datetime.now().isoformat(timespec="seconds")
         self._copy_content(self._db, key, t, t["size"], t["mtime_ns"], now,
                            os.path.normcase(tkey))

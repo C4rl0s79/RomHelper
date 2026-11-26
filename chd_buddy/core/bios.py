@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .fileops import replace_rw, unlink_rw
 from .settings import app_base_dir
 
 MANIFEST_FILENAME = "bios_manifest.json"
@@ -424,7 +425,7 @@ def export_for_emulator(emu: str, entries: list, files_db: dict,
             tmp = dest.with_name(dest.name + ".chdbuddy_tmp")
             write_torrentzip(tmp, [(arcname, src.read_bytes())
                                    for arcname, src in members])
-            os.replace(tmp, dest)
+            replace_rw(tmp, dest)
             copied += len(members)
             log(f"  [+] {emu}: zapakowano {len(members)} plików -> {dest}")
         except Exception as e:

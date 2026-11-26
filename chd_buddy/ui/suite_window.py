@@ -389,16 +389,106 @@ class SuiteWindow(QMainWindow):
         self._build_tab_bios()
         self._build_tab_update()
 
-        # AUTO-WCZYTANIE na starcie: DAT-y z cache + ostatni raport z pamięci
-        if self.row_dats.path and Path(self.row_dats.path).is_dir():
+        # START (0.6.99, model RomVaulta): drzewo z PLIKU STANU kolekcji — bez
+        # NAS i bez liczenia; brak pliku stanu → pełne wczytanie DAT-ów
+        if self.row_dats.path:
             from PySide6.QtCore import QTimer
-            QTimer.singleShot(150, self._collection_load_dats)
+            QTimer.singleShot(150, self._startup_load)
 
         # RAM DYSK na operacje tymczasowe — tworzymy w tle (inicjalizacja trwa),
         # by był gotowy zanim ruszy skan; usuwamy przy zamknięciu programu.
         if self.settings.ramdisk_enabled:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(50, self._init_ramdisk)
+
+    def _startup_load(self) -> None:
+        """Start z pliku stanu kolekcji: lista DAT-ów, liczby (indeks liczb),
+        skip, ToSort, kolejność katalogów — lokalne pliki, bez NAS. Gry DAT-ów
+        doczytywane w tle z lokalnego cache; stan gier leniwie per DAT. Gdy
+        pliku stanu nie ma (pierwszy start, inne DatRoot/rom_root) albo brak
+        indeksu liczb — dotychczasowe pełne „Wczytaj DAT-y"."""
+        import time as _t
+        t0 = _t.monotonic()
+        dats = self.row_dats.path
+        roms = self.row_roms.path or dats
+        from ..core.snapshot import load_snapshot
+        snap = load_snapshot(dats, roms)
+        counts: dict = {}
+        saved_at = None
+        if snap is not None:
+            from ..core.datcache import load_counts
+            saved_at, counts = load_counts(
+                [self._dat_key(e) for e in snap.entries], build_missing=False)
+        if snap is None or not counts:
+            self._collection_load_dats()
+            return
+        from ..core.datcache import LazyStates
+        from ..core.datstore import set_failed_dats
+        set_failed_dats(snap.failed)
+        self._entries = snap.entries
+        self._reports_by_id = {}
+        self._saved_at = saved_at
+        self._saved_states = LazyStates(any_saved=True)
+        self._folder_order = snap.order
+        view = {"counts": counts, "skip": snap.skip, "tosort": snap.tosort,
+                "order": snap.order}
+        self._fill_dats(snap.entries, with_stats=True, view=view)
+        self._log(f"Start z zapisanego stanu kolekcji ({len(snap.entries)} "
+                  f"DAT-ów, wynik z {saved_at}, {_t.monotonic() - t0:.1f} s). "
+                  f"Zmiany w katalogu DAT-ów (nowe/zmienione pliki .dat) — "
+                  f"przycisk „Wczytaj DAT-y”.")
+        self._start_games_loader(snap.entries)
+
+    def _start_games_loader(self, entries) -> None:
+        """Gry DAT-ów z lokalnego `dat_parse_cache` w TLE (bez NAS) — drzewo
+        już jest; zadania (skan/naprawa) czekają na koniec (`_wait_games`)."""
+        import threading
+        ev = threading.Event()
+        self._games_ready = ev
+        ents = list(entries)
+
+        def run():
+            try:
+                from ..core.gcpause import settle
+                for e in ents:
+                    if getattr(self, "_closing", False):
+                        break
+                    try:
+                        e.load()
+                    except Exception:
+                        pass            # zadanie doczyta / zgłosi samo
+                    # zamroź PO KAŻDYM DAT-cie (jak discover): bez tego pełne
+                    # GC przeglądało rosnącą stertę milionów obiektów przy
+                    # każdym kolejnym — 340 s zamiast kilku (pomiar 03.10)
+                    settle()
+            finally:
+                ev.set()
+        threading.Thread(target=run, name="dat-games", daemon=True).start()
+
+    def _resave_snapshot(self) -> None:
+        """Plik stanu z bieżących danych okna (np. po zmianie kolejności
+        katalogów) — lokalny zapis, bez NAS poza kolejnością katalogów."""
+        try:
+            from ..core.datstore import failed_dats
+            from ..core.folder_order import load_order
+            from ..core.snapshot import save_snapshot
+            dats = self.row_dats.path
+            tv = getattr(self, "_tree_view", None) or {}
+            self._folder_order = load_order(Path(dats))
+            save_snapshot(self._entries or [], dats, self.row_roms.path or dats,
+                          skip=tv.get("skip"), tosort=tv.get("tosort"),
+                          order=self._folder_order, failed=failed_dats())
+        except Exception as e:
+            self._log(f"UWAGA: nie zapisano pliku stanu kolekcji: {e}")
+
+    def _wait_games(self, progress=None) -> None:
+        """Wątek ZADANIA: poczekaj, aż gry DAT-ów doczytają się w tle."""
+        ev = getattr(self, "_games_ready", None)
+        if ev is None or ev.is_set():
+            return
+        if progress is not None:
+            progress(0, 0, tr("wczytuję DAT-y z cache…"))
+        ev.wait()
 
     def _init_ramdisk(self) -> None:
         # tworzymy w tle BEZ blokady przycisków/okna postępu (nie przeszkadza
@@ -463,6 +553,7 @@ class SuiteWindow(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:
+        self._closing = True             # wątek doczytywania gier DAT-ów: stop
         # zapamiętaj pozycję/rozmiar okna i zwinięte grupy
         try:
             self.settings.ui_geometry = bytes(
@@ -739,6 +830,14 @@ class SuiteWindow(QMainWindow):
             worker.fn = lambda log, prog: fn(log, prog, cancel)
         else:                 # (log, prog)
             worker.fn = fn
+        # gry DAT-ów doczytywane w tle po starcie z pliku stanu (0.6.99) —
+        # każde zadanie najpierw czeka na komplet (w SWOIM wątku, nie okna)
+        _fn0 = worker.fn
+
+        def _after_games(log, prog, _f=_fn0):
+            self._wait_games(prog)
+            return _f(log, prog)
+        worker.fn = _after_games
 
         # STRAŻ NAS + BEZ USYPIANIA na czas zadania: gdy dysk sieciowy zniknie
         # (uśpienie laptopa, restart routera) praca CZEKA z komunikatem i
@@ -1365,12 +1464,14 @@ class SuiteWindow(QMainWindow):
         return self._game_statuses_for(entry)
 
     @staticmethod
-    def _display_order(items, dat_root: Path, key):
+    def _display_order(items, dat_root: Path, key, order=None):
         """Kolejność WYŚWIETLANIA katalogów = ich PRIORYTET (_kolejnosc.json):
         katalog wyżej ma pierwszeństwo nad niższymi, niewymienione alfabetycznie
-        — dokładnie tak, jak są przetwarzane. W katalogu DAT-y alfabetycznie."""
+        — dokładnie tak, jak są przetwarzane. W katalogu DAT-y alfabetycznie.
+        `order` — już wczytana kolejność (plik stanu, bez NAS); None = z pliku."""
         from ..core.folder_order import folder_rank, load_order
-        order = load_order(dat_root)
+        if order is None:
+            order = load_order(dat_root)
 
         def sort_key(x):
             entry = key(x)
@@ -1485,7 +1586,7 @@ class SuiteWindow(QMainWindow):
         self.game_list.setUpdatesEnabled(False)
         LIMIT = 50000
         shown = 0
-        for game in self._sorted_games(entry.games):
+        for game in self._sorted_games(entry.load().games):
             if shown >= LIMIT:
                 self.game_list.addTopLevelItem(QTreeWidgetItem(
                     ["… (dalsze pozycje ukryte — zawęź filtrem)", "", ""]))
@@ -1980,18 +2081,15 @@ class SuiteWindow(QMainWindow):
             log(f"Wczytano {len(entries)} DAT-ów"
                 + (f" (wyłączonych skip: {len(skipped)} — szare, "
                    f"zaznacz checkbox by włączyć)" if skipped else ""))
-            # stany ostatniego skanu wczytujemy TU (wątek tła), nie w GUI —
-            # 1,8 mln wpisów to kilka sekund, które zamrażały okno po starcie
-            from ..core.datcache import load_report_states
-            log("Wczytuję wynik ostatniego skanu…")
-            saved = load_report_states(known_keys={
-                str(Path(os.path.abspath(e.dat_path))) for e in entries})
-            # liczby/reguły/ToSort dla drzewa — też tutaj (0.6.96)
+            # liczby/reguły/ToSort dla drzewa — w wątku (0.6.96); liczby z
+            # indeksu liczb, stan gier leniwie per DAT, zapis pliku stanu
+            # (kolejny start bez liczenia, 0.6.99)
             from ..core.viewdata import prepare_view
-            view = prepare_view(entries, saved=saved, dat_root=dats,
-                                tosort_dirs=_tosorts, log=log,
-                                progress=progress)
-            return entries, saved, view
+            log("Wczytuję wynik ostatniego skanu…")
+            view = prepare_view(entries, dat_root=dats, tosort_dirs=_tosorts,
+                                log=log, progress=progress,
+                                snapshot_roots=(dats, roms))
+            return entries, (view["saved_at"], view["states"]), view
 
         self._run(job, self._fill_dats_loaded)
 
@@ -2006,10 +2104,10 @@ class SuiteWindow(QMainWindow):
             view = result[2] if len(result) > 2 else None
         else:
             entries = result or []
-            from ..core.datcache import load_report_states
-            # klucze z PAMIĘCI (bez isfile na NAS — to było ~45 s zamrożenia)
-            self._saved_at, self._saved_states = load_report_states(
-                known_keys={self._dat_key(e) for e in entries})
+            # przerwane wczytywanie: stan leniwie per DAT (0.6.99), bez
+            # wczytywania wszystkich DAT-ów w wątku okna
+            from ..core.datcache import LazyStates
+            self._saved_states = LazyStates()
         self._reports_by_id = {}
         self._entries = entries
         has_saved = bool(self._saved_states)
@@ -2166,10 +2264,12 @@ class SuiteWindow(QMainWindow):
             return
         if not changed:
             return
+        self._folder_order = None           # nowa kolejność z _kolejnosc.json
         if entries:
             DatStore(dat_root, Path(self.row_roms.path),
                      use_cache=False).sort_entries(entries)
             self._entries = entries
+            self._resave_snapshot()
             if self._reports:
                 pos = {id(e): i for i, e in enumerate(entries)}
                 self._reports.sort(key=lambda r: pos.get(id(r.entry), len(pos)))
@@ -2812,7 +2912,8 @@ class SuiteWindow(QMainWindow):
                 view = prepare_view(
                     all_entries, reports=reports, save=True, dat_root=dats,
                     tosort_dirs=list(settings.tosort_dirs),
-                    rom_root=settings.rom_root, log=log, progress=progress)
+                    rom_root=settings.rom_root, log=log, progress=progress,
+                    snapshot_roots=(dats, roms))
                 return all_entries, reports, view
 
         self._run(job, self._fill_reports, title="Skanowanie kolekcji")
@@ -2831,9 +2932,8 @@ class SuiteWindow(QMainWindow):
             # stany z ostatniego skanu są JUŻ w pamięci (wczytane przy starcie) —
             # nie przeładowujemy (ponowny odczyt = zbędna praca na wątku GUI).
             if not self._saved_states:
-                from ..core.datcache import load_report_states
-                self._saved_at, self._saved_states = load_report_states(
-                    known_keys={self._dat_key(e) for e in all_entries})
+                from ..core.datcache import LazyStates
+                self._saved_states = LazyStates()       # leniwie per DAT (0.6.99)
             self._fill_dats(all_entries, with_stats=bool(self._reports_by_id
                                                          or self._saved_states))
             self._log("Skan przerwany — zachowano poprzedni wynik. „Znajdź "
@@ -2876,11 +2976,9 @@ class SuiteWindow(QMainWindow):
                 self._log(f"UWAGA: {view['error']}")
         else:
             try:
-                from ..core.datcache import (load_report_states,
-                                             save_report_states)
+                from ..core.datcache import LazyStates, save_report_states
                 save_report_states(reports)
-                self._saved_at, self._saved_states = load_report_states(
-                    known_keys={self._dat_key(e) for e in all_entries})
+                self._saved_states = LazyStates(any_saved=True)
             except Exception as e:      # zapis cache nie może ubić raportu
                 self._saved_states = {}
                 self._log(f"UWAGA: nie zapisano cache raportu: {e}")
@@ -2978,10 +3076,24 @@ class SuiteWindow(QMainWindow):
         self.rom_list.clear()
         dat_root = Path(self.row_dats.path)
         if view is None:
-            view = tree_extras(entries, dat_root, self.settings.tosort_dirs)
-            v_counts = None
+            # przerysowanie bez nowej operacji (przesunięcie katalogu, start
+            # naprawy…): reguły/ToSort/liczby z PAMIĘCI okna (0.6.99) — bez NAS
+            # i bez doczytywania stanu wszystkich DAT-ów (LazyStates)
+            cached = getattr(self, "_tree_view", None)
+            if cached:
+                view = {"skip": dict(cached.get("skip") or {}),
+                        "tosort": list(cached.get("tosort") or [])}
+            else:
+                view = tree_extras(entries, dat_root, self.settings.tosort_dirs)
+            prev = getattr(self, "_dat_counts", None)
+            v_counts = ({k: tuple(v) for k, v in prev.items()}
+                        if prev else None)
         else:
             v_counts = view.get("counts")
+            if view.get("order") is not None:
+                self._folder_order = view["order"]
+        self._tree_view = {"skip": dict(view.get("skip") or {}),
+                           "tosort": list(view.get("tosort") or [])}
         v_skip = view.get("skip") or {}
         rules = None
         if any(self._dat_key(e) not in v_skip for e in entries):
@@ -3006,7 +3118,11 @@ class SuiteWindow(QMainWindow):
         # stan pola zaznaczenia per DAT — `_on_tree_item_changed` zapisuje regułę
         # tylko przy jego ZMIANIE (nie przy zmianie tekstu/koloru wiersza)
         self._dat_checked = {}
-        for e in self._display_order(entries, dat_root, lambda x: x):
+        if getattr(self, "_folder_order", None) is None:
+            from ..core.folder_order import load_order
+            self._folder_order = load_order(dat_root)
+        for e in self._display_order(entries, dat_root, lambda x: x,
+                                     order=self._folder_order):
             k = self._dat_key(e)
             skip = (v_skip[k] if k in v_skip
                     else (rules.for_entry(e)["skip"] if rules else False))
@@ -3029,7 +3145,7 @@ class SuiteWindow(QMainWindow):
                 self._dat_items[self._dat_key(e)] = (item, skip)
                 self._dat_counts[self._dat_key(e)] = [total, complete, fix, miss]
             else:
-                item = QTreeWidgetItem([e.name, str(len(e.games)), "", "", ""])
+                item = QTreeWidgetItem([e.name, str(e.game_count), "", "", ""])
             item.setData(0, Qt.ItemDataRole.UserRole, e)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Unchecked if skip
@@ -3100,6 +3216,15 @@ class SuiteWindow(QMainWindow):
             self._log(f"BŁĄD zapisu reguły: {e}")
             return
         checked[k] = not skip
+        # plik stanu i pamięć drzewa znają nowy skip (start bez NAS, 0.6.99)
+        tv = getattr(self, "_tree_view", None)
+        if tv is not None:
+            tv.setdefault("skip", {})[k] = skip
+        try:
+            from ..core.snapshot import update_snapshot
+            update_snapshot(skip={k: skip})
+        except Exception:
+            pass
         col = QColor(150, 150, 150) if skip else QColor()
         _prev, self._filling = self._filling, True     # kolor ≠ kliknięcie
         try:
@@ -3225,7 +3350,7 @@ class SuiteWindow(QMainWindow):
                         stats.view = prepare_view(
                             entries, reports=reps, save=dry, dat_root=dats,
                             tosort_dirs=_tosorts, rom_root=_rom_root, log=log,
-                            progress=progress)
+                            progress=progress, snapshot_roots=(dats, roms))
                     except Exception as e:
                         log(f"UWAGA: nie przygotowano widoku: {e}")
             return stats
@@ -3269,10 +3394,8 @@ class SuiteWindow(QMainWindow):
                     self._saved_at, self._saved_states = (view["saved_at"],
                                                           view["states"])
                 else:
-                    from ..core.datcache import load_report_states
-                    self._saved_at, self._saved_states = load_report_states(
-                        known_keys={self._dat_key(e)
-                                    for e in (self._entries or [])})
+                    from ..core.datcache import LazyStates
+                    self._saved_states = LazyStates(any_saved=True)
                 self._fill_dats(self._entries or [], with_stats=True, view=view)
             except Exception as e:
                 self._log(f"UWAGA: nie odświeżono liczb: {e}")

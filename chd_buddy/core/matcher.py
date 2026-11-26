@@ -162,6 +162,14 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(a) == os.path.normcase(b)
 
 
+def _exact_place(a: str, b: str) -> bool:
+    """Ten sam plik (system plików nie rozróżnia wielkości liter) I nazwa co do
+    litery jak w DAT-cie. „WipEout (USA).chd" pod „Wipeout (USA).chd" to ten
+    sam plik, ale ZŁA NAZWA — naprawa ją poprawia (0.7.04)."""
+    return (_same_path(a, b)
+            and os.path.basename(str(a)) == os.path.basename(str(b)))
+
+
 def _link_satisfies(canonical, src: str, index: "FileIndex | None" = None) -> bool:
     """Czy ścieżka kanoniczna to POPRAWNY symlink na znalezioną kopię
     fizyczną `src`? Wtedy gra DZIECKA jest na miejscu (HAVE), a nie „do
@@ -234,8 +242,9 @@ def _pick(rows: Sequence, canonical: Path, target_dir: Path):
     for r in rows:
         if r["is_link"]:
             continue  # link nie jest kopią fizyczną
-        if _same_path(r["path"], canon):
+        if _exact_place(r["path"], canon):
             return r, "canonical"
+        # ta sama ścieżka w innej wielkości liter → „w katalogu" = NAZWA
         if os.path.normcase(r["path"]).startswith(tprefix):
             in_dir = in_dir or r
         else:
@@ -283,9 +292,20 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
         row = index.lookup(canon)
         if (row is not None and not row["missing"] and not row["is_link"]
                 and (row["size"] or 0) == 0):
-            status.state = RomState.HAVE
-            status.source_path = str(canon)
+            if _exact_place(row["path"], str(canon)):
+                status.state = RomState.HAVE
+                status.source_path = str(canon)
+            else:                        # inna wielkość liter → NAZWA (0.7.04)
+                status.state = RomState.WRONG_NAME
+                status.source_path = row["path"]
         return status
+    # żadnej sumy tego ROM-u nie ma w indeksie (pliki ani członkowie) → brak,
+    # bez pięciu wyszukiwań (0.7.06; wynik jak pełna ścieżka niżej)
+    _absent = getattr(index, "rom_absent", None)
+    if ((rom.sha1 or rom.md5 or rom.crc) and _absent is not None
+            and _absent(rom.sha1, rom.md5, rom.crc, rom.size)):
+        return RomStatus(entry, game, rom, RomState.MISSING,
+                         game_multi=game_multi)
     rows: list = []
     if rom.sha1:
         rows = index.find_sha1(rom.sha1, include_chd_content=False)
@@ -330,16 +350,19 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
 
     # trafienie wewnątrz archiwum (SHA-1, potem CRC32+rozmiar z ZIP-a) —
     # też z wymogiem zgodności WSZYSTKICH dostępnych sum
-    mrows: list = []
+    # PIERWSZE pełne trafienie wystarcza (0.7.06): plik wspólny setkom gier
+    # (DSi `titlePass.txt` w 5730 archiwach) nie jest filtrowany w całości
+    # dla każdej gry
+    mrow = None
     if rom.sha1:
-        mrows = [r for r in index.find_member_sha1(rom.sha1)
-                 if _row_full_match(r, rom)]
-    if not mrows and rom.crc and rom.size:
-        mrows = [r for r in index.find_member_crc(rom.crc, rom.size)
-                 if _row_full_match(r, rom)]
-    if mrows:
-        status.source_path = mrows[0]["archive"]
-        status.member = mrows[0]["name"]
+        mrow = next((r for r in index.find_member_sha1(rom.sha1)
+                     if _row_full_match(r, rom)), None)
+    if mrow is None and rom.crc and rom.size:
+        mrow = next((r for r in index.find_member_crc(rom.crc, rom.size)
+                     if _row_full_match(r, rom)), None)
+    if mrow is not None:
+        status.source_path = mrow["archive"]
+        status.member = mrow["name"]
         status.state = RomState.ELSEWHERE
     return status
 
@@ -362,6 +385,7 @@ def _archives_with_game(game, index: FileIndex) -> dict:
     ROM-y gry (trafienie SHA-1, potem CRC32+rozmiar). Do formatu kartridżowego,
     gdzie CAŁA gra siedzi w jednym pliku <gra>.zip."""
     per: dict[str, dict[int, str]] = {}
+    hits: list = []
     for i, rom in enumerate(game.roms):
         if _is_empty_rom(rom):
             # PUSTY znacznik (size=0): suma „pustego pliku" ma KAŻDE archiwum z
@@ -374,7 +398,22 @@ def _archives_with_game(game, index: FileIndex) -> dict:
             rows = index.find_member_sha1(rom.sha1)
         if not rows and rom.crc and rom.size:
             rows = index.find_member_crc(rom.crc, rom.size)
+        if not rows:
+            # ROM-u nie ma w ŻADNYM archiwum → żadne nie ma kompletu gry
+            # (TeknoParrot: tysiące plików na grę — bez szukania reszty)
+            return {}
+        hits.append((i, rom, rows))
+    # Jedyny konsument (`_match_game_archive`) bierze WYŁĄCZNIE archiwa z
+    # kompletem niepustych ROM-ów gry, więc kandydatem jest tylko archiwum z
+    # NAJRZADSZYM z nich (0.7.06). Plik wspólny setkom gier (DSi:
+    # `titlePass.txt`, 8 B, w 5730 archiwach) nie każe już przeglądać tysięcy
+    # cudzych archiwów dla każdej gry (19 mln porównań na DAT).
+    hits.sort(key=lambda h: len(h[2]))
+    allowed = None
+    for i, rom, rows in hits:
         for r in rows:
+            if allowed is not None and r["archive"] not in allowed:
+                continue
             if _row_full_match(r, rom):     # KOMPLET sum, nie jedna
                 # kilka członków o TEJ SAMEJ treści (DAT arcade ma ROM-y-
                 # bliźniaki pod różnymi nazwami, np. epr-11437 = epr-11445):
@@ -383,7 +422,35 @@ def _archives_with_game(game, index: FileIndex) -> dict:
                 got = per.setdefault(r["archive"], {})
                 if _zname(got.get(i, "")) != _zname(rom.name):
                     got[i] = r["name"]
+        if allowed is None:
+            allowed = set(per)              # archiwa z najrzadszym ROM-em
+            if not allowed:
+                break                       # żadne nie ma kompletu
     return per
+
+
+def _game_by_name_lc(entry) -> dict:
+    """{nazwa gry (małe litery): gra} DAT-u — budowane raz na wpis."""
+    m = getattr(entry, "_game_by_name_lc", None)
+    if m is None:
+        m = {g.name.lower(): g for g in entry.games}
+        try:
+            entry._game_by_name_lc = m
+        except Exception:
+            pass
+    return m
+
+
+def _archive_holds_game(archive: str, entry, game, index) -> bool:
+    """Archiwum zawiera (po SUMACH członków) KOMPLET niepustych ROM-ów gry
+    (efektywnych — dla arcade wg formatu zestawów)."""
+    from .content import holds_roms
+    roms = game.roms
+    if ((getattr(game, "cloneof", "") or getattr(game, "romof", ""))
+            and getattr(entry, "arcade_format", "")):
+        from . import mamesets
+        roms = mamesets.effective_roms(entry, game)
+    return holds_roms(index, archive, roms)
 
 
 def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
@@ -500,12 +567,31 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
         # pgm) — dawniej alfabetycznie, więc gra „znajdowała się" w cudzym zipie.
         in_dir.sort(key=lambda am: (0 if _own(am[0]) else 1,
                                     0 if _names_ok(am[1]) else 1,
+                                    1 if _superset(am[0]) else 0,
                                     am[0].lower()))
         archive, members = in_dir[0]
         sup = _superset(archive)
         # własny zip arcade z dodatkami = OK (flaga `sup` zostaje PRAWDZIWA —
         # przy złych nazwach rebuilder musi wiedzieć, że to nadzbiór)
         tolerate = arcade and sup and _own(archive)
+        # NAZWA PLIKU co do litery jak w DAT-cie (0.7.04): dawniej zip z
+        # dokładnym zestawem gry był „na miejscu" pod DOWOLNĄ nazwą (także
+        # „…Seed…" zamiast „…SEED…") — nazwa nigdy nie była poprawiana
+        want = entry.target_dir / f"{game.name}{Path(archive).suffix}"
+        # zip, który jest KOMPLETEM INNEJ gry tego DAT-u (po SUMACH członków),
+        # to plik TAMTEJ gry (arcade: zip rodzica zawiera ROM-y klona) — nie
+        # „zła nazwa" tej gry. 0.7.09: rozstrzyga treść, nie sama nazwa pliku
+        # (dawniej: stem = nazwa innej gry; arcade: tylko wielkość liter)
+        _stem = Path(archive).stem.lower()
+        _other = (_game_by_name_lc(entry).get(_stem)
+                  if _stem != game.name.lower() else None)
+        _other_game = (_other is not None
+                       and _archive_holds_game(archive, entry, _other, index))
+        if (_names_ok(members) and (not sup or tolerate)
+                and not _exact_place(archive, str(want))
+                and not _other_game):
+            return _mk(archive, members, RomState.WRONG_NAME, str(want), True,
+                       superset=sup)
         if _names_ok(members) and (not sup or tolerate):
             # w katalogu docelowym + poprawne nazwy + DOKŁADNY zestaw => zielone,
             # CHYBA że ZIP ma złą metodę kompresji (zstd/lzma) → „do naprawy"
@@ -521,7 +607,13 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
                    superset=sup)
     if not allow_move:
         return None
-    full.sort(key=lambda am: (0 if _names_ok(am[1]) else 1, am[0].lower()))
+    # DOKŁADNY zestaw przed NADZBIOREM (0.7.00): ta sama gra jako osobny zip
+    # (np. 1G1R …DSi (Digital) (Retool)\X.zip) = przeniesienie/hardlink bez
+    # transferu; nadzbiór (…(CDN)\X.zip z 4 plikami) = wypakowanie przez NAS.
+    # Dawniej alfabetycznie — „(CDN)" wygrywało z „(Retool)".
+    full.sort(key=lambda am: (0 if _names_ok(am[1]) else 1,
+                              1 if _superset(am[0]) else 0,
+                              am[0].lower()))
     archive, members = full[0]
     sup = _superset(archive)
     ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
@@ -712,10 +804,22 @@ def _match_game_roms(entry: DatEntry, game, index: FileIndex,
                         s.is_translation = True
                     return statuses
 
-    if all(s.state == RomState.HAVE for s in statuses):
-        return statuses                       # luźne pliki już na miejscu
-
     fmt = getattr(entry, "store_format", "keep")
+    if all(s.state == RomState.HAVE for s in statuses):
+        # luźne pliki już na miejscu. Format ARCHIWUM (zip/7z): gdy TA SAMA
+        # gra (po sumach, nazwy członków jak w DAT-cie, bez nadmiaru) leży
+        # gdzie indziej jako archiwum → to ona jest grą (link/przeniesienie),
+        # a luźnych nie pakujemy od nowa (0.7.07: RetroBat snes — 37 gier
+        # `.sfc` pakowanych do zipów identycznych z ROMS\snes, zamiast
+        # hardlinku). Brak dokładnego archiwum → jak dotąd (konwersja w miejscu).
+        if fmt in ("zip", "7z"):
+            arc = _match_game_archive(entry, game, index, fmt, allow_move=True)
+            if (arc and arc[0].archive_names_ok and not arc[0].archive_superset
+                    and arc[0].state in (RomState.HAVE, RomState.ELSEWHERE)):
+                return arc
+        return statuses
+
+
     # (1b) PIERWSZEŃSTWO CHD (user 01.10): gra PŁYTOWA w DAT-cie niepłytowym
     # (No-Intro: wydanie cyfrowe z tymi samymi sumami co płyta z Redump) —
     # gdy w kolekcji jest CHD tej gry, gra = ten CHD (link), nie drugi raz
@@ -748,7 +852,8 @@ def _match_game_roms(entry: DatEntry, game, index: FileIndex,
             return statuses
     canonical = entry.target_dir / f"{game.name}.chd"
     src = chd_row["path"]
-    if _same_path(src, str(canonical)) or _link_satisfies(canonical, src, index):
+    if (_exact_place(src, str(canonical))
+            or _link_satisfies(canonical, src, index)):
         state = RomState.HAVE_CHD
     elif is_under(src, entry.target_dir):
         state = RomState.WRONG_NAME

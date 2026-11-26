@@ -61,15 +61,44 @@ class DatEntry:
     # Metadane z sidecar-JSON RomVaulta (opcjonalne — nie każdy DAT je ma):
     # group / system / version / datName / datROMsSize. Puste, gdy brak.
     meta: dict = field(default_factory=dict, repr=False)
+    # START Z PLIKU STANU (0.6.99): wpis bez gier (doczytywane z lokalnego
+    # cache). Liczby z ostatniego wczytania, sygnatura pliku DAT-u (mtime_ns,
+    # size) do cache — bez `stat` na NAS. -1 / () = nieznane.
+    n_games: int = -1
+    n_roms: int = -1
+    cache_sig: tuple = ()
 
     @property
     def rom_count(self) -> int:
+        if not self.games and self.n_roms >= 0:
+            return self.n_roms
         return sum(len(g.roms) for g in self.games)
+
+    @property
+    def game_count(self) -> int:
+        """Liczba gier bez wczytywania DAT-u (drzewo)."""
+        if not self.games and self.n_games >= 0:
+            return self.n_games
+        return len(self.games)
 
     def load(self) -> "DatEntry":
         if not self.games:
             from .frontend import drop_frontend_games
-            self.games = drop_frontend_games(parse_dat(self.dat_path))
+            games = None
+            if self.cache_sig:
+                # lokalny cache po zapamiętanej sygnaturze — bez NAS; zmieniony
+                # DAT wykrywa „Wczytaj DAT-y" (nowa sygnatura)
+                try:
+                    from .datcache import shared_parse_cache
+                    hit = shared_parse_cache().get(self.dat_path,
+                                                   sig=self.cache_sig)
+                    if hit is not None:
+                        games = hit[1]
+                except Exception:
+                    games = None
+            if games is None:
+                games = parse_dat(self.dat_path)
+            self.games = drop_frontend_games(games)
         return self
 
 
@@ -252,6 +281,12 @@ _FAILED_DATS: list = []
 def failed_dats() -> list:
     """Ścieżki DAT-ów niewczytanych przez ostatnie `discover` (kopia)."""
     return list(_FAILED_DATS)
+
+
+def set_failed_dats(paths) -> None:
+    """Odtworzenie listy z pliku stanu (start bez `discover`, 0.6.99) —
+    finał naprawy dalej pomija sprzątanie sierot, gdy któryś DAT padł."""
+    _FAILED_DATS[:] = [Path(p) for p in (paths or ())]
 
 
 class DatStore:
@@ -585,6 +620,7 @@ class DatStore:
                          target_dir=self.rom_root / rel / name)
             e.games = games                            # już sparsowane
             e.meta = sidecars.get(str(dat.parent), {}).get(dat.name, {})
+            e.cache_sig = tuple(sig) if sig else ()   # plik stanu (0.6.99)
             entries.append(e)
             # DAT-y to miliony obiektów na cały czas życia programu — zamroź
             # przed pełnym GC (pauza całego programu do ~1,5 s przy starcie)
