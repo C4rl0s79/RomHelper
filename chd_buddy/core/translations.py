@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
+from .fileops import replace_rw, unlink_rw
 
 LogCB = Callable[[str], None]
 
@@ -456,7 +457,7 @@ def apply_substitution(
                     pass
             rollback.append(("copy", dest, form))   # odtwórz z zachowanej kopii
         else:
-            os.replace(form, dest)
+            replace_rw(form, dest)
             if index is not None:
                 try:
                     index.rename(form, dest)
@@ -486,7 +487,7 @@ def apply_substitution(
             res = repack_zip(tmp, method=zip_method, log=log)
             if not res.ok:
                 raise OSError(res.message)
-            os.replace(tmp, slot)
+            replace_rw(tmp, slot)
         else:
             import zipfile
             tmp = slot.with_name(slot.name + ".chdbuddy_tmp")
@@ -495,7 +496,7 @@ def apply_substitution(
                 with z.open(member) as src:
                     import shutil as _sh
                     _sh.copyfileobj(src, out)
-            os.replace(tmp, slot)
+            replace_rw(tmp, slot)
     except (LinkPrivilegeError, OSError) as e:
         slot.with_name(slot.name + ".chdbuddy_tmp").unlink(missing_ok=True)
         if isinstance(e, LinkPrivilegeError):
@@ -506,7 +507,7 @@ def apply_substitution(
         for kind, dsrc, form in rollback:
             try:
                 if kind == "move":
-                    os.replace(dsrc, form)
+                    replace_rw(dsrc, form)
                     if index is not None:
                         try:
                             index.rename(dsrc, form)
@@ -574,7 +575,7 @@ def restore_original(canonical: Path, preserve_dir: Path, *, game_name: str = ""
                 remove_link(form)
             else:
                 form.unlink()
-        os.replace(src, form)
+        replace_rw(src, form)
         if index is not None:
             try:
                 index.rename(src, form)

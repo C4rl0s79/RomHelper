@@ -31,8 +31,14 @@ def settle() -> None:
 @contextmanager
 def long_operation():
     """Na czas długiej operacji: zamrożone, co już jest (DAT-y itp.); na końcu
-    OSTATNIEJ zagnieżdżonej operacji — odmrożenie i JEDNO pełne zebranie (jedna
-    pauza w chwili zakończenia zamiast co kilkanaście sekund w trakcie)."""
+    OSTATNIEJ zagnieżdżonej operacji — zebranie MŁODYCH pokoleń i ponowne
+    zamrożenie.
+
+    0.7.00: dawniej `unfreeze()` + PEŁNE `collect()` po wszystkich obiektach
+    — 24 s z GIL-em na końcu każdej operacji (okno „nie odpowiada", log
+    22:39 02.10), a odmrożone miliony obiektów wracały do każdego kolejnego
+    pełnego GC. Koszt: cykliczne śmieci sprzed zamrożenia zostają do końca
+    programu (zwykłe obiekty zwalnia licznik referencji)."""
     global _depth
     with _lock:
         _depth += 1
@@ -44,5 +50,5 @@ def long_operation():
             _depth -= 1
             last = _depth == 0
         if last:
-            gc.unfreeze()
-            gc.collect()
+            gc.collect(1)
+            gc.freeze()

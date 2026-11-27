@@ -21,6 +21,45 @@ ProgCB = Callable[[int, int, str], None]
 _CHUNK = 8 * 1024 * 1024        # 8 MiB — kompromis szybkość / częstość aktualizacji
 
 
+def _clear_readonly(path) -> bool:
+    """Zdejmuje atrybut „tylko do odczytu". True = był i został zdjęty."""
+    import stat
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if st.st_mode & stat.S_IWRITE:
+        return False                     # nie był tylko do odczytu
+    try:
+        os.chmod(path, st.st_mode | stat.S_IWRITE)
+    except OSError:
+        return False
+    return True
+
+
+def replace_rw(src, dst) -> None:
+    """`os.replace`, a gdy CEL ma atrybut tylko do odczytu (Windows: odmowa
+    dostępu) — zdejmij go i spróbuj raz jeszcze (0.7.07, user: pliki ReadOnly
+    w kolekcji podmieniamy jak pozostałe)."""
+    try:
+        os.replace(src, dst)
+    except PermissionError:
+        if not _clear_readonly(dst):
+            raise
+        os.replace(src, dst)
+
+
+def unlink_rw(path) -> None:
+    """`os.unlink`, a gdy plik ma atrybut tylko do odczytu — zdejmij go i
+    spróbuj raz jeszcze (0.7.07)."""
+    try:
+        os.unlink(path)
+    except PermissionError:
+        if not _clear_readonly(path):
+            raise
+        os.unlink(path)
+
+
 def atomic_write_text(path, text: str, *, backup: bool = False,
                       encoding: str = "utf-8") -> Path:
     """JEDYNY sposób zapisu plików konfiguracyjnych: treść do pliku
@@ -245,12 +284,12 @@ def move_with_progress(src, dst, on_progress: Optional[ProgCB] = None,
     if ensure_parent:
         dst.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.replace(src, dst)        # atomowy rename (ten sam dysk)
+        replace_rw(src, dst)        # atomowy rename (ten sam dysk)
         return
     except FileNotFoundError:
         if not ensure_parent and src.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)   # katalog jednak znikł
-            os.replace(src, dst)
+            replace_rw(src, dst)
             return
         raise
     except OSError:
@@ -279,7 +318,7 @@ def move_with_progress(src, dst, on_progress: Optional[ProgCB] = None,
                     pass
         if not sent:
             copy_with_progress(src, tmp, on_progress, label, chunk=UPLOAD_CHUNK)
-        os.replace(tmp, dst)
+        replace_rw(tmp, dst)
     except BaseException:
         try:
             tmp.unlink()
@@ -287,6 +326,6 @@ def move_with_progress(src, dst, on_progress: Optional[ProgCB] = None,
             pass
         raise
     try:
-        os.unlink(src)              # źródło usuwamy dopiero po udanej kopii
+        unlink_rw(src)              # źródło usuwamy dopiero po udanej kopii
     except OSError:
         pass

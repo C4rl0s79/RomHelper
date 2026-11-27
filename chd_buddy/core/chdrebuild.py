@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from .fileops import replace_rw, unlink_rw
 from .cuelib import CueLibrary
 from .models import CD_METADATA_TAGS, MediaType
 
@@ -309,7 +310,7 @@ def _free_sources(scratch, keep: Path) -> None:
             fp = os.path.join(dirpath, f)
             if os.path.normcase(fp) != keep_n:
                 try:
-                    os.unlink(fp)
+                    unlink_rw(fp)
                 except OSError:
                     pass
 
@@ -663,24 +664,60 @@ def rebuild_bad_chds(
     targets: list = []          # (chd_path, game_name, hit)
     skipped_done = 0            # już potwierdzone jako poprawne (bez NAS)
     unknown = 0                 # podgląd: nagłówek nieznany w indeksie
+    def _consider(chd_path: Path, game_name: str, hit) -> None:
+        nonlocal skipped_done, unknown
+        # SZYBKIE WZNAWIANIE: plik już potwierdzony jako poprawny (DVD:
+        # kontener DVD; CD: układ ścieżek zgodny z DAT) — POMIŃ bez czytania
+        # nagłówka z NAS. Nie-potwierdzone trafiają do SPRAWDZENIA.
+        if _already_ok(chd_path, hit[0]):
+            skipped_done += 1
+            st.ok_layout += 1
+            return
+        verdict = _header_verdict(chd_path, hit)
+        if verdict is True:                  # zgodny wg nagłówka z indeksu
+            _mark_ok(chd_path, hit[0])
+            skipped_done += 1
+            st.ok_layout += 1
+            return
+        if verdict is None and dry_run:      # podgląd NIE czyta nagłówków
+            unknown += 1
+            return
+        targets.append((chd_path, game_name, hit))
+
     for entry in entries:
-        # ISTNIENIE <gra>.chd z INDEKSU (jedno zapytanie na katalog), NIE
-        # `is_file` per gra: PSX = ~4600 gier z DAT-u → ~3 min szeregowych
-        # zapytań SMB w CISZY przed pierwszą linią logu („program zawieszony").
-        # Odbudowę i tak poprzedza odczyt nagłówka pliku (błąd = pominięcie).
-        present = None
-        if index is not None:
-            try:
-                present = {os.path.normcase(r["path"])
-                           for r in index.all_under(entry.target_dir)
-                           if r["path"].lower().endswith(".chd")}
-            except Exception:
-                present = None
         _ng = len(entry.games)
+        if index is not None:
+            # CHD gry = CHD o odcisku TREŚCI gry (`data_sha1` = profil), pod
+            # DOWOLNĄ nazwą — jak w gałęzi ToSort niżej (0.7.09). Dawniej
+            # `<gra>.chd` PO NAZWIE: obcy CHD pod nazwą gry szedł do odbudowy
+            # wg cue tej gry, a CHD gry pod inną nazwą był pomijany. Jedno
+            # zapytanie na katalog (bez NAS).
+            try:
+                rows = index.identified_chds_under(entry.target_dir)
+            except Exception:
+                rows = []
+            names = {}
+            for g in entry.games:
+                data = g.data_roms
+                pr = game_profile(data) if data else ""
+                if pr:
+                    names[pr.lower()] = g.name
+            for _ri, row in enumerate(rows, 1):
+                if _cancelled():
+                    break
+                if on_progress and (_ri % 25 == 0 or _ri == len(rows)):
+                    on_progress(_ri, len(rows),
+                                f"Odbudowa CHD — przeliczam: {Path(row['path']).name}")
+                prof = (row["data_sha1"] or "").lower()
+                hit = by_prof.get(prof)
+                if hit is None or prof not in names:
+                    continue                     # treść spoza gier TEGO DAT-u
+                _consider(Path(row["path"]), names[prof], hit)
+            continue
+        # bez indeksu (narzędzia/testy): `<gra>.chd` z dysku
         for _gi, game in enumerate(entry.games, 1):
             if _cancelled():
                 break
-            # WIDOCZNOŚĆ: które gry i ile zostało (co 25, by nie zalać GUI)
             if on_progress and (_gi % 25 == 0 or _gi == _ng):
                 on_progress(_gi, _ng, f"Odbudowa CHD — przeliczam: {game.name}")
             data = game.data_roms
@@ -688,28 +725,9 @@ def rebuild_bad_chds(
             if hit is None:
                 continue
             chd_path = Path(entry.target_dir) / f"{game.name}.chd"
-            if present is not None:
-                if os.path.normcase(os.path.abspath(str(chd_path))) not in present:
-                    continue
-            elif not chd_path.is_file():
+            if not chd_path.is_file():
                 continue
-            # SZYBKIE WZNAWIANIE: plik już potwierdzony jako poprawny (DVD:
-            # kontener DVD; CD: układ ścieżek zgodny z DAT) — POMIŃ bez czytania
-            # nagłówka z NAS. Nie-potwierdzone trafiają do SPRAWDZENIA.
-            if _already_ok(chd_path, hit[0]):
-                skipped_done += 1
-                st.ok_layout += 1
-                continue
-            verdict = _header_verdict(chd_path, hit)
-            if verdict is True:                  # zgodny wg nagłówka z indeksu
-                _mark_ok(chd_path, hit[0])
-                skipped_done += 1
-                st.ok_layout += 1
-                continue
-            if verdict is None and dry_run:      # podgląd NIE czyta nagłówków
-                unknown += 1
-                continue
-            targets.append((chd_path, game.name, hit))
+            _consider(chd_path, game.name, hit)
     # ToSort: zidentyfikowane CHD leżące jeszcze poza targetem (kontener w miejscu)
     for root in (extra_roots or []):
         if index is None or _cancelled():
@@ -943,7 +961,7 @@ def _prep_cd(chd_path: Path, game_name: str, data, cue_rom, cue_bytes: bytes,
                 log(f"   {b.name}: suma nie zgadza się z DAT-em")
                 break
             t = split / rom.name
-            os.replace(b, t)
+            replace_rw(b, t)
             tracks.append(t)
     else:
         tracks = None

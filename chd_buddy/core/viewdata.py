@@ -86,14 +86,18 @@ def live_view(entries: Sequence, states: dict, dat_root,
 def prepare_view(entries: Sequence, *, reports=None, save: bool = False,
                  dat_root=None, tosort_dirs: Sequence = (), rom_root=None,
                  saved=None, log: Optional[Callable[[str], None]] = None,
-                 progress: Optional[Callable] = None) -> dict:
+                 progress: Optional[Callable] = None,
+                 snapshot_roots: Optional[tuple] = None) -> dict:
     """Wszystko, czego drzewo DAT-ów potrzebuje po operacji.
 
     reports — świeże raporty (skan / podgląd); `save` — zapisz je do stanu
     (DOKŁADAJĄC do zapamiętanego — DAT-y wyłączone w tym skanie zachowują
     ostatni stan); `saved` — (saved_at, states) już wczytane (bez ponownego
-    odczytu)."""
-    from .datcache import load_report_states, save_report_states
+    odczytu). Bez `saved`: liczby z INDEKSU LICZB, stan gier leniwie per DAT
+    (0.6.99 — bez 12 s wczytywania stanu wszystkich DAT-ów).
+    `snapshot_roots` = (DatRoot, rom_root) jak w ustawieniach okna → zapis
+    pliku stanu kolekcji (start bez liczenia)."""
+    from .datcache import LazyStates, load_counts, save_report_states
     if progress:
         progress(0, 0, "przygotowuję widok…")
     view: dict = {"variant_index": None, "trans_store": None,
@@ -107,14 +111,35 @@ def prepare_view(entries: Sequence, *, reports=None, save: bool = False,
                 log(f"UWAGA: {view['error']}")
     if saved is None:
         try:
-            saved = load_report_states(known_keys={dat_key(e) for e in entries})
+            saved_at, idx_counts = load_counts([dat_key(e) for e in entries])
         except Exception as e:
-            saved = (None, {})
+            saved_at, idx_counts = None, {}
             if log:
-                log(f"UWAGA: nie wczytano stanu raportu: {e}")
-    view["saved_at"], view["states"] = saved
-    view["counts"] = dat_counts(entries, view["states"], reports)
+                log(f"UWAGA: nie wczytano liczb raportu: {e}")
+        view["saved_at"] = saved_at
+        view["states"] = LazyStates(any_saved=bool(idx_counts))
+        counts = dict(idx_counts)
+        counts.update(dat_counts(entries, {}, reports))   # świeże raporty
+        view["counts"] = counts
+    else:
+        view["saved_at"], view["states"] = saved
+        view["counts"] = dat_counts(entries, view["states"], reports)
     view.update(tree_extras(entries, dat_root, tosort_dirs))
+    try:
+        from .folder_order import load_order
+        view["order"] = load_order(Path(str(dat_root))) if dat_root else None
+    except Exception:
+        view["order"] = None
+    if snapshot_roots:
+        try:
+            from .datstore import failed_dats
+            from .snapshot import save_snapshot
+            save_snapshot(entries, snapshot_roots[0], snapshot_roots[1],
+                          skip=view.get("skip"), tosort=view.get("tosort"),
+                          order=view.get("order"), failed=failed_dats())
+        except Exception as e:
+            if log:
+                log(f"UWAGA: nie zapisano pliku stanu kolekcji: {e}")
     # tłumaczenia + podsumowanie gier (tylko przy świeżych raportach)
     if reports is not None:
         try:

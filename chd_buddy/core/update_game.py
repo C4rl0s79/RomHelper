@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from .fileops import replace_rw, unlink_rw
 from .datfile import DatRom
 from .fileindex import hash_file
 
@@ -110,7 +111,7 @@ def update_dat_file(dat_path: Path, game_name: str, new_roms: List[DatRom], *,
             log(f"DAT: kopia zapasowa {bak.name}")
     tmp = dat_path.with_name(dat_path.name + ".chdbuddy_tmp")
     tmp.write_text(new_text, encoding="utf-8")
-    os.replace(tmp, dat_path)
+    replace_rw(tmp, dat_path)
     log(f"DAT: zaktualizowano wpis '{game_name}' ({len(new_roms)} ROM-ów)")
     return True
 
@@ -196,9 +197,8 @@ def apply_update(plan: UpdatePlan, *, index=None, tosort: Optional[Path],
         if delete_old:
             log(f"KASUJ starą: {old}")
             try:
-                old.unlink()
-                if index is not None:
-                    index.remove_path(old)
+                from .fileindex import unlink_tracked
+                unlink_tracked(old, index)
             except OSError as e:
                 log(f"  nie skasowano {old}: {e}")
                 move_failed = True
@@ -225,7 +225,7 @@ def apply_update(plan: UpdatePlan, *, index=None, tosort: Optional[Path],
     # 3) ZATWIERDŹ nowe pliki (rename staged → cel; atomowo, ten sam wolumin).
     for tmp, dest in staged:
         try:
-            os.replace(str(tmp), str(dest))
+            replace_rw(str(tmp), str(dest))
             if index is not None:
                 r = next((r for r in plan.new_roms
                           if r.name == dest.name), None)

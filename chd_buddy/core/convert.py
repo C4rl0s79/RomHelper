@@ -23,9 +23,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from .fileops import replace_rw, unlink_rw
 from .paths import is_protected as _is_prot
 from . import netguard
-from .fileindex import hash_file
+from .fileindex import hash_file, unlink_tracked
 
 LogCB = Callable[[str], None]
 
@@ -40,6 +41,10 @@ class ConvertResult:
     ok: bool
     dst: Optional[Path] = None
     message: str = ""
+    # (crc32, md5, sha1) pliku wynikowego, gdy policzone bez ponownego odczytu
+    # (przepakowanie w RAM, 0.7.06) — wołający nie czyta pliku z NAS jeszcze raz
+    sums: Optional[tuple] = None
+    tz: int = -1                       # status TorrentZip wyniku (1/0, -1 = nie wiem)
 
 
 # --- wykrywanie narzędzi ------------------------------------------------------
@@ -125,7 +130,7 @@ def pack_zip(files: Sequence[Path], dst_zip: Path, *,
     except (OSError, zipfile.BadZipFile) as e:
         tmp.unlink(missing_ok=True)
         return ConvertResult(False, message=f"ZIP weryfikacja: {e}")
-    os.replace(tmp, dst_zip)
+    replace_rw(tmp, dst_zip)
     _n = len(files) + len(list(empty_entries))
     log(f"  ZIP OK: {dst_zip.name} ({_n} plików, zweryfikowane)")
     return ConvertResult(True, dst=dst_zip)
@@ -174,6 +179,80 @@ def zip_needs_repack(zip_path: Path, method: str) -> bool:
     return bool(used - acc)
 
 
+# zip do tej wielkości przepakowywany w całości w pamięci (0.7.06)
+RAM_REPACK_MAX = 256 * 1024 * 1024
+
+
+def _data_sums(data: bytes) -> tuple:
+    """(crc32, md5, sha1) bajtów — w formacie `hash_file`."""
+    import hashlib
+    import zlib
+    return (f"{zlib.crc32(data) & 0xFFFFFFFF:08x}",
+            hashlib.md5(data).hexdigest(), hashlib.sha1(data).hexdigest())
+
+
+def _repack_tz_in_ram(zip_path: Path, acc: set, *, log: LogCB,
+                      on_progress=None) -> Optional[ConvertResult]:
+    """Przepakowanie do TorrentZip z JEDNYM odczytem i JEDNYM zapisem na
+    dysku (NAS: każda operacja na pliku to rundy SMB, ~0,3–0,5 s przez
+    Tailscale; dawniej ~15 na zip). Metoda, status TZ, sumy członków,
+    przepakowanie, weryfikacja i sumy NOWEGO pliku — w pamięci. Podmiana
+    atomowa (tmp → replace). None = plik większy niż RAM_REPACK_MAX."""
+    import hashlib
+    import io
+    import tempfile as _tf
+    from .torrentzip import repack_to_torrentzip, torrentzip_status_bytes
+    try:
+        with open(zip_path, "rb") as f:
+            if os.fstat(f.fileno()).st_size > RAM_REPACK_MAX:
+                return None
+            data = f.read()
+    except OSError as e:
+        return ConvertResult(False, message=f"repack ZIP {zip_path.name}: {e}")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zin:
+            infos = [i for i in zin.infolist() if not i.is_dir()]
+            if (not ({i.compress_type for i in infos} - acc)
+                    and torrentzip_status_bytes(data) == 1):
+                # już w tej postaci
+                return ConvertResult(True, dst=zip_path, sums=_data_sums(data),
+                                     tz=1)
+            want = {}
+            for k, i in enumerate(infos, 1):
+                if on_progress is not None:
+                    on_progress(k, len(infos), f"sumy {zip_path.name}: "
+                                f"{i.filename} ({k}/{len(infos)})")
+                want[i.filename] = hashlib.sha1(zin.read(i.filename)).hexdigest()
+        out = io.BytesIO()
+        repack_to_torrentzip(
+            io.BytesIO(data), out, verify_sha1=want, label=zip_path.name,
+            on_progress=(None if on_progress is None else
+                         (lambda d, t, lab: on_progress(d, t, f"przepakowuję {lab}"))))
+        new = out.getvalue()
+    except (zipfile.BadZipFile, ValueError, OSError) as e:
+        return ConvertResult(False, message=f"repack ZIP {zip_path.name}: {e}")
+    # UNIKALNY plik tymczasowy (mkstemp = O_EXCL, patrz niżej) — zapis do jego
+    # deskryptora, bez ponownego otwierania
+    try:
+        fd, tmp = _tf.mkstemp(prefix=zip_path.stem + ".",
+                              suffix=".chdbuddy_repack.zip",
+                              dir=str(zip_path.parent))
+    except OSError as e:
+        return ConvertResult(False, message=f"repack ZIP {zip_path.name}: {e}")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(new)
+        replace_rw(tmp, zip_path)
+    except OSError as e:
+        try:
+            unlink_rw(tmp)
+        except OSError:
+            pass
+        return ConvertResult(False, message=f"repack ZIP {zip_path.name}: {e}")
+    log(f"  ZIP przepakowany → TorrentZip: {zip_path.name}")
+    return ConvertResult(True, dst=zip_path, sums=_data_sums(new), tz=1)
+
+
 def repack_zip(zip_path: Path, *, method: str = "deflate", level: int = 6,
                log: LogCB = lambda m: None,
                dry_run: bool = False, on_progress=None) -> ConvertResult:
@@ -189,6 +268,11 @@ def repack_zip(zip_path: Path, *, method: str = "deflate", level: int = 6,
         return ConvertResult(False,
             message="ZSTD niedostępny w tym Pythonie (potrzebny 3.14+)")
     _deflate = str(method).lower() != "zstd"
+    if _deflate and not dry_run:
+        r = _repack_tz_in_ram(Path(zip_path), acc, log=log,
+                              on_progress=on_progress)
+        if r is not None:
+            return r                       # None = za duży na RAM → strumieniowo
     if not zip_needs_repack(zip_path, method):
         # deflate = TorrentZip (0.6.95): poprawna metoda, ale nie TorrentZip →
         # dalej do przepakowania
@@ -214,30 +298,21 @@ def repack_zip(zip_path: Path, *, method: str = "deflate", level: int = 6,
     tmp = Path(_tmp)
     if _deflate:
         # TorrentZip (bitowo jak RomVault): klasyczny zlib, stała postać
+        # JEDEN odczyt źródła (0.7.06): SHA-1 członków liczone przy kompresji,
+        # weryfikacja i sumy pliku z lokalnej kopii — dawniej duży zip (MSU-1,
+        # do 1,2 GB) szedł z NAS 3× (sumy, przepakowanie, sumy nowego pliku)
         from .torrentzip import repack_to_torrentzip
         try:
-            with zipfile.ZipFile(zip_path) as zin:
-                infos = [i for i in zin.infolist() if not i.is_dir()]
-                want = {}
-                for k, i in enumerate(infos, 1):
-                    if on_progress is not None:
-                        on_progress(k, len(infos), f"sumy {zip_path.name}: "
-                                    f"{i.filename} ({k}/{len(infos)})")
-                    h = hashlib.sha1()
-                    with zin.open(i.filename) as fh:
-                        for b in iter(lambda: fh.read(4 << 20), b""):
-                            h.update(b)
-                    want[i.filename] = h.hexdigest()
-            repack_to_torrentzip(
-                zip_path, tmp, verify_sha1=want, label=zip_path.name,
+            sums = repack_to_torrentzip(
+                zip_path, tmp, verify_read=True, label=zip_path.name,
                 on_progress=(None if on_progress is None else
                              (lambda d, t, lab: on_progress(d, t, f"przepakowuję {lab}"))))
         except (OSError, zipfile.BadZipFile, ValueError) as e:
             tmp.unlink(missing_ok=True)
             return ConvertResult(False, message=f"repack ZIP {zip_path.name}: {e}")
-        os.replace(tmp, zip_path)
+        replace_rw(tmp, zip_path)
         log(f"  ZIP przepakowany → TorrentZip: {zip_path.name}")
-        return ConvertResult(True, dst=zip_path)
+        return ConvertResult(True, dst=zip_path, sums=sums, tz=1)
     try:
         def _step(stage: str, k: int, n: int, name: str) -> None:
             if on_progress is not None:
@@ -269,7 +344,7 @@ def repack_zip(zip_path: Path, *, method: str = "deflate", level: int = 6,
     except (OSError, zipfile.BadZipFile) as e:
         tmp.unlink(missing_ok=True)
         return ConvertResult(False, message=f"repack ZIP {zip_path.name}: {e}")
-    os.replace(tmp, zip_path)
+    replace_rw(tmp, zip_path)
     log(f"  ZIP przepakowany → {target_name}: {zip_path.name}")
     return ConvertResult(True, dst=zip_path)
 
@@ -305,7 +380,7 @@ def disc_to_chd(main_file: Path, dst_chd: Path, chdman, settings, *,
         return ConvertResult(False, message=out.message)
     made = dst_chd.parent / (main_file.stem + ".chd")
     if made != dst_chd and made.is_file():
-        os.replace(made, dst_chd)
+        replace_rw(made, dst_chd)
     log(f"  CHD OK: {dst_chd.name} (round-trip zweryfikowany)")
     return ConvertResult(True, dst=dst_chd)
 
@@ -332,7 +407,7 @@ def disc_archive_to_chd(archive: Path, dst_chd: Path, chdman, settings, *,
                     if p.is_file() and p.parent != work:
                         tgt = work / p.name          # spłaszcz do korzenia
                         if not tgt.exists():
-                            os.replace(p, tgt)
+                            replace_rw(p, tgt)
                 extracted = [p for p in work.iterdir() if p.is_file()]
             else:
                 with zipfile.ZipFile(archive) as zf:
@@ -413,7 +488,7 @@ def iso_to_rvz(iso: Path, dst_rvz: Path, dolphintool: Path, *,
     except OSError as e:
         tmp.unlink(missing_ok=True)
         return ConvertResult(False, message=f"DolphinTool: {e}")
-    os.replace(tmp, dst_rvz)
+    replace_rw(tmp, dst_rvz)
     log(f"  RVZ OK: {dst_rvz.name} (DolphinTool verify)")
     return ConvertResult(True, dst=dst_rvz)
 
@@ -439,6 +514,28 @@ _CHD_SOURCE_EXTS = {"cue", "gdi", "toc", "iso", "img"}
 # rozszerzenia OPISU ścieżek (nie niosą danych — matcher może ich nie mieć, a
 # my zsyntetyzujemy je z torów danych).
 _DISC_DESC_EXTS = {"cue", "gdi", "toc"}
+
+
+def _conv_candidate(game, sts, fmt: str) -> bool:
+    """Czy gra dojdzie do KONWERSJI w `convert_from_source` — te same warunki
+    ze statusów, w tej samej kolejności co w pętli (bez sprawdzeń indeksu).
+    Tylko do paska postępu (0.7.07); decyzje podejmuje pętla."""
+    from .matcher import RomState
+    if not sts:
+        return False
+    miss = [s for s in sts if s.state in (RomState.MISSING, RomState.NO_HASH)]
+    if miss and not (fmt == "chd" and all(
+            s.rom.name.rsplit(".", 1)[-1].lower() in _DISC_DESC_EXTS
+            for s in miss)):
+        return False
+    if any(s.via_chd or s.via_archive for s in sts):
+        return False
+    if all(r.name.lower().endswith("." + fmt) for r in game.roms):
+        return False
+    if all(s.state in (RomState.HAVE, RomState.HAVE_CHD) for s in sts):
+        return fmt == "chd" and not any(s.state == RomState.HAVE_CHD
+                                        for s in sts)
+    return True
 
 
 def _track_no(name: str) -> int:
@@ -501,9 +598,9 @@ def _content_matches_game(chd_path: Path, game, chdman, work_dir: Path,
 
 
 def _indexed_by_parent(index, target_dir: Path):
-    """{normcase(katalog): [ścieżki]} fizycznych plików pod `target_dir` —
-    JEDNO zapytanie do indeksu zamiast `is_file`/`islink` per ROM na NAS.
-    None, gdy indeksu brak (wtedy wołający sprawdza dysk)."""
+    """{normcase(katalog): {normcase(ścieżka): wiersz}} fizycznych plików pod
+    `target_dir` — JEDNO zapytanie do indeksu (ścieżki i SUMY) zamiast
+    `is_file`/`islink` per ROM na NAS. None, gdy indeksu brak."""
     if index is None:
         return None
     try:
@@ -514,36 +611,44 @@ def _indexed_by_parent(index, target_dir: Path):
     for r in rows:
         p = Path(r["path"])
         out.setdefault(os.path.normcase(str(p.parent)), {})[
-            os.path.normcase(str(p))] = p
+            os.path.normcase(str(p))] = r
     return out
 
 
 def _game_physical_files(target_dir: Path, game, subdir: bool,
                          indexed=None) -> list[Path]:
-    """Fizyczne (nie-symlink) pliki gry w kanonicznej lokalizacji.
+    """Fizyczne pliki gry w miejscu kanonicznym — TYLKO te, których TREŚĆ
+    (sumy z indeksu) to ROM-y gry z DAT-u (0.7.09). Dowolny niepusty ROM
+    nieobecny albo z INNĄ treścią → [] (gra nie jest gotowa do konwersji).
+    Dawniej: pliki po NAZWACH z DAT-u, a dla gry wieloplikowej WSZYSTKO z
+    podfolderu `<gra>\\` — bez sprawdzenia sum (spakowany port Half-Life).
 
-    `indexed` (z `_indexed_by_parent`) — odpowiedź z INDEKSU, bez rund SMB.
-    Dawniej 2 rundy NAS (is_file + islink) na KAŻDY ROM każdej gry także wtedy,
-    gdy nie było nic do konwersji (Amiga: ~110 s ciszy na katalog). Wynik z
-    indeksu służy do DECYZJI; przed faktyczną konwersją wołający sprawdza dysk."""
-    if indexed is not None:
-        if subdir and len(game.roms) > 1:
-            d = target_dir / game.name
-            return sorted(indexed.get(os.path.normcase(str(d)), {}).values())
-        here = indexed.get(os.path.normcase(str(target_dir)), {})
-        return sorted({here[k] for k in (
-            os.path.normcase(str(target_dir / r.name)) for r in game.roms)
-            if k in here})
-    if subdir and len(game.roms) > 1:
-        d = target_dir / game.name
-        if not d.is_dir():
+    `indexed` (z `_indexed_by_parent`) — odpowiedź z INDEKSU, bez rund SMB;
+    przed faktyczną konwersją wołający sprawdza dysk. Bez indeksu (testy,
+    narzędzia) — pliki pod nazwami ROM-ów z dysku."""
+    from .matcher import _is_empty_rom, _row_full_match
+    d = (target_dir / game.name if subdir and len(game.roms) > 1
+         else target_dir)
+    if indexed is None:
+        files = [d / r.name for r in game.roms]
+        return [f for f in files if f.is_file() and not os.path.islink(f)]
+    here = indexed.get(os.path.normcase(str(d)), {})
+    files: list = []
+    for rom in game.roms:
+        f = d / rom.name
+        row = here.get(os.path.normcase(str(f)))
+        if _is_empty_rom(rom):
+            if row is not None:
+                files.append(Path(row["path"]))
+            continue
+        # ta sama TREŚĆ: wszystkie podane sumy zgodne I choć jedna faktycznie
+        # porównana (wiersz bez sum — np. niezahashowany — to nie dowód)
+        if (row is None or not _row_full_match(row, rom)
+                or not ((rom.sha1 and row["sha1"])
+                        or (rom.crc and row["crc32"]))):
             return []
-        files = [p for p in sorted(d.iterdir()) if p.is_file()]
-    else:
-        files = [target_dir / r.name for r in game.roms]
-        files = [f for f in files if f.is_file()]
-    # tylko fizyczne kopie (dzieci-symlinki obsługiwane osobno)
-    return [f for f in files if not os.path.islink(f)]
+        files.append(Path(row["path"]))
+    return sorted(files)
 
 
 @dataclass
@@ -597,6 +702,9 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
         subdir = bool(eff.get("subdir_per_game", True))
         # pliki z INDEKSU (1 zapytanie na katalog) — decyzja bez rund SMB
         _idx_files = _indexed_by_parent(index, rep.entry.target_dir)
+        _sts_by_game: dict = {}
+        for _s in getattr(rep, "statuses", ()) or ():
+            _sts_by_game.setdefault(_s.game, []).append(_s)
         for game in rep.entry.games:
             if cancel is not None and cancel.is_set():
                 break
@@ -610,7 +718,24 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
             if cur != "loose":
                 st.skipped += 1        # np. już chd/zip w innym docelowym — pomiń
                 continue
-            if _idx_files is not None:
+            # plik, który nie jest obrazem gry (DAT dir2dat folderu frontendu:
+            # .pak/.cfg/.ips/.ini/.jpg/.libretro…) — formatu nie zmieniamy
+            # (0.7.07: port Half-Life i Singe spakowane do zipów)
+            from .frontend import is_disc_image, is_not_rom_file
+            if any(is_not_rom_file(f.name) for f in files):
+                continue
+            # obraz płyty NIGDY do archiwum (user 05.10: kartridż → zip,
+            # płyta → CHD, a gdy emulator nie obsługuje CHD — bez zmian;
+            # Dolphin/Flycast nie czytają ISO z zipa — triforce)
+            if fmt in ("zip", "7z") and any(is_disc_image(f.name) for f in files):
+                continue
+            # gra zaspokojona CAŁYM ARCHIWUM (link/przeniesienie z DAT-u wyżej —
+            # matcher, 0.7.07) — luźne pliki są zbędne, nie pakujemy ich; w
+            # podglądzie indeks jeszcze ich nie zna jako zastąpionych
+            if any(getattr(s, "via_archive", False)
+                   for s in _sts_by_game.get(game.name, ())):
+                continue
+            if _idx_files is not None and not dry_run:
                 # REALNA konwersja → potwierdź stan na dysku (indeks mógł się
                 # rozjechać); dopiero tu dotykamy NAS, i tylko dla tej gry
                 files = [f for f in files
@@ -633,7 +758,7 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
             if _is_prot(f):
                 continue                      # biblioteka cue — tylko odczyt
             try:
-                os.unlink(f)
+                unlink_rw(f)
                 if index is not None:
                     index.remove_path(f)
             except OSError:
@@ -814,7 +939,8 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB,
 
 def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
                                    log: LogCB, needed_crc=None,
-                                   kept_shared=None, dry_run: bool = False) -> int:
+                                   kept_shared=None, dry_run: bool = False,
+                                   dat_known=None) -> int:
     """Kasuje z ToSort ŹRÓDŁO gry JUŻ zrobionej na CHD (w docelowym): luźne
     pliki ścieżek ORAZ archiwa ZIP/7z zawierające te ścieżki.
 
@@ -869,8 +995,8 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
                     f"): {p2}")
                 continue
             try:
-                os.unlink(p2)
-                index.remove_path(p2)
+                if not unlink_tracked(p2, index):
+                    continue                  # już skasowany w tym przebiegu
                 n += 1
                 touched_dirs.add(os.path.dirname(p2))
                 tag = ("nadmiarowy wspólny tor" if protected
@@ -913,6 +1039,11 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
             if mc and msz and (mc, msz) in needed_crc:
                 protected = True
                 break
+            # członek NIEZNANY żadnemu DAT-owi (0.7.05, zasada usera): nie
+            # kasujemy z nim archiwum — finał przeniesie je do ToSort\nieznane
+            if dat_known is not None and msz and not dat_known(mc, msz):
+                protected = True
+                break
         if protected or _is_prot(ap):
             continue                          # ZIP potrzebny innej grze / biblioteka cue
         if dry_run:
@@ -920,8 +1051,8 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
             log(f"(podgląd) KASUJ z ToSort archiwum (gra już na CHD): {ap}")
             continue
         try:
-            os.unlink(ap)
-            index.remove_path(ap)
+            if not unlink_tracked(ap, index):
+                continue                      # już skasowane w tym przebiegu
             n += 1
             touched_dirs.add(os.path.dirname(ap))
             log(f"KASUJ z ToSort archiwum (gra już na CHD): {ap}")
@@ -944,8 +1075,11 @@ def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
 
 
 def _purge_child_loose_duplicates(game, loose_by_sha1, needed_sha1, index,
-                                  log: LogCB, dry_run: bool) -> int:
-    """DZIECKO jest/będzie zaspokojone przez CHD (rodzica) — z jego KATALOGU
+                                  log: LogCB, dry_run: bool,
+                                  held_in: str = "CHD") -> int:
+    """`held_in` — gdzie żyje treść gry (do logu: ścieżka CHD albo archiwum;
+    0.7.10: dawniej zawsze „gra na CHD", także dla gier w zipie).
+    DZIECKO jest/będzie zaspokojone przez CHD (rodzica) — z jego KATALOGU
     DOCELOWEGO kasuje LUŹNE fizyczne pliki torów tej gry (błędnie wypakowane we
     wcześniejszym przebiegu). Ich zawartość żyje w CHD, więc to bezpieczne.
     Nie rusza plików .chd, symlinków ani sha1 potrzebnych niezaspokojonym grom
@@ -968,14 +1102,15 @@ def _purge_child_loose_duplicates(game, loose_by_sha1, needed_sha1, index,
             if _is_prot(p):
                 continue                      # biblioteka cue — tylko odczyt
             if dry_run:
-                log(f"  (podgląd) KASUJ luźny w dziecku: {p}")
+                log(f"  (podgląd) KASUJ luźny w dziecku (treść jest w "
+                    f"{held_in}): {p}")
                 n += 1
                 continue
             try:
-                os.unlink(p)
-                index.remove_path(p)
+                if not unlink_tracked(p, index):
+                    continue                  # już skasowany w tym przebiegu
                 n += 1
-                log(f"KASUJ luźny w dziecku (gra na CHD): {p}")
+                log(f"KASUJ luźny w dziecku (treść jest w {held_in}): {p}")
                 pd = Path(p).parent
                 parents[os.path.normcase(str(pd))] = pd
             except OSError as e:
@@ -1150,12 +1285,12 @@ def _defer_or_purge_game_sources(sts, shared_srcs, deferred, index, dry_run,
             log(f"  źródło współdzielone — skasuję po całości: {sp}")
         else:
             try:
-                os.unlink(sp)
-                if index is not None:
-                    index.remove_path(sp)
-                log(f"  KASUJ źródło: {sp}")
-                pd = Path(sp).parent
-                parents[os.path.normcase(str(pd))] = pd
+                # już skasowane (np. przez rodzica — dziecko ma statusy ze
+                # startu naprawy) = nic do zrobienia, nie błąd (0.7.07)
+                if unlink_tracked(sp, index):
+                    log(f"  KASUJ źródło: {sp}")
+                    pd = Path(sp).parent
+                    parents[os.path.normcase(str(pd))] = pd
             except OSError as e:
                 log(f"  nie skasowano źródła {sp}: {e}")
     # opustoszałe podkatalogi gry (jeśli część torów była współdzielona i poszła
@@ -1170,7 +1305,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         cancel=None, on_progress=None, detail=None,
                         on_converted=None, delete_roots=None, make_links=True,
                         slot=None, hierarchy=None, finals=None,
-                        only_complete: bool = True):
+                        only_complete: bool = True, dat_known=None):
     """Konwersja PROSTO ZE ŹRÓDŁA na RAM → w docelowym ląduje TYLKO finał.
 
     hierarchy — `Hierarchy` DAT-ów: JEDYNE źródło decyzji „link czy kopia
@@ -1262,6 +1397,28 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
     del_prefixes = dir_prefixes(delete_roots)
     n_total = sum(len(r.entry.games) for r in reports) or 1
     gi = 0
+    # PASEK (0.7.07): ile gier realnie pójdzie do konwersji — „650/3545" było
+    # numerem gry w DAT-ach katalogu (większość tylko sprawdzana)
+    conv_total = 0
+    for _rep in reports:
+        _eff = rules_fn(_rep.entry)
+        if _eff.get("skip"):
+            continue
+        _fmt = effective_format(_rep.entry, _eff)
+        if _fmt in ("keep", "", "extract"):
+            continue
+        _bg2: dict = {}
+        for _s in _rep.statuses:
+            _bg2.setdefault(_s.game, []).append(_s)
+        conv_total += sum(1 for _g in _rep.entry.games
+                          if _conv_candidate(_g, _bg2.get(_g.name), _fmt))
+    conv_total = conv_total or 1
+    conv_i = 0
+
+    def _prog(label: str) -> None:
+        if on_progress:
+            on_progress(min(conv_i, conv_total), conv_total,
+                        f"{label} · sprawdzono gier {gi}/{n_total}")
     # CACHE luźnych plików per KATALOG DOCELOWY (sha1 → [ścieżki]): budowany RAZ
     # z `index.all_under` przy pierwszej grze via_chd danego katalogu, reużywany
     # przez wszystkie kolejne gry tego katalogu. Bez tego `_purge_child_loose_
@@ -1429,13 +1586,14 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             if not netguard.checkpoint(cancel):    # NAS padł → czeka na powrót
                 break
             gi += 1
+            _counted = False                # gra policzona w pasku konwersji
             sts = by_game.get(game.name, [])
             if not sts:
                 continue
             if on_progress and (gi % 25 == 0):
                 # widać, która gra i ile zostało — także gdy kolejne gry są
                 # tylko sprawdzane (już na CHD) i nic nie trafia do logu
-                on_progress(gi, n_total, f"konwersja — sprawdzam: {game.name}")
+                _prog(f"konwersja — sprawdzam: {game.name}")
             # POSTĘP PRZERWANEJ NAPRAWY: gra JUŻ ma zweryfikowany <gra>.chd w
             # docelowym (indeks: fizyczny, `data_sha1==game_profile`). Naprawa
             # działa „z przepisu" (raporty z OSTATNIEGO skanu) — po przerwaniu i
@@ -1469,7 +1627,7 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                     st.tosort_purged += _purge_redundant_tosort_tracks(
                         game, index, del_prefixes, _needed_sha1, log,
                         needed_crc=_needed_crc, kept_shared=_kept_shared,
-                        dry_run=dry_run)
+                        dry_run=dry_run, dat_known=dat_known)
                 continue
             # DYSK w JEDNYM archiwum (cue/gdi + tory) → CHD: buduj CHD WPROST z
             # archiwum jego WŁASNYM cue (nazwy w środku pasują do torów). Ratuje
@@ -1513,6 +1671,9 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         and Path(next(iter(arch_srcs))).suffix.lower()
                         in (".zip", ".7z")):
                     arch = Path(next(iter(arch_srcs)))
+                    conv_i += 1
+                    _counted = True
+                    _prog(f"konwersja (ze źródła): {game.name}")
                     _pr0 = game_profile(game.data_roms)
                     # rejestracja keepera (platforma, odcisk) — dzieci linkują
                     # do niego, gdy pozwala hierarchia
@@ -1597,16 +1758,19 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 # LUŹNE fizyczne tory tej gry w katalogu DOCELOWYM (błędnie
                 # wypakowane wcześniej) — gra jest na CHD, więc je sprzątamy.
                 if index is not None:
+                    _held = next((s.source_path for s in sts
+                                  if (s.via_chd or s.via_archive)
+                                  and s.source_path), "CHD")
                     st.tosort_purged += _purge_child_loose_duplicates(
                         game, _loose_by_sha1(rep.entry.target_dir),
-                        _needed_sha1, index, log, dry_run)
+                        _needed_sha1, index, log, dry_run, held_in=_held)
                 # ALE gdy CHD jest JUŻ w docelowym (HAVE_CHD), a luźne ścieżki
                 # tej gry wciąż leżą w ToSort — posprzątaj je (redundantne).
                 if (del_prefixes and index is not None and is_havechd):
                     st.tosort_purged += _purge_redundant_tosort_tracks(
                         game, index, del_prefixes, _needed_sha1, log,
                         needed_crc=_needed_crc, kept_shared=_kept_shared,
-                        dry_run=dry_run)
+                        dry_run=dry_run, dat_known=dat_known)
                 continue
             # DAT „surowy" już W FORMACIE docelowym (np. NKit RVZ: ROM-y to pliki
             # .rvz z własną sumą) — konwersja nie ma czego robić (RVZ→RVZ dałby
@@ -1635,10 +1799,11 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         st.tosort_purged += _purge_redundant_tosort_tracks(
                             game, index, del_prefixes, _needed_sha1, log,
                             needed_crc=_needed_crc, kept_shared=_kept_shared,
-                            dry_run=dry_run)
+                            dry_run=dry_run, dat_known=dat_known)
                     continue
-            if on_progress:
-                on_progress(gi, n_total, f"konwersja (ze źródła): {game.name}")
+            if not _counted:
+                conv_i += 1
+            _prog(f"konwersja (ze źródła): {game.name}")
             key = f"{id(rep.entry)}::{game.name}"
             prof = game_profile(game.data_roms)
             pkey = _dedup_key(rep.entry, prof)
@@ -1735,7 +1900,8 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                 if not _disc_on_verified_chd(game, tdir, index, dry_run):
                     continue             # CHD niezweryfikowany → NIE kasujemy
                 st.tosort_purged += _purge_child_loose_duplicates(
-                    game, _lmap, _needed_sha1, index, log, dry_run)
+                    game, _lmap, _needed_sha1, index, log, dry_run,
+                    held_in=str(Path(tdir) / f"{game.name}.chd"))
     # NIE kasujemy tu — oryginalne źródła (unikalne) zwracamy, a kasuje je
     # dopiero KONIEC całej naprawy (po placemencie i fallbacku), żeby żadna
     # współdzielona ścieżka nie zniknęła zanim ktoś jej jeszcze potrzebuje.
@@ -1842,7 +2008,8 @@ def purge_loose_on_verified_chd(reports, rules_fn, index, *,
             if not _disc_on_verified_chd(game, tdir, index, dry_run):
                 continue                      # CHD niezweryfikowany → NIE kasujemy
             n += _purge_child_loose_duplicates(
-                game, lmap, needed_sha1, index, log, dry_run)
+                game, lmap, needed_sha1, index, log, dry_run,
+                held_in=str(Path(tdir) / f"{game.name}.chd"))
     return n
 
 
@@ -1874,6 +2041,10 @@ def _disc_on_verified_chd(game, target_dir, index, dry_run,
     crow = index.lookup(chd)
     if (crow is None or crow["is_link"] or crow["missing"]
             or (crow["data_sha1"] or "").lower() != prof.lower()):
+        return False
+    # nazwa co do litery jak w DAT-cie (0.7.04): „…HardCore 4X4…" pod
+    # „…Hardcore 4x4…" to ten sam plik, ale do NAZWA — nie „gotowe"
+    if Path(crow["path"]).name != chd.name:
         return False
     if not dry_run:
         if present is not None:
@@ -1946,7 +2117,7 @@ def _purge_redundant_target_archives(game, target_dir, index, log, dry_run,
             + f"KASUJ redundantne archiwum (gra jest na CHD): {arch}")
         if not dry_run:
             try:
-                os.unlink(arch)
+                unlink_rw(arch)
                 index.remove_path(arch)
             except OSError as e:
                 log(f"  nie skasowano {arch}: {e}")
@@ -1968,9 +2139,8 @@ def purge_source_files(paths, index=None, log: LogCB = lambda m: None,
         if _is_prot(p):
             continue                          # biblioteka cue — tylko odczyt
         try:
-            os.unlink(p)
-            if index is not None:
-                index.remove_path(p)
+            if not unlink_tracked(p, index):
+                continue                      # już skasowany w tym przebiegu
             n += 1
             pd = Path(p).parent
             parents[os.path.normcase(str(pd))] = pd
@@ -2605,7 +2775,7 @@ def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
                 if _is_prot(f):
                     continue                  # biblioteka cue — tylko odczyt
                 try:
-                    os.unlink(f)
+                    unlink_rw(f)
                     if index is not None:
                         index.remove_path(f)
                 except OSError:

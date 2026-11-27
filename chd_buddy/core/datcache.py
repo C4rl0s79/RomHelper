@@ -129,14 +129,170 @@ def save_report_states(reports, path: Optional[Path] = None) -> None:
     from datetime import datetime
     d.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
+    counts: dict = {}
     for rep in reports:
         key = str(Path(os.path.abspath(rep.entry.dat_path)))
-        _write_report_file(d, key, _compact(rep), now)
+        games = _compact(rep)
+        _write_report_file(d, key, games, now)
+        counts[key] = counts_of_compact(games)
+    # INDEKS LICZB (0.6.99) zapisany RAZEM ze stanem — start czyta tylko jego
+    # (drzewo z liczbami bez wczytywania 500 MB stanu wszystkich DAT-ów)
+    _update_counts(d, counts, now)
     # stan policzony z AKTUALNEGO indeksu → znacznik „nieaktualny" zdjęty
     try:
         (d / STALE_MARKER).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+COUNTS_FILENAME = "_counts.idx"   # NIE *.pkl — load_report_states go pomija
+COUNTS_VERSION = 1
+
+
+def counts_of_compact(games: dict) -> tuple:
+    """(gry, komplet, do naprawy, brak) ze ZWARTEGO stanu DAT-u."""
+    from .matcher import RomState, game_stats_from_states
+    return tuple(game_stats_from_states(
+        {g: {rn: RomState(v[0]) for rn, v in roms.items()}
+         for g, roms in games.items()}))
+
+
+def _read_counts(d: Path) -> dict:
+    try:
+        with open(d / COUNTS_FILENAME, "rb") as f:
+            blob = pickle.load(f)
+    except (OSError, pickle.PickleError, EOFError, AttributeError):
+        return {}
+    if not isinstance(blob, dict) or blob.get("version") != COUNTS_VERSION:
+        return {}
+    return blob
+
+
+def _update_counts(d: Path, counts: dict, saved_at: str) -> None:
+    """Dokłada liczby DAT-ów do indeksu (atomowo). Błąd zapisu nie przerywa."""
+    blob = _read_counts(d) or {"version": COUNTS_VERSION, "counts": {},
+                               "saved_at": {}}
+    nc = os.path.normcase
+    for k, v in counts.items():
+        blob["counts"][nc(k)] = tuple(v)
+        blob["saved_at"][nc(k)] = saved_at
+    dst = d / COUNTS_FILENAME
+    tmp = _tmp_for(dst)
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, dst)
+    except (OSError, pickle.PickleError):
+        _drop_tmp(tmp)
+
+
+def load_report_state(key: str, path: Optional[Path] = None) -> Optional[dict]:
+    """Stan JEDNEGO DAT-u {gra: {rom_lower: status}} albo None (brak/stary)."""
+    d = Path(path) if path else report_cache_path()
+    fp = _report_file(d, str(key))
+    try:
+        with open(fp, "rb") as f:
+            blob = pickle.load(f)
+    except (OSError, pickle.PickleError, EOFError, AttributeError):
+        return None
+    if not isinstance(blob, dict) or blob.get("version") != REPORT_CACHE_VERSION:
+        return None
+    return _expand(blob.get("games") or {})
+
+
+def load_counts(known_keys, path: Optional[Path] = None,
+                build_missing: bool = True):
+    """(saved_at, {dat_key: (gry, komplet, naprawa, brak)}) z indeksu liczb —
+    bez wczytywania stanu wszystkich DAT-ów. DAT, który ma plik stanu, a nie
+    ma liczb w indeksie (pierwszy start po aktualizacji), liczony raz z
+    własnego pliku i dopisywany (`build_missing`)."""
+    d = Path(path) if path else report_cache_path()
+    if path is None:
+        _migrate_legacy(d)
+    blob = _read_counts(d)
+    have = blob.get("counts", {}) if blob else {}
+    at = blob.get("saved_at", {}) if blob else {}
+    nc = os.path.normcase
+    out: dict = {}
+    missing: dict = {}
+    newest = None
+    for k in known_keys:
+        c = have.get(nc(k))
+        if c is not None:
+            out[k] = tuple(c)
+            a = at.get(nc(k))
+            if a and (newest is None or a > newest):
+                newest = a
+        elif build_missing and _report_file(d, str(k)).is_file():
+            try:
+                with open(_report_file(d, str(k)), "rb") as f:
+                    rb = pickle.load(f)
+            except (OSError, pickle.PickleError, EOFError, AttributeError):
+                continue
+            if (isinstance(rb, dict)
+                    and rb.get("version") == REPORT_CACHE_VERSION):
+                out[k] = counts_of_compact(rb.get("games") or {})
+                missing[k] = out[k]
+                a = rb.get("saved_at")
+                if a and (newest is None or a > newest):
+                    newest = a
+    if missing and d.is_dir():
+        from datetime import datetime
+        _update_counts(d, missing,
+                       newest or datetime.now().isoformat(timespec="seconds"))
+    return newest, out
+
+
+class LazyStates(dict):
+    """Stan DAT-ów wczytywany PRZY PIERWSZYM UŻYCIU (0.6.99), DAT po DAT-cie
+    — zamiast 515 MB / ~990 tys. gier naraz (12 s) przy starcie i po każdej
+    operacji. Zachowuje się jak dict {dat_key: {gra: {rom: status}}}."""
+
+    def __init__(self, known_keys=None, path: Optional[Path] = None,
+                 any_saved: bool = False):
+        super().__init__()
+        self._path = path
+        self._tried: set = set()
+        self._any = any_saved
+
+    def _ensure(self, key) -> None:
+        if dict.__contains__(self, key) or key in self._tried:
+            return
+        self._tried.add(key)
+        st = load_report_state(key, self._path)
+        if st is not None:
+            dict.__setitem__(self, key, st)
+
+    def get(self, key, default=None):
+        self._ensure(key)
+        return dict.get(self, key, default)
+
+    def __getitem__(self, key):
+        self._ensure(key)
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key) -> bool:
+        self._ensure(key)
+        return dict.__contains__(self, key)
+
+    def setdefault(self, key, default=None):
+        self._ensure(key)
+        return dict.setdefault(self, key, default)
+
+    def __bool__(self) -> bool:
+        return self._any or dict.__len__(self) > 0
+
+
+_SHARED_PARSE_CACHE = None
+
+
+def shared_parse_cache() -> "DatParseCache":
+    """Jeden `DatParseCache` na proces (doczytywanie gier DAT-ów z pliku
+    stanu — bez tworzenia obiektu i sprawdzania migracji per DAT)."""
+    global _SHARED_PARSE_CACHE
+    if _SHARED_PARSE_CACHE is None:
+        _SHARED_PARSE_CACHE = DatParseCache()
+    return _SHARED_PARSE_CACHE
 
 
 def _migrate_legacy(d: Path) -> None:

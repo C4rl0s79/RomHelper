@@ -60,8 +60,19 @@ class DatGame:
     @property
     def data_roms(self) -> List[DatRom]:
         """ROM-y niosące dane (bez samego .cue/.gdi)."""
-        return [r for r in self.roms
-                if Path(r.name).suffix.lower() not in (".cue", ".gdi")]
+        return [r for r in self.roms if _suffix_lc(r.name) not in (".cue", ".gdi")]
+
+
+def _suffix_lc(name: str) -> str:
+    """`Path(name).suffix.lower()` bez tworzenia obiektu `Path` (0.7.06:
+    TeknoParrot = 3 mln ROM-ów, `pathlib` liczył to sekundami). Ostatni
+    człon po „/" albo „\\"; część przed ostatnią kropką musi mieć znak inny
+    niż kropka („.cue", „..cue" — bez rozszerzenia) — jak w `pathlib` 3.14."""
+    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    i = base.rfind(".")
+    if i == -1 or not base[:i].lstrip("."):
+        return ""
+    return base[i:].lower()
 
 
 @dataclass

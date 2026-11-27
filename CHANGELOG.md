@@ -2,6 +2,841 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.7.10] — 2026-10-05
+
+### Konfiguracja usera (nie kod): reguła BIOS
+- `BIOS\\System.dat` (libretro) to JEDNA „gra" „System" z 396 plikami BIOS
+  wszystkich systemów (91 w podfolderach, np. `bk/…`); w kolekcji 279, brak
+  117 → przy „tylko kompletne" cała gra pomijana, `Z:\\ROMS\\BIOS\\System`
+  pusty; `format: zip` dałby jeden `System.zip`, którego rdzenie libretro nie
+  czytają. Za zgodą usera reguła `BIOS` w `DatRoot\\_reguly.json`:
+  `format: keep`, `only_complete: false`, `subdir_per_game: false` (kopia
+  `_reguly.json.bak-2026-10-05`, zapis atomowy).
+
+### Naprawa ma być kompletna: „Znajdź naprawy" tuż po naprawie = nic do zrobienia
+- DZIAŁANIE: naprawa 05.10 12:49–17:26 (0.7.09, bez błędów), zaraz potem
+  „Znajdź naprawy" (user: „nie powinno znaleźć jakichkolwiek napraw"):
+  12 × REPACK ZIP (fbneo: 720g, apb… — przeniesione w tej naprawie), 1 ×
+  KASUJ zbędną kopię (sierota) `No-intro\\FinalBurn Neo - Arcade Games\\
+  redearth.zip`, 2 × „KASUJ z ToSort (już na miejscu)" pustych zipów
+  Splinter Cell (Disc 2), 1 × „KASUJ z ToSort (zawartość już w kolekcji)"
+  `nieznane\\ports\\anarch.zip`.
+- ANALIZA — trzy błędy ogólne:
+  1. PUSTA treść traktowana jak tożsamość: każdy plik 0 B ma te same sumy;
+     dedup uznał puste zipy Splinter Cell za kopie pustego znacznika
+     TeknoParrot „Missing in Action" (utworzonego w tej naprawie);
+     `_purge_redundant_tosort_archives` pomija puste członki, więc zip z
+     SAMYMI pustymi (`anarch.libretro` 0 B) był „zawartością w kolekcji"
+     bez żadnego sprawdzenia. Matcher ma tę zasadę od dawna
+     (`_is_empty_rom`), reszta programu — nie.
+  2. Archiwum PRZENIESIONE na miejsce (etap 1) nie dostaje formatu katalogu:
+     przepakowanie TorrentZip w etapie 2 decyduje ze statusów sprzed
+     naprawy (status „gdzie indziej" nie ma flagi złego zipa) → kolejna
+     naprawa.
+  3. Sierota chroniona tylko dlatego, że matcher wybrał ją jako źródło
+     (alfabetycznie pierwsza z równych archiwów), choć gra dostała hardlink
+     do kopii w DAT-cie wyżej — `sweep_orphans` pomija każde „źródło".
+- MIEJSCA: `core/content.py` (`content_sets`), `rebuilder`:
+  `_content_placed_outside`, dedup w `_finalize_global`,
+  `_purge_redundant_tosort_archives`, `_place_archive` (+`_pending_tz`,
+  `run`), `sweep_orphans`.
+- ZMIANA:
+  1. Treść pusta (rozmiar 0 / sumy pustego pliku) nie jest „tą samą treścią"
+     ani „treścią w kolekcji"; archiwum bez niepustych członków nie jest
+     zbędne.
+  2. Zip położony przez naprawę (przeniesienie/kopia) w katalogu z metodą
+     deflate, nie-TorrentZip → przepakowanie w TEJ naprawie (etap 2 tego
+     katalogu; widoczne w podglądzie).
+  3. Plik w sierocie, którego treść leży na swoim miejscu w kolekcji →
+     KASUJ zbędną kopię także wtedy, gdy był wybrany jako źródło.
+- WPŁYW: druga naprawa po pełnej naprawie — bez tych operacji. Puste pliki
+  zostają tam, gdzie są (w ToSort/nieznane), nie są kasowane jako „kopie".
+- WERYFIKACJA: testy — pusty plik w ToSort i pusty znacznik w kolekcji: brak
+  KASUJ; zip z samymi pustymi członkami: nie „zbędny"; zip nie-TorrentZip
+  przeniesiony z ToSort/sieroty → TorrentZip w tej samej naprawie, druga
+  naprawa: nic; sierota-źródło z treścią w DAT-cie wyżej → skasowana.
+
+### Log „KASUJ luźny w dziecku" mówi, gdzie jest treść (nie zawsze „gra na CHD")
+- DZIAŁANIE: naprawa 05.10 (0.7.09): „KASUJ luźny w dziecku (gra na CHD):
+  Z:\\Arcade2\\RetroBat\\roms\\snes\\Batman Returns (USA).sfc" — user: „jak
+  może być sfc w chd? SNES nie ma gier na płytach".
+- ANALIZA: decyzja poprawna (0.7.07: gra = zip z ROMS\\snes, hardlink
+  utworzony w etapie 1 o 12:52, luźny `.sfc` skasowany w etapie 2 o 13:48 —
+  treść jest w zipie). Błędny tylko komunikat: `_purge_child_loose_duplicates`
+  powstało dla gier na CHD i od 0.7.07 obsługuje też gry zaspokojone
+  archiwum — tekst się nie zmienił.
+- MIEJSCA: `convert._purge_child_loose_duplicates` (+`held_in`) i jego 3
+  wywołania.
+- ZMIANA: log/podgląd: „KASUJ luźny w dziecku (treść jest w <ścieżka zipa
+  albo CHD>)".
+- WPŁYW: tylko tekst logu; decyzje bez zmian.
+- WERYFIKACJA: test naprawy RetroBat-snes: brak „na CHD", jest ścieżka zipa.
+
+## [0.7.09] — 2026-10-05
+
+### Audyt: tożsamość plików i gier wyłącznie po sumach (nie po nazwach)
+- DZIAŁANIE: user 05.10: „pliki od początku miały być sprawdzane po sumach,
+  a nie po nazwie; poprawki dla pojedynczych instancji zamiast całej metody
+  zostawiają śmieci — wyszukaj tego typu błędy i je napraw".
+- ANALIZA (przegląd `matcher`, `rebuilder`, `convert`, `chdrebuild`,
+  `hierarchy`, `fileindex`, `linker`): zasada — CZYM jest plik/gra
+  rozstrzygają SUMY (matcher, indeks); nazwa z DAT-u wyznacza tylko MIEJSCE
+  (ścieżka kanoniczna, nazwy członków). Odstępstwa:
+  1. `convert._game_physical_files` (konwersja w miejscu): pliki gry =
+     pliki o NAZWACH z DAT-u, a dla gry wieloplikowej — WSZYSTKO z
+     podfolderu `<gra>\\`; treść niesprawdzona → spakowane `halflife\\valve`,
+     możliwy zip z plikiem o złej treści pod dobrą nazwą.
+  2. `chdrebuild.rebuild_bad_chds`: CHD gry w katalogu docelowym =
+     `<gra>.chd` PO NAZWIE (gałąź ToSort tej samej funkcji — po treści,
+     `identified_chds_under`): CHD o innej treści pod nazwą gry szedłby do
+     odbudowy wg cue tej gry.
+  3. `matcher._match_game_archive` `_other_game` (0.7.04): „zip nazwany jak
+     INNA gra tego DAT-u = plik tamtej gry" — po nazwie.
+  4. `convert._identical_above` (0.7.07): hardlink do tej samej treści
+     wyżej, ale PO zbudowaniu zipa — łatka na skutek; przyczynę usuwa matcher
+     (0.7.07: archiwum gry wyżej przed konwersją).
+  Pozostałe użycia nazw = miejsce/wyświetlanie (kanoniczna ścieżka, nazwy
+  członków jak w DAT-cie, wielkość liter, tłumaczenia — świadomie po nazwie),
+  albo klasyfikacja typu pliku po rozszerzeniu (płyta/kartridż/nie-gra).
+- MIEJSCA: `convert._game_physical_files`/`convert_reports`,
+  `chdrebuild.rebuild_bad_chds`, `matcher._match_game_archive`,
+  `convert._convert_one` (usunięte `_identical_above`).
+- ZMIANA:
+  1. Pliki gry do konwersji = dla KAŻDEGO niepustego ROM-u plik w miejscu
+     kanonicznym, którego SUMY z indeksu = ROM z DAT-u (`_row_full_match`);
+     brak/inna treść któregokolwiek → gra nie jest konwertowana; nic spoza
+     ROM-ów gry (podfolder).
+  2. CHD do sprawdzenia kontenera w katalogu docelowym = CHD o odcisku
+     treści gry (`data_sha1` = profil), jak w gałęzi ToSort — niezależnie od
+     nazwy (nazwę poprawia NAZWA rebuildera).
+  3. Archiwum „innej gry" = archiwum, którego członkowie (sumy) to KOMPLET
+     tamtej gry — nie sama nazwa pliku.
+  4. `_identical_above` usunięte.
+  5. Jedno miejsce porównania treści: nowe `core/content.py`
+     (`content_sets`/`has_item`/`holds_roms` — SHA-1, bez niego
+     CRC32+rozmiar, plik + członkowie archiwum); używają go
+     `matcher._archive_holds_game`, `rebuilder._occupant_is_other` (gałąź
+     indeksu), `rebuilder._same_game_copy` (dotąd trzy osobne odmiany tego
+     samego porównania).
+- WPŁYW: konwersja w miejscu pakuje wyłącznie zweryfikowane ROM-y gry;
+  odbudowa CHD widzi CHD gry pod dowolną nazwą i pomija obce pod nazwą gry;
+  arcade: zip nazwany jak inna gra, ale z inną treścią, jest „złą nazwą".
+- WERYFIKACJA: testy (każdy pada na 0.7.08): plik pod nazwą ROM-u z INNĄ
+  treścią nie trafia do zipa; podfolder gry z plikiem spoza DAT-u — zip
+  tylko z ROM-ami; CHD gry pod inną nazwą — w odbudowie; CHD obcy pod nazwą
+  gry — pominięty; zip nazwany jak inna gra z treścią tej gry → NAZWA;
+  obcy CHD pod nazwą gry: treść innej gry → NAZWA na nią, treść nieznana →
+  ToSort (user 05.10).
+  A/B podglądu 0.7.08 → 0.7.09 (ta sama kopia indeksu): +28 PRZENIEŚ w
+  `ROMS\\fbneo` — zipy z treścią INNEGO zestawu pod złą nazwą (np.
+  `720g.zip` = 7 ROM-ów zestawu 720gr1, bez 3 ROM-ów 720g; `apb.zip` = 2
+  pliki zestawu apbf) dostają właściwe nazwy, a prawdziwe zestawy (z
+  `No-intro\\FinalBurn Neo - Arcade Games`, dotąd sieroty) trafiają na swoje
+  miejsca — każdy przeniesiony zip ma KOMPLET gry, której nazwę dostaje
+  (sprawdzone po sumach: 28/28). Regresja z 0.7.04 „720g→720gr1" była w
+  rzeczywistości złą treścią pod nazwą — reguła po nazwie ją ukrywała.
+  `alienaru.zip`/`indytemp2.zip` (nazwy spoza DAT-u, treść w kolekcji) →
+  ToSort. Reszta identyczna; czas 750 → 683 s.
+
+## [0.7.08] — 2026-10-05
+
+### Płyta w ToSort (CHD/RVZ) rozpoznawana po treści, nie po sumie pliku
+- DZIAŁANIE: podgląd 05.10 11:37 (0.7.07): „NIEZNANE w ToSort → nieznane:
+  `ToSort\\3do\\Mad Dog II - The Lost Gold (USA) (Arcade CD-ROM).chd`" — ta
+  sama płyta (odcisk treści `data_sha1`) leży w
+  `ROMS\\REDUMP\\Panasonic - 3DO …\\Mad Dog II … .chd`.
+- ANALIZA: tożsamość płyty CHD/RVZ = odcisk TREŚCI (`data_sha1`, z sondy);
+  suma PLIKU zależy od kompresji/wersji CHD — dwa CHD tej samej gry mają
+  różne SHA-1 pliku. Sprzątanie ToSort (`_purge_redundant_tosort_archives`:
+  „zawartość już w kolekcji") i „nieznane" (`sort_tosort_unknown`,
+  `_wholly_unknown`, 0.7.05: znane DAT-om po CRC+rozmiar) patrzyły tylko na
+  sumę pliku → kopia płyty z kolekcji szła do `nieznane` zamiast być
+  skasowana; płyta zidentyfikowana jako gra DAT-u, ale nieobecna w kolekcji —
+  też do `nieznane`. Płyty z NIEUDANĄ identyfikacją (`deep_fail`: Mega Man X3
+  (Europe), Pro Racer (Europe) — treść spoza DAT-ów) → `nieznane` słusznie.
+- MIEJSCA: `rebuilder`: `_purge_redundant_tosort_archives` (luźny plik),
+  `sort_tosort_unknown`, `_wholly_unknown`; nowe `_dat_profile_known`
+  (odciski gier płytowych wszystkich DAT-ów, budowane raz, jak `_dat_known`).
+- ZMIANA: plik z `data_sha1`: treść w kolekcji = plik w katalogu DAT-u o tym
+  samym odcisku (`find_sha1(…, include_chd_content=True)`) → zbędna kopia
+  (KASUJ); odcisk = odcisk gry któregoś DAT-u → znana DAT-om (zostaje w
+  ToSort); inaczej jak dotąd.
+- WPŁYW: reguła ogólna (kopia płyty z kolekcji o innej kompresji → KASUJ;
+  płyta gry DAT-u spoza kolekcji → zostaje w ToSort). U usera BEZ zmian w
+  planie (A/B podglądu 0.7.07 → 0.7.08: 27 796 identycznych linii): Mad Dog
+  II „(Arcade CD-ROM)" nie jest w żadnym DAT-cie (jest tylko „Mad Dog II -
+  The Lost Gold (USA)"), a kopia w `ROMS\REDUMP\…3DO` sama jest sierotą
+  wynoszoną do `nieznane` — obie kopie do `nieznane` słusznie (zasada usera);
+  2 CHD z `deep_fail` i 1 RVZ (uszkodzony, 17 MB) też.
+- WERYFIKACJA: test — CHD w ToSort z odciskiem jak CHD w katalogu DAT-u
+  (inna suma pliku) → KASUJ, nie `nieznane`; CHD z odciskiem gry DAT-u,
+  której nie ma w kolekcji → zostaje w ToSort; CHD bez dopasowania → nieznane.
+
+## [0.7.07] — 2026-10-04
+
+### Duży zip (poza RAM) czytany z NAS raz; kolejka przepakowań nie czeka na największy
+- DZIAŁANIE: naprawa 0.7.06, 03/04.10: SNESMSU1 (zipy MSU-1 0,3–1,2 GB, 42
+  zostało, 17 GB) +10 zipów / 15 min; po przepakowaniu `Demon's Crest
+  (MSU1).zip` 20 s do przepięcia hardlinku. Przy `kof2k4se.zip` (41 MB)
+  „20 s bez postępu" w `_repack_collect`.
+- ANALIZA: zip > `RAM_REPACK_MAX` (256 MB) idzie drogą strumieniową, która
+  czytała źródło z NAS DWA razy (przebieg sum SHA-1 członków, potem
+  przepakowanie), a wynik bez sum → `_repack_finish` czytał NOWY plik trzeci
+  raz (`hash_file`). Kolejka puli przy zapełnieniu czekała na NAJSTARSZE
+  zadanie — jeden duży zip wstrzymywał dokładanie, choć 3 wątki stały.
+- MIEJSCA: `torrentzip.repack_to_torrentzip` (konsument: `convert.repack_zip`
+  — RAM i strumień), `torrentzip._copy_out` (też `write_torrentzip`),
+  `convert.repack_zip` (droga strumieniowa deflate), `rebuilder._repack_collect`.
+- ZMIANA: SHA-1 członków liczone w tym samym odczycie co kompresja
+  (`verify_read`), weryfikacja na lokalnej kopii jak dotąd; sumy pliku liczone
+  przy wysyłce z lokalnej kopii → wynik niesie `sums`/`tz`. Kolejka: czekanie
+  na PIERWSZE zakończone przepakowanie.
+- WPŁYW: te same bajty (RAM = strumień, 15 losowych zipów); duży zip: 1 odczyt
+  + 1 zapis zamiast 3 odczytów + 1 zapisu (SNESMSU1: ~34 GB mniej pobierania).
+  Uszkodzony odczyt źródła wykrywa CRC członka (zipfile) i weryfikacja wyniku.
+- WERYFIKACJA: test — zip „duży" (limit RAM = 0): bajtów przeczytanych ze
+  źródła < 1,3× rozmiar, sumy z wyniku = sumy pliku, tz=1, treść członków
+  bez zmian.
+
+### Konwersja w miejscu: tylko obrazy gier, hardlink do tej samej treści wyżej, widoczna w podglądzie
+- DZIAŁANIE: naprawa 05.10 (katalogi RetroBata, `Arcade1TB`): 72 ×
+  „KONWERSJA→ZIP" w `Z:\Arcade2\RetroBat\roms\…`: 45 gier SNES `.sfc`→zip
+  (37 = bajt w bajt kopie zipów z ROMS\snes — FIZYCZNE kopie zamiast
+  hardlinków), ale też `halflife\extras.pak`, `halflife\valve\*.cfg`,
+  `singe\Framework\*`, `ports\anarch.libretro`, łatki `.ips`,
+  `model3\__ia_thumb.jpg`, `sonicmania\Settings.ini`. W podglądzie 03.10:
+  0 takich linii. User: SNES ma być zipem jako hardlink z wyższych DAT-ów;
+  halflife/singe/ports niepotrzebne.
+- ANALIZA:
+  - `convert_reports` (konwersja w miejscu) pakował KAŻDĄ „grę" DAT-u z
+    luźnym plikiem — DAT-y dir2dat opisują każdy plik folderu frontendu, więc
+    też porty, konfiguracje, łatki i obrazki.
+  - Zip zbudowany z luźnego ROM-u (TorrentZip — powtarzalne bajty) był zawsze
+    wysyłany jako nowa kopia, bez sprawdzenia, czy identyczny plik leży już w
+    DAT-cie wyżej (gałąź konwersji ze źródła to robi — LINK(dziecko)).
+  - Konwersja w miejscu idzie jako `after_place` rebuildera, który w
+    podglądzie jej NIE woła (`not self.dry_run`), a `repair` nie podawał jej
+    `dry_run` — podgląd ≠ wykonanie.
+  - Źródło problemu (user: „masz sumy w DAT-ach — porównaj i linkuj"):
+    `matcher._match_game_roms` przy luźnym pliku już pod nazwą z DAT-u
+    zwracał „jest" OD RAZU, przed szukaniem archiwów — gra w formacie zip,
+    której ROM (po sumach) jest w zipie DAT-u wyżej, nie dostawała linku do
+    tego zipa, tylko pakowanie w miejscu (a hardlink co najwyżej później, z
+    deduplikacji w finale — przerwanej w naprawie 05.10).
+- MIEJSCA: `frontend` (nowe `NOT_ROM_EXTS`/`is_not_rom_file`),
+  `convert.convert_reports` (filtr; podgląd bez NAS; `hierarchy`),
+  `convert._convert_one` (nowe `_identical_above`: hardlink zamiast wysyłki,
+  wpis indeksu `record_hardlink`), `rebuilder.run` (`after_place` także w
+  podglądzie), `repair` (`dry_run` i `hierarchy` dla `convert_reports`).
+- ZMIANA: format zip/7z i komplet luźnych plików gry na miejscu → najpierw
+  archiwum tej gry gdzie indziej (sumy, nazwy członków jak w DAT-cie, bez
+  nadmiaru) — jest → gra = to archiwum (link wg hierarchii / przeniesienie),
+  luźne pliki zbędne; brak → konwersja w miejscu jak dotąd (`matcher`).
+  Gra zaspokojona całym archiwum (link) nie trafia do konwersji w miejscu
+  (także w podglądzie). Obraz płyty (iso/cue/gdi/chd/rvz/cso/wbfs…, nowe
+  `frontend.DISC_IMAGE_EXTS`) NIGDY nie jest pakowany do zipa (user 05.10:
+  kartridż → zip, płyta → CHD, bez obsługi CHD → bez zmian). Format „auto"
+  dla systemu NIEZNANEGO z plikami płytowymi (np. „triforce") = „keep"
+  (dotąd zip) — `dirrules.resolve_format`; wykryte w A/B:
+  `triforce\\Mario Kart Arcade GP.iso` → zip, `windows\\…bat.keys` → zip.
+  Zmiana „auto" dotyczy u usera 11 DAT-ów (zip → keep): TeknoParrot,
+  TOSEC Amiga CD32 ISO, [T-En] PC-9801, MD+/MSU-MD/Mode 1 CD (5),
+  Arcade1TB fpinball/switch/triforce — w planie naprawy jedyny skutek:
+  pusty plik-znacznik TeknoParrot „Missing in Action".
+  Plik stanu (`collection_state.pkl`) — wersja 2: pierwszy start po
+  aktualizacji wczytuje DAT-y (z lokalnego cache) i liczy formaty od nowa.
+- A/B podglądu całej kolekcji (0.7.05 → 0.7.07, ta sama kopia indeksu):
+  +38 LINK (37 gier SNES RetroBata → ROMS\\snes, redearth → fbneo), +26
+  KONWERSJA→ZIP (gry bez odpowiednika wyżej: SNES 8, Naomi 9, NES 5, MD 3,
+  MSU 1 — dotąd ukryte w podglądzie), +60 KASUJ zbędnych luźnych kopii
+  (redearth), reszta identyczna; czas 1046 → 744 s.
+  Gra z plikiem spoza obrazów gier (media, opisy, konfiguracje,
+  łatki, porty/silniki) — bez zmiany formatu. Gotowy zip = te same bajty
+  (SHA-1+rozmiar) co fizyczny plik, do którego hierarchia pozwala linkować →
+  hardlink. Konwersja w miejscu widoczna w podglądzie („KONWERSJA→…").
+- WPŁYW: RetroBat: ROM-y dalej pakowane (format „auto" katalogu), kopie gier
+  z wyższych DAT-ów jako hardlinki; pliki portów/konfiguracji/łatek/mediów
+  nietknięte. Podgląd pokazuje konwersje w miejscu dla wszystkich DAT-ów.
+- WERYFIKACJA: testy — `.pak`/`.ips`/`.ini` obok `.sfc`: zip tylko z `.sfc`;
+  zip = bajty zipa wyżej → hardlink; podgląd: „KONWERSJA→ZIP" bez zmian na
+  dysku; rebuilder woła `after_place` w podglądzie.
+- NAPRAWA DANYCH 05.10: 67 plików przywróconych z zipów pod oryginalne nazwy
+  (CRC sprawdzone), zipy przeniesione do
+  `Z:\RomVault\_przywrocone_zipy_2026-10-05`, indeks zaktualizowany;
+  halflife/singe/ports — do skasowania przez usera. Kolejna naprawa spakuje
+  ROM-y ponownie, tym razem z hardlinkami.
+
+### Plik „tylko do odczytu" w kolekcji: atrybut zdejmowany przy podmianie/kasowaniu
+- DZIAŁANIE: naprawa 05.10: 4 × „BŁĄD repack … [WinError 5] Odmowa dostępu"
+  (`Z:\Arcade2\RetroBat\roms\nes\Super Mario Bros. (World).zip`, SMB 2 i 3,
+  TMNT). User: „A, zdejmuj atrybut i przepakuj".
+- ANALIZA: pliki mają atrybut ReadOnly (z 2023 r.); Windows nie pozwala
+  nadpisać (`os.replace` tmp → plik) ani skasować takiego pliku. Przepakowanie
+  zostawiło oryginał nietknięty, plik tymczasowy sprzątnięty. Ta sama blokada
+  dotyczy każdej podmiany w miejscu (przepakowanie, przepięcie hardlinku,
+  odbudowa CHD, zmiana nazwy na istniejący plik) i każdego kasowania.
+- MIEJSCA: nowe `fileops.replace_rw` / `fileops.unlink_rw`; wszystkie
+  `os.replace`/`os.unlink` na plikach kolekcji i ToSort: `convert`,
+  `rebuilder`, `chdrebuild`, `fixer`, `linker`, `fileindex.unlink_tracked`,
+  `update_game`, `translations`, `prune`, `bios`, `fileops.move_with_progress`.
+  Pliki programu (ustawienia, cache, snapshot, ramdisk, skróty) bez zmian.
+- ZMIANA: operacja odrzucona z PermissionError, a cel ma atrybut tylko do
+  odczytu → atrybut zdejmowany i operacja ponawiana RAZ; inaczej błąd jak
+  dotąd. Atrybut nie jest przywracany (plik i tak jest zastępowany/kasowany).
+- WPŁYW: pliki ReadOnly w katalogach DAT-ów i ToSort są naprawiane jak
+  pozostałe; bez atrybutu — zachowanie bez zmian (jedna próba, jak dotąd).
+- WERYFIKACJA: test — przepakowanie zipa ReadOnly: TorrentZip, bez błędu;
+  skasowanie pliku ReadOnly przez `unlink_tracked`; przepięcie hardlinku na
+  pliku ReadOnly.
+
+### „nie skasowano źródła … [WinError 3]" przy dzieciach — plik już skasowany to nie błąd
+- DZIAŁANIE: naprawa 0.7.06, 04/05.10: 692 linie „nie skasowano źródła
+  Z:\RomVault\ToSort\psp\…\…iso: [WinError 3] System nie może odnaleźć
+  określonej ścieżki" (REDUMP PSP 534, PSN 132+2, 1G1R PSP 11, Saturn 24 —
+  Sonic R (USA, Brazil)).
+- ANALIZA: gra skonwertowana w katalogu RODZICA (ROMS\psp) kasuje swoje
+  źródła w ToSort od razu. Dzieci (REDUMP, 1G1R) mają statusy z dopasowania na
+  starcie naprawy — wskazują te same pliki ToSort; po LINK(dziecko) do CHD
+  rodzica `_defer_or_purge_game_sources` próbuje skasować je drugi raz, a pliku
+  (i katalogu gry) już nie ma → WinError 3/2. Link powstaje poprawnie, nic nie
+  ginie — to tylko fałszywy błąd w logu. Ten sam wzorzec (kasowanie pliku,
+  który mógł zniknąć wcześniej w tym przebiegu) w innych miejscach kasowania.
+- MIEJSCA: `convert`: `_defer_or_purge_game_sources`,
+  `_purge_redundant_tosort_tracks` (luźne + archiwa),
+  `_purge_child_loose_duplicates`, kasowanie redundantnego archiwum gry na
+  CHD, `purge_source_files`; `rebuilder`: kasowanie zbędnych kopii w ToSort
+  (dwa miejsca) i starego archiwum po przepakowaniu; `update_game`.
+- ZMIANA: wspólne `fileindex.unlink_tracked(path, index)`: brak pliku
+  (FileNotFoundError, WinError 2/3) = już skasowany → tylko wpis indeksu
+  usuwany, bez logu „nie skasowano" i bez liczenia jako skasowany teraz.
+  Inne błędy jak dotąd.
+- WPŁYW: log bez fałszywych błędów; liczniki skasowanych = realnie
+  skasowane. Pliki i linki bez zmian.
+- WERYFIKACJA: test — rodzic kasuje źródło, dziecko po linku do rodzica: brak
+  „nie skasowano" w logu, wpis indeksu źródła usunięty.
+
+### Pasek konwersji: ile gier do konwersji, a nie numer gry w DAT-ach katalogu
+- DZIAŁANIE: user 04.10 (zrzut): „konwersja (ze źródła): Crush (USA)
+  (650/3545)" — „ponad 3000 gier PSP do zrobienia, a nie powinno być tyle".
+- ANALIZA: `convert_from_source` liczył postęp jako pozycję w pętli po
+  WSZYSTKICH grach DAT-ów katalogu (3545), z których większość jest tylko
+  sprawdzana i pomijana; realnych konwersji w podglądzie: 534 (ToSort\psp).
+  Pasek był szybki na pominięciach, a po nim nie dało się ocenić, ile zostało.
+- MIEJSCA: `convert.convert_from_source` (etykieta i wartości `on_progress`;
+  konsument: pasek etapu w oknie i StallWatch — tylko wyświetlanie).
+- ZMIANA: przed pętlą liczba gier-kandydatów do konwersji — te same warunki
+  ze statusów, które w pętli prowadzą do konwersji (komplet poza opisem płyty,
+  źródło luźne / w archiwum, nie CHD/całe archiwum, nie już w formacie, nie
+  wszystko „jest" poza luźną płytą na CHD). Pasek: „konwersja X/Y: gra ·
+  sprawdzono G/N"; wartość paska = X/Y.
+- WPŁYW: tylko wyświetlanie; decyzje konwersji bez zmian. Y to górna granica:
+  gra pominięta po sprawdzeniu indeksu (już na zweryfikowanym CHD po
+  wznowieniu) jest w Y, ale X do niej nie dochodzi; dziecko dostające tylko
+  hardlink do CHD rodzica liczy się jak konwersja (szybka).
+- WERYFIKACJA: test — dwie gry do konwersji w DAT-cie z wieloma grami bez
+  źródła: ostatni postęp „konwersja 2/2", N = liczba gier DAT-u.
+
+## [0.7.06] — 2026-10-03
+
+### Przepakowanie do TorrentZip: jeden odczyt i jeden zapis na NAS, kilka zipów naraz
+- DZIAŁANIE: naprawa 03.10 13:15: po 8,5 h przepakowane 7175 z 27 566 zipów
+  (4,25 s/zip, średnio 0,4 MB → 0,1 MB/s); prognoza: jeszcze ~24 h.
+- ANALIZA: py-spy na działającej naprawie (5 min): 100% wątku naprawy w
+  `_repack_bad_zip`, z tego ~5% kompresja (CPU), ~95% czekanie na operacje
+  plikowe na NAS (jedna ≈ 0,3–0,5 s przez Tailscale). Na jeden zip ~15 takich
+  operacji: zip otwierany 5× (metoda, status TZ, sumy członków, źródło
+  przepakowania, weryfikacja nowego) + ponowny odczyt całego nowego pliku dla
+  sum indeksu (`hash_file`) i statusu TZ; zapis TorrentZipa z `seek` po
+  każdym członku (każdy = osobna runda SMB); `mkstemp` + ponowne otwarcie;
+  `same_file` = 2× stat na kandydata; przepięcie hardlinku = lexists + link +
+  replace. Wszystko szeregowo.
+- MIEJSCA: `torrentzip.write_torrentzip` (wszyscy wołający: przepakowanie,
+  pakowanie z wypakowania, BIOS-y, `convert`), `torrentzip_status`,
+  `convert.repack_zip` (+ `ConvertResult.sums/tz`), `rebuilder._repack_bad_zip`
+  i `_normalize_target_zip_compression` (ponowny `hash_file` po
+  przepakowaniu), `linker.replace_with_hardlink`, `fileindex.record_file`.
+- ZMIANA:
+  - TorrentZip powstaje w pamięci (duże: lokalny plik tymczasowy), na NAS
+    trafia jednym ciągłym zapisem — dotyczy KAŻDEGO zapisu TorrentZipa.
+  - `repack_zip` (deflate): zip ≤ 256 MB wczytany RAZ; metoda, status TZ,
+    sumy członków, przepakowanie, weryfikacja i sumy nowego pliku liczone w
+    pamięci; wynik niesie sumy → wołający nie czyta pliku ponownie. Większe
+    — dotychczasową drogą strumieniową.
+  - Naprawa: przepakowania w miejscu idą w puli 4 wątków (tylko system
+    plików: odczyt, zapis, podmiana, przepięcie hardlinków); indeks, licznik
+    i log — wątek właściciela, jak przy linkach równoległych (0.6.97).
+    Kolejność względem reszty naprawy zachowana: operacja na zipie w trakcie
+    przepakowania (link do niego, użycie jako źródła) czeka na jego koniec;
+    pula domykana na końcu każdego DAT-u i przy przerwaniu.
+- WPŁYW: wynik na dysku i w indeksie bez zmian (te same bajty TorrentZipa,
+  ta sama weryfikacja SHA-1 członków przed podmianą, podmiana atomowa,
+  hardlinki przepinane). Pamięć: do ~4 zipów naraz w RAM (≤ 256 MB każdy;
+  większe przetwarzane pojedynczo). Kolejność wierszy w logu przepakowań może
+  się różnić (równoległość). Podgląd bez zmian.
+- WERYFIKACJA: testy — bajty TorrentZipa z pamięci = jak dotąd; przepakowanie
+  w RAM: te same bajty, sumy z wyniku = sumy pliku, zip uszkodzony → błąd i
+  plik nietknięty; naprawa z pulą: hardlinki przepięte, indeks z sumami
+  nowego pliku i tz=1, link do zipa w trakcie przepakowania wskazuje NOWY
+  plik. Bajty TorrentZipa 0.7.05 = 0.7.06 (25 losowych zipów: przepakowanie
+  i zapis). Pomiar na NAS usera (12 zipów fbneo ~0,5 MB, kopie w
+  `Z:\_rh_perftest`): 0.7.05 3,24 s/zip; 0.7.06 jeden wątek 1,62 s/zip,
+  4 wątki 0,62 s/zip (8 wątków 0,58 — zostaje 4). Podgląd całej kolekcji
+  0.7.05 vs 0.7.06 na kopii indeksu: 56 536 identycznych linii; czas
+  1012 → 768 s.
+
+### Dopasowanie: współdzielony plik w setkach gier, gry z tysiącami plików
+- DZIAŁANIE: podgląd 03.10: „dopasowanie" DSi (CDN) 15 s ×2, TeknoParrot
+  18 s; sonda CHD: „20 s bez postępu — all_under".
+- ANALIZA (cProfile na kopii indeksu):
+  - DSi: `titlePass.txt` (8 B, ta sama treść w 1678 grach) leży w 5730
+    archiwach — `_archives_with_game` przeglądał je dla KAŻDEJ gry: 19 mln
+    porównań, choć gra pasuje tylko do archiwum, które ma WSZYSTKIE jej pliki.
+  - TeknoParrot: 3,18 mln plików w 852 grach; `DatGame.data_roms` (lista bez
+    .cue/.gdi) liczony przez `pathlib` od nowa przy każdym użyciu.
+  - `all_under`/`count_under`/`identified_chds_under`/`mark_missing`: warunek
+    `substr(path, 1, n) = ?` = przegląd całej tabeli (~55 ms), wołane per
+    katalog (sonda CHD: ~430 katalogów; naprawa: per DAT).
+  - Po pierwszej poprawce (pomiar): DSi dalej 6 s — `match_rom` filtrował
+    WSZYSTKIE 5730 wierszy `titlePass.txt` dla każdej gry, choć bierze
+    pierwszy pasujący; TeknoParrot dalej 17 s — każdy z 3,18 mln ROM-ów
+    (prawie wszystkie nieobecne) przechodził 5 wyszukiwań z kopiowaniem list,
+    a `_archives_with_game` szukał wszystkich ROM-ów gry, choć pierwszy
+    nieobecny przesądza, że żadne archiwum nie ma kompletu.
+- MIEJSCA: `matcher._archives_with_game` (jedyny konsument:
+  `_match_game_archive`, używa wyłącznie archiwów z kompletem niepustych
+  ROM-ów), `matcher.match_rom` (trafienie w archiwum: używany tylko pierwszy
+  pełny wiersz), `datfile.DatGame.data_roms` (konsumenci: odcisk gry, CHD,
+  konwersja, hierarchia), `fileindex` (4 zapytania, nowe `rom_absent`).
+- ZMIANA: archiwa kandydaci = zawierające NAJRZADSZY niepusty ROM gry;
+  pozostałe ROM-y sprawdzane tylko w nich; ROM nieobecny w żadnym archiwum →
+  od razu brak archiwum z kompletem (wynik `full` identyczny). `match_rom`:
+  ROM, którego żadnej sumy (SHA-1, MD5, CRC+rozmiar) nie ma w cache
+  dopasowania ani wśród plików, ani członków → „brak" bez wyszukiwań;
+  trafienie w archiwum = pierwszy pełny wiersz (jak dotąd `[0]`). `data_roms`
+  — rozszerzenie z nazwy bez `pathlib` (te same reguły co `Path.suffix` w
+  Pythonie 3.14). Zapytania „pod katalogiem" — zakres na indeksie ścieżki
+  (`path >= prefiks AND path < prefiks+1`), ta sama semantyka co `substr`.
+- WPŁYW: wyniki dopasowania i zapytań bez zmian (kopia indeksu usera:
+  statusy TeknoParrot 3 183 707 i DSi 7392 — identyczny odcisk 0.7.05 i
+  0.7.06). Czas: DSi (CDN) 15,0 → 1,3 s (każdy z dwóch DAT-ów), TeknoParrot
+  21,3 → 13,3 s, `all_under` dla 430 katalogów 21,6 → 0,4 s.
+- WERYFIKACJA: testy — gra z plikiem wspólnym dla wielu archiwów: ten sam
+  wynik co dotąd, archiwum częściowe pomijane; ROM nieobecny → brak bez
+  wyszukiwań, ROM tylko w archiwum → dalej „gdzie indziej"; `data_roms` =
+  dawna definicja na nazwach brzegowych; `all_under` = `substr` (w tym
+  ścieżki z podobnym prefiksem: `…\psx` vs `…\psx2`). Porównanie podglądu
+  przed/po; pomiar czasu dopasowania.
+
+## [0.7.05] — 2026-10-03
+
+### „Nieznane" = treść, której nie zna ŻADEN DAT (po sumach), nie „nie widać jej w kolekcji"
+- DZIAŁANIE: podgląd 03.10 12:19 (0.7.04): w „NIEZNANE w ToSort → nieznane"
+  tory Saturna/Dreamcasta (`Sonic R (Europe) (Track 02).bin`…), BIOS-y
+  (`128p-1.rom`, `pcfxbios.bin`), `fbneo\gforce2ja.zip` (46/46 plików znanych
+  FBNeo), PSP Minis.
+- ANALIZA (indeks + cache DAT-ów usera): z 5760 „nieznanych" 387 ma treść
+  znaną DAT-om; wszystkie 366 „PRZEPAKUJ (tylko nieznane)" też. 0.7.02
+  (`_wholly_unknown`, `sort_tosort_unknown`) uznawało za nieznane wszystko,
+  czego nie widać jako pliku/członka w katalogach DAT-ów — a tory gier na CHD
+  w indeksie nie występują osobno, treść potrzebna do braków też nie. Zasada
+  usera: do nieznane trafia treść, „której nie ma gdziekolwiek w DAT".
+- MIEJSCA: `rebuilder`: `set_hierarchy` (zapamiętuje wszystkie wpisy DAT-ów),
+  nowe `_dat_known` (zbiór CRC+rozmiar ROM-ów WSZYSTKICH DAT-ów, budowany raz,
+  zwalniany po finale), `_wholly_unknown` i `sort_tosort_unknown`;
+  `convert._purge_redundant_tosort_tracks` (kasowanie archiwów ToSort z torami
+  gier już na CHD: archiwum z członkiem NIEZNANYM żadnemu DAT-owi nie jest
+  kasowane — trafi do nieznane w finale; dotąd 0 takich u usera, ta sama
+  zasada w całym programie) — `repair` podaje `rb._dat_known`.
+- ZMIANA: członek/plik „nieznany" = brak w kolekcji I brak w każdym DAT-cie
+  (CRC+rozmiar). `sort_tosort_unknown`: całość do nieznane tylko gdy WSZYSTKO
+  nieznane; zip mieszany → przepakowanie wyrzuca TYLKO członków leżących w
+  katalogach DAT-ów, a gdy zostają członkowie znani DAT-om — archiwum zostaje
+  w ToSort (nie w nieznane); znana treść nie w kolekcji → bez zmian.
+  `_wholly_unknown` (sieroty / sprzątanie): znane DAT-om → ToSort (nie
+  nieznane).
+- WPŁYW: podgląd: „NIEZNANE w ToSort → nieznane" ↓ ~387, „PRZEPAKUJ (tylko
+  nieznane)" → tylko zipy bez członków znanych DAT-om poza kolekcją. Pamięć:
+  ~3 mln kluczy na czas finału.
+- WERYFIKACJA: test — tor gry (znany DAT-owi, w kolekcji tylko w CHD) w ToSort
+  nie trafia do nieznane; plik nieznany — trafia; zip z członkiem znanym DAT-owi
+  i nieznanym — zostaje w ToSort. Porównanie podglądu przed/po.
+
+## [0.7.04] — 2026-10-03
+
+### Nazwa pliku = jak w DAT-cie, co do litery (także wielkość liter); plik rozpoznany po sumach
+- DZIAŁANIE: user 03.10: „jak index może o czymś nie wiedzieć? jak może się
+  okazać, że miejsce zajęte, skoro był nowy skan?"; „nazwa pliku nie powinna
+  być brana pod uwagę, jak mam sumy"; „zmiana nazwy pliku to też naprawa —
+  jeśli w DAT jest SEED, plik Seed trzeba zmienić"; „dla wszystkich platform".
+- ANALIZA: plik `…Gundam Seed (Japan).zip`, DAT: `…Gundam SEED (Japan)`.
+  Windows/NAS nie rozróżniają wielkości liter, program — tak: indeks
+  (`lookup`/`members_of`: `path=?`) nie widział pliku pod nazwą z DAT-u
+  („nie ma") → podgląd: nowy link; wykonanie: miejsce zajęte → KONFLIKT co
+  naprawę. Odwrotnie matcher (`_same_path` = normcase): plik o nazwie różnej
+  tylko wielkością liter = „na miejscu" → nazwa NIGDY nie poprawiana (12 plików
+  u usera: PS1 4, PS2 3, Saturn 2, GBA 2, WSC 1 — np. „WipEout (USA).chd" →
+  „Wipeout (USA)"). Gorzej: zip w katalogu DAT-u z dokładnym zestawem gry był
+  „na miejscu" NIEZALEŻNIE od nazwy pliku (`_match_game_archive`, gałąź
+  w katalogu) — zip pod złą nazwą zostawał. Do tego `link_of` (Amiga 1000):
+  wpis „to hardlink X" zostawał po podmianie X (przepakowanie) — fałszywe
+  „już zlinkowane".
+- MIEJSCA: `fileindex`: `lookup`/`members_of` (bez rozróżniania wielkości
+  liter, indeks `path COLLATE NOCASE`), `rename`/`record_file`/
+  `reindex_archive`/`_persist_hashed` (link_of wskazujące na zmieniony plik:
+  przeniesione/wyczyszczone); `matcher`: `_pick`, gra CHD, archiwum w
+  katalogu (HAVE tylko przy nazwie co do litery = DAT; inaczej „zła nazwa");
+  `rebuilder`: nowe `_case_rename` (zmiana samej wielkości liter: przez nazwę
+  tymczasową) w ścieżkach: NAZWA, `_place_archive` (to samo miejsce), link do
+  rodzica (`_same_game_copy`), konflikt przy wykonaniu (0.7.03).
+- ZMIANA: plik rozpoznany po SUMACH, a jego nazwa (pliku; w środku zipa —
+  już było) ≠ DAT co do litery → NAZWA na dokładną nazwę z DAT-u; indeks
+  znajduje plik niezależnie od wielkości liter (jak system plików). WYJĄTEK
+  (wykryty w porównaniu podglądów): zip nazwany jak INNA gra tego DAT-u to plik
+  tamtej gry (arcade: zip rodzica `720g.zip` zawiera ROM-y klona `720gr1`) —
+  nie jest „złą nazwą" klona; w DAT-ach arcade tylko różnica wielkości liter.
+- WPŁYW: podgląd/naprawa: nowe „NAZWA" (12 u usera + zipy pod złymi nazwami
+  w katalogach DAT-ów, dotąd „na miejscu"); znika 5 KONFLIKT. Linki/treść bez
+  zmian.
+- WERYFIKACJA: testy — plik i CHD różniące się wielkością liter → NAZWA,
+  podgląd = wykonanie; zip w katalogu DAT-u pod złą nazwą → NAZWA; dziecko
+  „Seed" z rodzicem „SEED" → hardlink pod nazwą z DAT-u, bez KONFLIKT;
+  `lookup` bez rozróżniania wielkości liter; `link_of` czyszczony po podmianie
+  celu.
+
+### Pod nazwą gry leży INNA treść (po sumach) → do ToSort, na miejsce właściwy plik
+- DZIAŁANIE: naprawa 03.10 11:16: „KONFLIKT: No-intro\…SNES\Blackthorne (USA)
+  (Beta).zip zajęte zwykłym plikiem" — co naprawę.
+- ANALIZA: zip w No-intro to STARY zrzut bety (CRC b39af3fa) — aktualny DAT
+  No-intro chce cffaaa21 (leży w ROMS). Plik o nazwie gry, ale NIE ta gra.
+  Gałąź linku (i układania, i „własnego pliku" 0.6.98) kończy KONFLIKT-em,
+  a sprzątanie omija ścieżkę (jest kanoniczna) → stan na zawsze.
+- MIEJSCA: `rebuilder`: gałąź linku do rodzica (podgląd: zajęte w indeksie;
+  naprawa: `_resolve_link_conflict`), układanie (`_clear_dest` → KONFLIKT),
+  „własny plik" (0.6.98) — wspólne `_evict_occupant`.
+- ZMIANA: gdy pod ścieżką gry leży plik, którego treść (po sumach; zip:
+  CRC+rozmiar członków z dysku przy naprawie) NIE zawiera ROM-ów gry z DAT-u →
+  przeniesienie do ToSort (`nieznane`, gdy żaden DAT go nie zna — 0.7.02), a
+  potem zwykła operacja (link / ułożenie). Gdy treści nie da się sprawdzić
+  (nie-zip przy naprawie) albo plik JEST tą grą → jak dotąd.
+- WPŁYW: KONFLIKT → „TOSORT (inna treść pod nazwą z DAT-u)" + LINK; nic nie
+  jest kasowane (przeniesienie).
+- WERYFIKACJA: test — pod nazwą gry stary zrzut: podgląd i naprawa → stary
+  plik w ToSort\nieznane, na miejscu hardlink rodzica, bez KONFLIKT.
+
+## [0.7.03] — 2026-10-03
+
+### Zajęte miejsce linku przy wykonaniu: ta sama treść (z dysku) → hardlink
+- DZIAŁANIE: naprawa 03.10 11:15: 5× „KONFLIKT: … zajęte zwykłym plikiem"
+  (Gundam SEED WSC/GBA ×3, [BIOS] Amiga 1000 Bootstrap 8k/64k) — te same w
+  KAŻDEJ realnej naprawie od 02.10 (22:53, 22:55, 05:58, 11:15), nigdy w
+  podglądzie.
+- ANALIZA: podgląd rozstrzyga z INDEKSU, a indeks się myli: (1) Gundam —
+  plik leży na dysku, indeks go nie zna → podgląd „LINK (tworzę)", wykonanie:
+  os.link → FileExistsError → inne bajty → KONFLIKT; (2) Amiga — indeks ma
+  `link_of` = plik ROMS (hardlink), na dysku osobny plik (nlink 1; nieaktualny
+  wpis) → podgląd „już zlinkowane", wykonanie → KONFLIKT. Rozstrzygnięcie z
+  0.7.01 (`_same_game_copy`) działa tylko na indeksie.
+- MIEJSCA: `rebuilder._link_finish` (wynik „conflict" z puli linków) — nowe
+  `_resolve_link_conflict` (wątek właściciela).
+- ZMIANA: przy konflikcie: oba pliki to zipy → spis członków Z DYSKU (central
+  directory: CRC + rozmiar, bez dekompresji); KAŻDY niepusty członek pliku w
+  miejscu linku jest w pliku docelowym → atomowa podmiana na hardlink
+  (`replace_with_hardlink`, „POPRAW LINK (ta sama treść)") + wpis w indeksie;
+  inaczej KONFLIKT jak dotąd (nic nie nadpisujemy).
+- WPŁYW: tylko realna naprawa, tylko przy konflikcie (rzadkie) — 2 krótkie
+  odczyty NAS na konflikt. Podgląd bez zmian.
+- WERYFIKACJA: test — plik w miejscu linku nieznany indeksowi / z
+  nieaktualnym `link_of`, ta sama treść → hardlink; inna treść → KONFLIKT.
+
+## [0.7.02] — 2026-10-03
+
+### ToSort: treść z katalogów DAT-ów kasowana, nieznana → ToSort\nieznane
+- DZIAŁANIE: zasada usera 03.10: „jeśli jakakolwiek treść jest fizycznie
+  gdziekolwiek w katalogach DAT, usuwamy wszystkie jej wystąpienia z ToSort;
+  treść, której nie ma w żadnym DAT-cie → ToSort\nieznane". Decyzje usera:
+  nieznane pliki, które JUŻ leżą w ToSort → też do ToSort\nieznane; archiwum
+  mieszane (część znana, część nie) → przepakować, zostawić tylko nieznane.
+- ANALIZA: (1) kasowanie z ToSort (`_purge_redundant_tosort_archives` →
+  `_content_placed_outside`) liczyło kopię GDZIEKOLWIEK poza ToSort — także w
+  katalogu-sierocie (bez DAT-u), który sam idzie do ToSort/kasowania.
+  (2) nieznane z katalogów kolekcji szły do `ToSort\<katalog>\…`
+  (`sweep_orphans` „NIEZNANY→ToSort", `_clean_dir` „TOSORT"), nie do
+  `ToSort\nieznane`. (3) nieznane w ToSort zostawały na miejscu. (4) archiwum
+  mieszane zostawało w całości. Uwaga: źródła gier NIEKOMPLETNYCH (pomijane
+  przez „tylko kompletne") nie trafiały do `_placed_sources` — nie wolno ich
+  uznać za nieznane.
+- MIEJSCA: `rebuilder`: `set_hierarchy` (prefiksy katalogów WSZYSTKICH DAT-ów,
+  także wyłączonych), `run` (nowy zbiór `_known_sources`: źródło KAŻDEGO
+  dopasowanego statusu, także gier pominiętych), `_content_placed_outside`
+  (tylko kopie w katalogach DAT-ów), `sweep_orphans` i `_clean_dir` (cel
+  nieznanych = `ToSort\nieznane\…`; znane źródła — jak dotąd do ToSort),
+  nowe `sort_tosort_unknown` (finał); `repair` (wywołanie w finale, te same
+  warunki co sprzątanie sierot: sprzątanie włączone, bez przerwania, wszystkie
+  DAT-y wczytane).
+- ZMIANA: finał: każdy plik ToSort (poza `nieznane`, biblioteką `cues` i
+  plikami przeniesionymi w tym przebiegu), którego NIE używa jako źródła żaden
+  DAT: luzem → `ToSort\nieznane\<ścieżka>`; archiwum bez członków znanych z
+  katalogów DAT-ów → całe do `nieznane`; archiwum mieszane (zip) → TorrentZip
+  tylko z członkami SPOZA katalogów DAT-ów do `nieznane`, oryginał kasowany
+  (członkowie znani są potwierdzeni w katalogach DAT-ów); 7z mieszane — bez
+  zmian (nie umiemy przepakować 7z). Kolizja nazw w `nieznane` → sufiks `_N`.
+- WPŁYW: podgląd/naprawa: „NIEZNANY→ToSort" i „TOSORT" nieznanych wskazują
+  `ToSort\nieznane\…`; nowe „NIEZNANE w ToSort → nieznane" i „PRZEPAKUJ
+  (tylko nieznane)"; „KASUJ z ToSort (zawartość już w kolekcji)" może SPAŚĆ
+  (kopie tylko w sierotach już się nie liczą — sieroty same trafiają do
+  nieznane albo są kasowane jako zbędne). Skan ToSort obejmuje `nieznane`
+  (podkatalog) — po włączeniu DAT-u znane pliki zostaną z niego ułożone.
+- WERYFIKACJA: testy — nieznany plik z sieroty → `ToSort\nieznane`; nieznany
+  plik w ToSort → `nieznane`; źródło gry niekompletnej zostaje; plik ToSort,
+  którego kopia jest tylko w sierocie, NIE jest kasowany jako „w kolekcji";
+  zip mieszany → w `nieznane` tylko nieznani członkowie, oryginał skasowany;
+  podgląd przed/po na danych usera.
+
+## [0.7.01] — 2026-10-03
+
+### Ta sama gra pod złymi nazwami w miejscu linku → hardlink (nie KONFLIKT)
+- DZIAŁANIE: user 03.10 (podgląd 07:01): „KONFLIKT: No-intro\SNK - NeoGeo
+  Pocket Color\[BIOS] … (En,Ja).zip zajęte zwykłym plikiem" — w każdym
+  podglądzie od dni; user: „masz DAT, masz sumy, masz zły plik — czemu nie
+  zmieniasz nazwy i nie linkujesz? to cały sens programu".
+- ANALIZA: oba DAT-y (ROMS i No-intro) chcą `[BIOS] … (En,Ja).bin`. ROMS ma
+  poprawny zip; zip w No-intro ma w środku STARĄ nazwę `.ngp` — ten sam ROM
+  (SHA-1 edc1319205…), inne bajty zipa. Matcher dobrze: gra po sumach,
+  „złe nazwy". Rebuilder: treść ma kopię w DAT-cie wyżej → gałąź LINKU
+  (dziecko → rodzic); miejsce zajęte zwykłym plikiem, a test „już
+  zlinkowane" porównuje BAJTY (podgląd: `_linked_to`, naprawa: os.link →
+  FileExistsError → same_file) → KONFLIKT. Ta sama gra pod złymi nazwami
+  nie jest rozpoznawana jako „ta sama treść".
+- MIEJSCA: `rebuilder._process`, gałąź linku do rodzica (przed pulą linków
+  i przed sprawdzeniem zajętego miejsca); nowy `_same_game_copy` (indeks,
+  bez NAS).
+- ZMIANA: gdy w miejscu linku leży (wg indeksu) zwykły plik o innych bajtach,
+  ale TEJ SAMEJ treści co plik rodzica — archiwum: każdy niepusty członek
+  (SHA-1, bez SHA-1: CRC+rozmiar) jest w rodzicu (członek albo cały plik);
+  CHD: ten sam `data_sha1` — atomowa podmiana na hardlink rodzica
+  (`_link_over_copy`, „POPRAW LINK"). Inna treść → KONFLIKT jak dotąd (nic
+  nie nadpisujemy).
+- WPŁYW: podgląd/naprawa: takie KONFLIKT → POPRAW LINK (u usera 1). Zwykłe
+  linki bez zmian (sprawdzenie tylko z indeksu, bez dodatkowych rund NAS).
+- WERYFIKACJA: test — zip rodzica `.bin`, zip dziecka `.ngp` z tym samym ROM-em:
+  podgląd POPRAW LINK bez KONFLIKT, naprawa → ten sam plik (hardlink);
+  dziecko z INNĄ treścią → KONFLIKT.
+
+## [0.7.00] — 2026-10-03
+
+### Źródło gry: dokładny plik zamiast wypakowania z większego zipa; kopia między DAT-ami = hardlink
+- DZIAŁANIE: user 02/03.10: naprawa stała 19 min w etapie 1 na „PRZEPAKUJ
+  …DSi (Digital) (CDN) (Decrypted) (Retool)\X.zip -> No-intro\…DSi
+  (Digital)\X.zip (wypakuj ROM-y gry z nadzbioru: 1 z 4 plików)" — ~4 s na
+  grę (pobranie + wysyłka przez NAS), ~900 gier.
+- ANALIZA (indeks usera, „Shapo (USA)"): ta sama gra leży DOKŁADNIE jako
+  `1G1R\…DSi (Digital) (Retool)\Shapo (USA).zip` (1 plik `00000000`, ta sama
+  suma). (1) matcher (`_match_game_archive`) wybiera archiwum spoza katalogu
+  DAT-u po „nazwy w środku OK", potem ALFABETYCZNIE — „(CDN) (Decrypted)"
+  wygrywa z „(Retool)", nadzbiór przed dokładnym plikiem. (2) Nawet dokładny
+  plik innego DAT-u (który go potrzebuje) był KOPIOWANY (`_copy_keep`:
+  pobranie + wysyłka), choć na tym samym udziale hardlink daje to samo
+  natychmiast (hardlink = równorzędna kopia, zasada z 0.6.50/0.6.93).
+  (3) Przepakowanie z cudzego archiwum (transfer) szło w etapie 1 („szybkie").
+- MIEJSCA: `matcher._match_game_archive` (wybór archiwum: w katalogu i poza
+  nim); `rebuilder._copy_keep` (3 wywołania: plik/archiwum innego DAT-u,
+  który zostaje u właściciela) + gałąź „KOPIA (dedup w kolekcji → fizyczna)"
+  w `_process` (treść już w kolekcji, DAT wyżej nie linkuje w dół — dziś
+  `_copy_file` przez NAS, teraz ten sam `_copy_keep`); `rebuilder._process` gałąź archiwum
+  (przepakowanie z innego miejsca w etapie 1 → etap 2, jak repack zipów).
+- ZMIANA: (1) kolejność kandydatów: poprawne nazwy → DOKŁADNY zestaw przed
+  nadzbiorem → ścieżka. (2) `_copy_keep`: hardlink, gdy oba końce to dane
+  tylko do odczytu (`linkable`), DAT docelowy nie wymusza kopii fizycznych
+  (`physical_only`), linki włączone; nieudany `os.link` (inny wolumin) →
+  kopia jak dotąd. (3) etap 1: przepakowanie archiwum z INNEGO miejsca
+  (nadzbiór / złe nazwy) czeka na etap 2.
+- WPŁYW: podgląd/naprawa: „PRZEPAKUJ (wypakuj z nadzbioru)" ↓ tam, gdzie
+  dokładna kopia istnieje; „KOPIA (plik innego DAT-u zostaje)" → „LINK
+  (hardlink…)" (liczone jako połączone, nie kopie); transfer NAS ↓.
+  Przepakowanie z nadzbioru, gdy dokładnej kopii brak — dalej, w etapie 2.
+  Zip nie-TorrentZip zlinkowany tak dalej idzie do repacku TZ w etapie 2
+  (relink_twins przepina linki). Treść bez zmian (te same sumy).
+- WERYFIKACJA: testy — dokładny zip innego katalogu wybrany przed nadzbiorem
+  (stara kolejność alfabetyczna wybierała nadzbiór); `_copy_keep` tworzy
+  hardlink (ten sam plik), dla `physical_only` kopię; etap 1 nie przepakowuje
+  z innego miejsca, etap 2 tak. Podgląd na danych usera: liczby przed/po.
+
+### Koniec operacji bez 24 s pauzy odśmiecacza
+- DZIAŁANIE: log podglądu 02.10 22:39: „[24 s bez postępu] trwa:
+  long_operation (gcpause.py:48)" — na końcu każdej operacji okno stało
+  (pełne GC trzyma GIL: stoją wszystkie wątki, też okno).
+- ANALIZA: `gcpause.long_operation` na końcu: `gc.unfreeze()` + pełne
+  `gc.collect()` po WSZYSTKICH obiektach (miliony: DAT-y, raporty, stany) —
+  24 s. Odmrożone obiekty były potem przeglądane przy każdym kolejnym pełnym GC.
+- MIEJSCA: `core/gcpause.py` (`long_operation`).
+- ZMIANA: na końcu ostatniej operacji tylko zebranie MŁODYCH pokoleń
+  (`gc.collect(1)`, ułamki sekundy) i ponowne zamrożenie (`gc.freeze()`) —
+  bez odmrażania i pełnego przeglądu.
+- WPŁYW: brak pauzy na końcu operacji i rzadszych pauz później. Koszt: śmieci
+  CYKLICZNE sprzed zamrożenia nie są odzyskiwane do końca programu (zwykłe
+  obiekty zwalnia licznik referencji jak dotąd).
+- WERYFIKACJA: test — po `long_operation` brak pełnego `gc.collect()`,
+  obiekty zamrożone.
+
+## [0.6.99] — 2026-10-03
+
+### Start bez liczenia: drzewo z liczbami z zapisanego stanu (model RomVaulta, krok 1/3)
+- DZIAŁANIE: user 03.10: „czemu w RomVault wszystko jest szybciej — startuję
+  program, mam od razu listę DAT-ów z liczbami"; RomVault: jeden plik cache
+  wczytany do RAM, nic nie liczone na starcie, „nic się nie zmieniło, dopóki
+  użytkownik sam nie odpali etapu".
+- ANALIZA (pomiar na danych usera, 03.10): start robi pełne „Wczytaj DAT-y":
+  przegląd całego DatRoot na NAS (z `cues`, 18 593 pliki), `stat` 1214 DAT-ów,
+  sidecary JSON z NAS, odczyt `dat_parse_cache` (697 plików, 955 MB, 7 s),
+  `report_states` (959 plików, 515 MB, ~990 tys. gier: 12 s z budową
+  obiektów), liczby gier (1,5 s), reguły i lista ToSort z NAS, a w wątku okna
+  dodatkowo `is_dir` DatRoot na NAS. Drzewo potrzebuje z tego tylko: listy
+  DAT-ów (nazwa, ścieżka, katalog, liczba gier), liczb per DAT, reguły skip,
+  kolejności katalogów i liczników ToSort.
+- MIEJSCA: nowy `core/snapshot.py` (plik stanu kolekcji obok exe: wpisy DAT-ów
+  bez gier + skip + ToSort + kolejność katalogów + DAT-y nieudane);
+  `core/datcache.py` (indeks liczb `report_states/_counts.pkl` zapisywany
+  RAZEM ze stanem DAT-u w `save_report_states`; `load_report_state` jednego
+  DAT-u; `LazyStates` — stan DAT-u wczytywany przy pierwszym użyciu);
+  `core/datstore.py` (`DatEntry`: `n_games`/`n_roms`/`cache_sig`, `load()` z
+  lokalnego cache po zapamiętanej sygnaturze, bez NAS; `discover` zapisuje
+  sygnaturę); `core/viewdata.py` (`prepare_view`: liczby z indeksu liczb +
+  świeże raporty, stan leniwy, zapis pliku stanu); `ui/suite_window.py`
+  (start z pliku stanu; gry DAT-ów doczytywane w tle z lokalnego cache;
+  zadania czekają na koniec doczytywania; wszystkie pełne `load_report_states`
+  w oknie → `LazyStates`; `len(e.games)` → `game_count`; kolejność katalogów
+  z pamięci; zmiana skip aktualizuje plik stanu).
+- ZMIANA: start = odczyt jednego małego pliku stanu + indeksu liczb (lokalnie,
+  bez NAS) → drzewo z liczbami od razu. Gry DAT-ów doczytują się w tle z
+  `dat_parse_cache` (bez NAS). DatRoot przeglądamy tylko przyciskiem „Wczytaj
+  DAT-y" (jak „Update DATs") i przy „Skanuj i raportuj" (jak dotąd). Brak pliku
+  stanu / inne DatRoot albo rom_root w ustawieniach → stary pełny start (i
+  zapis pliku stanu). Plik stanu zapisywany po: wczytaniu DAT-ów, skanie,
+  podglądzie, naprawie, zmianie zaznaczenia DAT-u.
+- WPŁYW: zmiany DAT-ów w DatRoot (nowy/zmieniony plik .dat, ręczna edycja
+  `_reguly.json`/`_kolejnosc.json` poza programem) widać po „Wczytaj DAT-y",
+  nie po samym restarcie — świadomie, jak w RomVault. Liczby/kolory bez zmian
+  (ten sam stan, inne źródło odczytu). Koniec operacji szybszy: bez
+  wczytywania stanu wszystkich DAT-ów (24 s „bez postępu" na końcu podglądu).
+  Plan naprawy bez zmian (krok 2 osobno).
+- WERYFIKACJA: testy — plik stanu: zapis/odczyt wpisów (wszystkie pola reguł),
+  inne DatRoot → brak; `DatEntry.load()` z cache bez dotykania pliku DAT-u;
+  indeks liczb = liczby z pełnego stanu; `LazyStates` wczytuje tylko pytany
+  DAT; start okna z pliku stanu bez `discover`/NAS. Pomiar czasu startu.
+
+## [0.6.98] — 2026-10-03
+
+### Sprzątanie: zbędna kopia ARCHIWUM rozpoznawana po treści (członkach), nie po bajtach zipa
+- DZIAŁANIE: user 02.10 (podgląd 22:09): 1552 pliki z No-intro → ToSort,
+  np. „Asteroids (USA) (Atari Anthology).zip"; user: „co mają nazwy? szukasz
+  po sumach, najwyżej naprawiasz nazwy".
+- ANALIZA: 1484 z nich to zipy, których CAŁA treść (ROM-y w środku) jest już
+  w kolekcji pod właściwą nazwą („Asteroids (USA).zip" obok). Sprzątanie
+  (`_clean_dir` → `_redundant_copy`) porównuje sumę CAŁEGO pliku zip — a
+  zip o innej nazwie wewnętrznej/starszy ma inne bajty, więc „treść nieznana"
+  → ToSort, a dopiero KOLEJNA naprawa kasuje go z ToSort („zawartość już w
+  kolekcji", ta sama reguła patrzy na członków). Dwa przebiegi, ruch po NAS,
+  ToSort zapchany duplikatami.
+- MIEJSCA: `rebuilder._redundant_copy` (jedyny wywołujący: `_clean_dir`;
+  kasowanie z ToSort ma własną, członkową regułę — bez zmian).
+- ZMIANA: gdy suma całego pliku nie ma kanonicznego „trzymacza", a plik to
+  archiwum z członkami w indeksie — zbędne, gdy KAŻDY niepusty członek (SHA-1,
+  bez SHA-1: CRC+rozmiar) leży w kanonicznej, fizycznej ścieżce tego
+  przebiegu (plik luzem albo członek innego archiwum), poza ToSort i poza
+  samym plikiem. Te same warunki co dla całego pliku (kanoniczny, nie link,
+  realna naprawa potwierdza istnienie na dysku). Działa jak dotąd tylko przy
+  włączonym kasowaniu ułożonych kopii z ToSort.
+- WPŁYW: podgląd: TOSORT z katalogów kolekcji ↓ (~1484 u usera), „KASUJ
+  zbędną kopię" ↑ o tyle samo; finałowe „KASUJ z ToSort (zawartość już w
+  kolekcji)" w następnym przebiegu ↓. Archiwum z choć jednym członkiem bez
+  kopii w kolekcji → dalej ToSort (nic nie ginie). Planowanie: zapytania do
+  indeksu (bez NAS) dla plików niekanonicznych.
+- WERYFIKACJA: test — zip pod starą nazwą z ROM-em obecnym pod właściwą
+  nazwą → KASUJ zbędną kopię (nie TOSORT); zip z jednym członkiem spoza
+  kolekcji → TOSORT; porównanie liczb podglądu przed/po. Ta sama funkcja
+  obsługuje sieroty (katalogi bez DAT-u: „NIEZNANY→ToSort" → „KASUJ zbędną
+  kopię (sierota)", gdy zipa treść jest w kolekcji).
+
+### Kopia fizyczna gry „już OK" tylko przy zgodnych SUMACH (nie nazwa+rozmiar)
+- DZIAŁANIE: user 03.10: „sprawdź, czy wszędzie masz sprawdzanie sum — nazwa
+  się zmienia w nowych DAT-ach, sumy zostają; te same gry w różnych DAT-ach
+  mają różne nazwy, te same sumy".
+- ANALIZA (przegląd wszystkich miejsc „ta sama treść"): matcher — wszystkie
+  sumy z DAT-u (`_row_full_match`), nazwa tylko jako preferencja wśród
+  trafień; claim/hierarchia — klucz treści; dedup finału — identyczne bajty
+  (hardlink); kasowanie z ToSort — członkowie po sumach; sprzątanie — patrz
+  wyżej (0.6.98). WYJĄTEK: `rebuilder._process`, gałąź „własna kopia
+  fizyczna" (treść jest gdzie indziej, ten DAT jej nie linkuje): plik pod
+  kanoniczną ścieżką uznawany za „już OK" po NAZWIE + ROZMIARZE
+  (`_physical_ok`) i ZGŁASZANY jako kopia fizyczna gry (`_claim`). Inna
+  rewizja o tym samym rozmiarze (częste przy ROM-ach) = „OK", a dzieci
+  linkowałyby do złej treści. (Matcher dał tu „gdzie indziej", więc plik pod
+  tą ścieżką NIE ma sum gry.)
+- MIEJSCA: `rebuilder._process` (jedyne wywołanie `_physical_ok`).
+- ZMIANA: „już OK" tylko gdy wpis indeksu pod kanoniczną ścieżką ma sumy
+  zgodne z ROM-em DAT-u (wszystkie podane po obu stronach, jak matcher; brak
+  porównywalnej sumy = nie wiadomo → nie OK); realna naprawa dodatkowo
+  potwierdza plik na dysku. Inaczej — jak w głównej ścieżce: kopia, a
+  zajęte miejsce zwykłym plikiem = KONFLIKT (nic nie nadpisujemy).
+  Zgłoszenie `_claim` dopiero dla potwierdzonej treści.
+- WPŁYW: podgląd/naprawa: plik o złej treści pod nazwą gry → KONFLIKT
+  zamiast cichego „już OK" (liczba KONFLIKT może wzrosnąć o takie pliki).
+  Pliki z poprawnymi sumami — bez zmian.
+- WERYFIKACJA: test — pod kanoniczną ścieżką inna rewizja o tym samym
+  rozmiarze, poprawna treść w innym katalogu → nie „już OK", KONFLIKT; ten
+  sam plik z poprawnymi sumami → „już OK".
+
+## [0.6.97] — 2026-10-02
+
+### Podgląd: fałszywe „POPRAW LINK" dla hardlinków dzieci przy przepakowaniu TorrentZip
+- DZIAŁANIE: user 02.10 (zrzut podglądu, 28 min, „niby 100% a dalej szuka
+  napraw"): tysiące „POPRAW LINK Z:\ROMS\1G1R\…(Retool)\X.zip ->
+  Z:\ROMS\No-intro\…\X.zip"; podgląd 21:31 → 20 337 takich linii, naprawa
+  01.10 → 12 576 (te same pliki).
+- ANALIZA: plik w 1G1R JEST hardlinkiem do No-intro (indeks: `link_of` =
+  plik No-intro, te same sumy), ale oba mają `tz=0` (nie TorrentZip). W
+  etapie 2 dziecko idzie ścieżką „zła metoda/nie-TZ" → rodzic wyżej →
+  `_link_over_copy`, które w PODGLĄDZIE od razu wołało `_relink_if_stale`.
+  Tam `os.readlink` działa tylko dla symlinku — na hardlinku rzuca, więc
+  KAŻDY poprawny hardlink wychodził jako „POPRAW LINK", a do tego 1 runda
+  SMB na plik w planowaniu (stąd ~15 plików/s). W realnej naprawie (0.6.95+)
+  ta sama ścieżka sprawdza `same_file` → OK, a przepakowanie rodzica i tak
+  przepina hardlinki dzieci (`relink_twins`) — więc to szum podglądu i strata
+  czasu, nie operacja. (0.6.94 w realnej naprawie kasował i odtwarzał te
+  hardlinki — stąd 12 576 w logu z 01.10.)
+- MIEJSCA: `rebuilder._link_over_copy` (jedyne wywołanie `_relink_if_stale`
+  na zwykłym pliku; drugie — gałąź HAVE — jest za `_link_or_absent`, które
+  przepuszcza tylko symlink/brak).
+- ZMIANA: podgląd: zwykły plik wg indeksu → `_linked_to` (indeks: `link_of`
+  albo te same sumy) = „już OK"; własna kopia innej treści → „POPRAW LINK"
+  jak w realnej naprawie. `_relink_if_stale` tylko dla symlinku/braku.
+- WPŁYW: tylko podgląd (liczba POPRAW LINK/„połączone" w podsumowaniu
+  spada o hardlinki już poprawne; REPACK rodziców bez zmian). Realna naprawa
+  bez zmian. Planowanie bez `readlink` na NAS dla tych plików.
+- WERYFIKACJA: test — dziecko-hardlink (`link_of`) nie-TZ w podglądzie
+  etapu 2: brak „POPRAW LINK", `readlink` nie wołany; własna kopia innej
+  treści → dalej „POPRAW LINK".
+
+### Postęp: pasek ogólny = cały etap, dolny = gra w bieżącym DAT-cie
+- DZIAŁANIE: user 02.10: „dlaczego nie ma paska postępu dla całości stage
+  2?"; dolny pasek stał na „xbox360: 32/32 100%", gdy szły inne DAT-y.
+- ANALIZA: `repair` ustawia „katalog i/N" na pasku ogólnym, ale ten sam
+  `progress` dostają podfazy (licznik plików naprawy `naprawa: …` w
+  `rb.run`, konwersja, odbudowa CHD, sprzątanie) i natychmiast go
+  nadpisują — widać „81/1214 (pliki)" jednego DAT-u, nie etap. Dolnego
+  paska w pętli po grach nikt nie ustawia → zostaje wartość z poprzedniej
+  fazy.
+- MIEJSCA: `repair.repair_collection` — etap 1 i etap 2 (wywołania
+  `rb.run`, `convert_from_source`, `convert_reports`, `rebuild_bad_chds`,
+  kasowanie źródeł); `rebuilder.run` (pętla po grach).
+- ZMIANA: podfazy dostają opakowany `progress`: pasek ogólny = (katalog +
+  ułamek podfazy) / liczba katalogów, tekst „etap X/2 — katalog i/N: DAT ·
+  podfaza (k/m)". `rb.run` przy zmianie gry (co ≥0,25 s) ustawia dolny pasek
+  „DAT: gra g/G — nazwa"; start każdego DAT-u czyści dolny pasek.
+- WPŁYW: tylko wyświetlanie postępu; żadnych zmian operacji ani logu.
+- WERYFIKACJA: test — wartości paska ogólnego w etapie 2 rosną
+  monotonicznie z katalogami mimo podfaz; dolny pasek dostaje grę.
+
 ## [0.6.96] — 2026-10-02
 
 ### Koniec operacji bez „Brak odpowiedzi": liczby drzewa liczone w tle

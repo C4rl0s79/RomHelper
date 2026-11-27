@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from .fileops import replace_rw, unlink_rw
 from .paths import is_protected
 
 LogCB = Callable[[str], None]
@@ -71,7 +72,7 @@ def purge_orphan_descriptors(index, roots: Iterable, *, log: LogCB = lambda m: N
                 n += 1
                 continue
             try:
-                os.unlink(p)
+                unlink_rw(p)
             except FileNotFoundError:
                 pass
             except OSError as e:

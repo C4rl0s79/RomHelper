@@ -263,6 +263,11 @@ def resolve_format(fmt: str, entry) -> str:
         # system „płytowy", ale DAT może być kartridżowy (PC Engine HuCard) —
         # sprawdź treść: brak plików płytowych → ZIP, nie CHD.
         return "zip" if _dat_is_cartridge(entry) else "chd"
+    # system NIEZNANY (np. „triforce" z dir2dat RetroBata): płyty nigdy do
+    # zipa, a o obsłudze CHD przez emulator nic nie wiemy → bez zmian
+    # (0.7.07: Mario Kart Arcade GP.iso → zip)
+    if not _dat_is_cartridge(entry):
+        return "keep"
     return "zip"               # kartridż → ZIP
 
 

@@ -51,6 +51,40 @@ def _save_state(reports, log: LogCB) -> None:
         log(f"   (nie zapisano stanu do okna: {e})")
 
 
+_STAGE_RES = 1000            # rozdzielczość ułamka podfazy w jednym katalogu
+
+
+def stage_progress(progress: Callable, stage: int, rep_i: int, ntot: int,
+                   name: str) -> Callable:
+    """`progress` dla PODFAZ katalogu `rep_i` (z `ntot`) w etapie `stage`.
+
+    Pasek ogólny pokazuje CAŁY etap: (katalog + ułamek podfazy) / katalogi;
+    podfaza (licznik plików naprawy, konwersja, odbudowa CHD…) dopisuje się
+    tylko do tekstu. Dawniej podfazy dostawały surowy `progress` i nadpisywały
+    „katalog i/N" swoimi liczbami (0.6.97: „81/1214 (pliki)" zamiast etapu 2).
+    W obrębie katalogu wartość nie cofa się (kolejne podfazy liczą od zera)."""
+    ntot = max(int(ntot), 1)
+    base = rep_i * _STAGE_RES
+    head = f"etap {stage}/2 — katalog {rep_i + 1}/{ntot}: {name}"
+    last = [base]
+
+    def cb(done=0, total=0, text: str = "") -> None:
+        try:
+            done, total = int(done), int(total)
+        except (TypeError, ValueError):
+            done, total = 0, 0
+        frac = min(max(done / total, 0.0), 1.0) if total > 0 else 0.0
+        val = max(last[0], base + int(frac * (_STAGE_RES - 1)))
+        last[0] = val
+        txt = head
+        if text.startswith("naprawa: "):          # licznik plików `rb.run`
+            text = tr("pliki do ułożenia")
+        if text:
+            txt += f" · {text}" + (f" ({done}/{total})" if total > 0 else "")
+        progress(val, ntot * _STAGE_RES, txt)
+    return cb
+
+
 def repair_collection(opts: RepairOptions, settings, entries, idx, *,
                       log: LogCB = lambda m: None,
                       progress: Callable = lambda d, t, s: None,
@@ -257,7 +291,10 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
         if eff and eff.get("skip"):
             continue
         name = rep.entry.name
-        progress(rep_i, ntot, f"etap 1/2 — {rep_i + 1}/{ntot}: {name}")
+        sprog = stage_progress(progress, 1, rep_i, ntot, name)
+        sprog()
+        if detail is not None:
+            detail(-1, 0, "")               # dolny pasek: nic z poprzedniej fazy
         _npre = purge_loose_on_verified_chd([rep], rules.for_entry, idx,
                                             log=log, dry_run=dry, cancel=cancel)
         if _npre:
@@ -268,10 +305,11 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
                 [rep], rules.for_entry, _tools, index=idx, dry_run=True,
                 log=lambda m: None, cancel=cancel, delete_roots=del_from,
                 make_links=opts.make_links, hierarchy=rb.hierarchy,
-                finals=_plan_finals, only_complete=opts.only_complete)
+                finals=_plan_finals, only_complete=opts.only_complete,
+                dat_known=rb._dat_known)
         rb.run([rep], clean=False, only_complete=opts.only_complete,
                rules=rules.for_entry, delete_placed_from=del_from,
-               cancel=cancel, converted_games=pending, on_progress=progress,
+               cancel=cancel, converted_games=pending, on_progress=sprog,
                defer_global=True)
         # stan DAT-u po jego operacjach (te same statusy, przestawione na
         # bieżąco) → zapis; zamknięcie w trakcie nie zostawia starych liczb
@@ -344,7 +382,10 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
             break
         eff = rules.for_entry(rep.entry)
         name = rep.entry.name
-        progress(rep_i, ntot, f"katalog {rep_i + 1}/{ntot}: {name}")
+        sprog = stage_progress(progress, 2, rep_i, ntot, name)
+        sprog()
+        if detail is not None:
+            detail(-1, 0, "")               # dolny pasek: nic z poprzedniej fazy
         if eff and eff.get("skip"):
             log(f"══ {name}: POMINIĘTY (reguła skip)")
             continue
@@ -363,10 +404,11 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
         if convert and not cancel.is_set():
             cst0, converted_games, src_to_purge = convert_from_source(
                 [rep], rules.for_entry, _tools, index=idx, dry_run=dry,
-                log=log, cancel=cancel, detail=detail, on_progress=progress,
+                log=log, cancel=cancel, detail=detail, on_progress=sprog,
                 on_converted=rb.add_canonical, delete_roots=del_from,
                 make_links=opts.make_links, slot=slot, hierarchy=rb.hierarchy,
-                finals=_finals, only_complete=opts.only_complete)
+                finals=_finals, only_complete=opts.only_complete,
+                dat_known=rb._dat_known)
             if converted_games:
                 log(f"   konwersja ze źródła: {cst0.summary()} "
                     f"({len(converted_games)} gier).")
@@ -378,13 +420,14 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
 
         # fallback-konwersja „w miejscu" PO placemencie (dla gier, których nie
         # dało się zrobić prosto ze źródła).
-        def _do_convert_one(_r=rep):
+        def _do_convert_one(_r=rep, _p=sprog):
             if not (convert and not cancel.is_set()):
                 return
             cst = convert_reports(
                 [_r], rules.for_entry, _tools, index=idx, log=log,
+                dry_run=dry,
                 cancel=cancel, detail=detail, on_converted=rb.add_canonical,
-                on_progress=lambda i, n, t: progress(i, n, f"konwersja: {t}"))
+                on_progress=lambda i, n, t: _p(i, n, f"konwersja: {t}"))
             if cst.converted:
                 log(f"   konwersja w miejscu: {cst.summary()}")
 
@@ -394,7 +437,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
                rules=rules.for_entry, dedup_roots=dedup_roots,
                delete_placed_from=del_from, cancel=cancel,
                after_place=_do_convert_one, converted_games=converted_games,
-               on_progress=progress, defer_global=True)
+               on_progress=sprog, defer_global=True)
 
         # złe kontenery CHD (in-place) — DVD zrobione jako CD itp.
         if _bad_chd_ctx and convert and not cancel.is_set():
@@ -403,7 +446,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
             try:
                 _rst = rebuild_bad_chds(
                     [rep.entry], _lib, _chd, settings, idx, extra_roots=_extra,
-                    dry_run=dry, log=log, on_progress=progress, detail=detail,
+                    dry_run=dry, log=log, on_progress=sprog, detail=detail,
                     cancel=cancel, slot=slot, seen=_rebuild_seen)
                 if _rst.rebuilt or _rst.verify_failed or _rst.errors:
                     log(f"   naprawa kontenera CHD: {_rst.summary()}")
@@ -416,7 +459,7 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
         #    DOMKNIĘCIU katalogu (współdzielone tory wielopłytowe były dostępne
         #    przez cały placement/fallback tego katalogu).
         if src_to_purge and not dry and not rb.cancelled:
-            progress(0, 0, f"{name}: kasuję źródła po konwersji…")
+            sprog(0, 0, tr("kasuję źródła po konwersji…"))
             purge_source_files(src_to_purge, index=idx, log=log, dry_run=dry)
 
         # stan TEGO DAT-u po jego domknięciu → zapis. To te same statusy,
@@ -476,6 +519,17 @@ def repair_collection(opts: RepairOptions, settings, entries, idx, *,
             log(f"Nieznane (brak DAT-a) → ToSort: {n_orph} plików (treść "
                 f"niepasująca do żadnego DAT-u; pasujące przeniesiono do "
                 f"targetów).")
+        # ToSort: treść, której nie używa żaden DAT → ToSort\nieznane (zasada
+        # usera 03.10; zip mieszany — tylko nieznani członkowie)
+        if not rb.cancelled and not cancel.is_set():
+            progress(0, 0, tr("finał: ToSort → nieznane…"))
+            n_unk = rb.sort_tosort_unknown([Path(t) for t in tosorts if t],
+                                           cancel=cancel)
+            if n_unk:
+                log(f"ToSort → nieznane: {n_unk} plików (treść spoza "
+                    f"wszystkich DAT-ów).")
+    rb._dat_keys = None                  # ~3 mln kluczy DAT-ów — tylko na finał
+    rb._dat_profiles = None
     # flaga przerwania na STATS — GUI po niej odświeża stan z INDEKSU (bez skanu)
     rb.stats.cancelled = rb.cancelled or cancel.is_set()
     rb.stats.reports = _state_reports

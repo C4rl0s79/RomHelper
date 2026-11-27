@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .fileops import replace_rw, unlink_rw
 from . import diskbudget, imageops, roundtrip
 from .chdman import CHDMan, CHDManResult
 from .models import CHDInfo, DiskBudget, MediaType
@@ -102,7 +103,7 @@ def _quarantine(path: Path, target_dir: Path, log: LogCB = _noop_log) -> Path:
             dest = target_dir / f"{stem}.{i}{suf}"
             i += 1
     try:
-        os.replace(path, dest)          # rename w obrębie woluminu
+        replace_rw(path, dest)          # rename w obrębie woluminu
     except OSError:
         shutil.move(str(path), str(dest))  # fallback: między woluminami
     log(f"Kwarantanna: {path.name} → {dest}")
@@ -116,13 +117,13 @@ def _atomic_replace(original: Path, new_file: Path, keep_backup: bool = False,
     if backup.exists():
         backup.unlink()
     if original.exists():
-        os.replace(original, backup)  # atomowo w obrębie woluminu
+        replace_rw(original, backup)  # atomowo w obrębie woluminu
     try:
-        os.replace(new_file, original)
+        replace_rw(new_file, original)
     except OSError:
         # rollback: przywróć oryginał
         if backup.exists():
-            os.replace(backup, original)
+            replace_rw(backup, original)
         raise
     if keep_backup:
         return backup
@@ -134,7 +135,7 @@ def _rollback(original: Path, new_file: Path, log: LogCB) -> None:
     new_file.unlink(missing_ok=True)
     backup = original.with_suffix(original.suffix + ".bak")
     if not original.exists() and backup.exists():
-        os.replace(backup, original)
+        replace_rw(backup, original)
         log(f"Rollback: przywrócono {original.name} z .bak")
 
 
@@ -296,7 +297,7 @@ def retype_file(
         backup_kept: Optional[Path] = None
         if settings.aggressive_low_disk:
             backup_kept = path.with_suffix(path.suffix + ".bak")
-            os.replace(path, backup_kept)
+            replace_rw(path, backup_kept)
             log("Tryb agresywny: oryginał przeniesiony do .bak (zwolnione miejsce)")
 
         # 3) Utwórz nowy CHD właściwym poleceniem.
@@ -307,7 +308,7 @@ def retype_file(
                         cancel_event=cancel_event)
         if not cr.ok:
             if backup_kept and backup_kept.exists():
-                os.replace(backup_kept, path)  # przywróć oryginał
+                replace_rw(backup_kept, path)  # przywróć oryginał
             raise RuntimeError(f"create ({create_cmd}) nie powiódł się")
 
         # 4) Weryfikacja PRZED nieodwracalną podmianą.
@@ -326,7 +327,7 @@ def retype_file(
                 on_progress=on_progress, cancel_event=cancel_event)
             if check_hash != src_hash:
                 if backup_kept and backup_kept.exists():
-                    os.replace(backup_kept, path)  # przywróć oryginał z .bak
+                    replace_rw(backup_kept, path)  # przywróć oryginał z .bak
                 raise RuntimeError(
                     "round-trip: dane po pakowaniu nie zgadzają się ze źródłem "
                     f"(src={src_hash[:12]}… != new={check_hash[:12]}…) — "
@@ -338,21 +339,21 @@ def retype_file(
             vr = chd.verify(new_file, on_progress=on_progress, cancel_event=cancel_event)
             if not vr.ok:
                 if backup_kept and backup_kept.exists():
-                    os.replace(backup_kept, path)
+                    replace_rw(backup_kept, path)
                 raise RuntimeError("weryfikacja nowego CHD nie powiodła się")
         elif settings.verify_after_create:
             log("Weryfikacja nowego CHD…")
             vr = chd.verify(new_file, on_progress=on_progress, cancel_event=cancel_event)
             if not vr.ok:
                 if backup_kept and backup_kept.exists():
-                    os.replace(backup_kept, path)
+                    replace_rw(backup_kept, path)
                 raise RuntimeError("weryfikacja nowego CHD nie powiodła się")
 
         new_size = new_file.stat().st_size
         # 5) Podmiana.
         if backup_kept:
             # oryginał już w .bak — wystarczy przenieść new_file na oryginał
-            os.replace(new_file, path)
+            replace_rw(new_file, path)
             backup_kept.unlink(missing_ok=True)
         else:
             _atomic_replace(path, new_file, keep_backup=False, log=log)
