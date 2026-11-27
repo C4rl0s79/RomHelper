@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import string
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +45,42 @@ def _candidate_roots(prefer: Optional[str]) -> list[str]:
             seen.add(k)
             out.append(r)
     return out
+
+
+def resilient_dir(preferred, log=None) -> Path:
+    """Zwraca ISTNIEJĄCY, zapisywalny katalog scratch, ODPORNIE na zniknięcie
+    scratchu w trakcie (np. RAM-dysk odmontowany nagle):
+      1) spróbuj `preferred` (utwórz),
+      2) gdy padło a to był RAM-dysk → spróbuj go ODTWORZYĆ (ramdisk.remount)
+         i użyć ponownie,
+      3) ostatecznie systemowy temp (dysk fizyczny) — byle operacja szła dalej.
+    """
+    def _mk(p: Path):
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except OSError:
+            return None
+
+    p = _mk(Path(preferred))
+    if p is not None:
+        return p
+    # preferred zniknął — jeśli to RAM-dysk, spróbuj go przywrócić
+    try:
+        from . import ramdisk
+        root = ramdisk.remount(log=log)
+        if root is not None:
+            q = _mk(root / _SCRATCH_NAME)
+            if q is not None:
+                if log:
+                    log(f"scratch: RAM dysk odtworzony {root}.")
+                return q
+    except Exception:
+        pass
+    if log:
+        log("scratch: używam systemowego temp (RAM dysk niedostępny).")
+    q = _mk(Path(tempfile.gettempdir()) / _SCRATCH_NAME)
+    return q if q is not None else Path(tempfile.gettempdir())
 
 
 def pick_scratch_root(need_bytes: int, prefer: Optional[str] = None,

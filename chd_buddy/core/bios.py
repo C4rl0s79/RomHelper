@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .fileops import replace_rw, unlink_rw
 from .settings import app_base_dir
 
 MANIFEST_FILENAME = "bios_manifest.json"
@@ -193,8 +194,8 @@ def load_manifest() -> dict:
 
 
 def save_manifest(m: dict) -> None:
-    manifest_path().write_text(json.dumps(m, indent=2, ensure_ascii=False),
-                               encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(manifest_path(), json.dumps(m, indent=2, ensure_ascii=False))
 
 
 # --- import libretro System.dat (clrmamepro) ----------------------------------
@@ -419,10 +420,13 @@ def export_for_emulator(emu: str, entries: list, files_db: dict,
         dest = emu_dir / subdir / zname
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
-                for arcname, src in members:
-                    z.writestr(arcname, src.read_bytes())
-                    copied += 1
+            # TorrentZip (0.6.95) — bitowo powtarzalny, jak RomVault
+            from .torrentzip import write_torrentzip
+            tmp = dest.with_name(dest.name + ".chdbuddy_tmp")
+            write_torrentzip(tmp, [(arcname, src.read_bytes())
+                                   for arcname, src in members])
+            replace_rw(tmp, dest)
+            copied += len(members)
             log(f"  [+] {emu}: zapakowano {len(members)} plików -> {dest}")
         except Exception as e:
             log(f"  [!] {emu}: błąd tworzenia {dest}: {e}")

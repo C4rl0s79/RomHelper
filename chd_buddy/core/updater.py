@@ -117,8 +117,8 @@ def load_versions() -> dict:
 
 
 def save_versions(v: dict) -> None:
-    versions_path().write_text(json.dumps(v, indent=2, ensure_ascii=False),
-                               encoding="utf-8")
+    from .fileops import atomic_write_text
+    atomic_write_text(versions_path(), json.dumps(v, indent=2, ensure_ascii=False))
 
 
 def _download(session, url: str, dest: Path, log: LogCB) -> None:
@@ -137,7 +137,9 @@ def _download(session, url: str, dest: Path, log: LogCB) -> None:
 
 
 def _find_7z() -> Optional[str]:
-    for cand in ("7z", r"C:\Program Files\7-Zip\7z.exe",
+    # 7zz = oficjalny 7-Zip na Linuksie, 7za = p7zip-full (starsze dystrybucje)
+    for cand in ("7z", "7zz", "7za",
+                 r"C:\Program Files\7-Zip\7z.exe",
                  r"C:\Program Files (x86)\7-Zip\7z.exe"):
         if shutil.which(cand) or Path(cand).exists():
             return cand

@@ -10,3 +10,4 @@
 *.chd binary
 *.sqlite3 binary
 *.pkl binary
+*.dll binary

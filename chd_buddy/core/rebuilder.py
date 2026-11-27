@@ -28,13 +28,18 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from .fileindex import FileIndex
-from .linker import create_link, is_link, remove_link
+from .fileops import replace_rw, unlink_rw
+from . import netguard
+from .fileindex import FileIndex, is_reparse_stat, unlink_tracked
+from .linker import create_link, is_link, remove_link, same_file
+from .hierarchy import Hierarchy
+from .frontend import is_frontend_under
+from .paths import dir_prefixes, is_protected
 from .matcher import DatReport, RomState, RomStatus
 
 LogCB = Callable[[str], None]
@@ -48,13 +53,18 @@ def _retry_locked(fn, attempts: int = 4, delay: float = 0.4):
     miał tę samą lekcję przy zapisie .lnk. Inne błędy lecą od razu.
     """
     import time
-    for i in range(attempts):
-        try:
-            return fn()
-        except OSError as e:
-            if getattr(e, "winerror", None) not in (5, 32) or i == attempts - 1:
-                raise
-            time.sleep(delay * (i + 1))
+
+    def _locked():
+        for i in range(attempts):
+            try:
+                return fn()
+            except OSError as e:
+                if getattr(e, "winerror", None) not in (5, 32) or i == attempts - 1:
+                    raise
+                time.sleep(delay * (i + 1))
+    # ZERWANY NAS (uśpienie laptopa, restart routera): czekaj, aż dysk wróci,
+    # i ponów całość — zamiast błędu i pominiętej gry
+    return netguard.call(_locked)
 
 
 @dataclass
@@ -69,16 +79,26 @@ class RebuildStats:
     deduped: int = 0
     tosort_deleted: int = 0
     substituted: int = 0
+    created: int = 0            # puste pliki-znaczniki (size=0, np. .msu)
+    repacked: int = 0          # ZIP-y przepakowane na DEFLATE (normalizacja)
     conflicts: int = 0
     skipped: int = 0
     links_skipped: int = 0      # symlink niemożliwy => NIC nie tworzymy
     incomplete: int = 0
+    bad_container: int = 0      # złe kontenery CHD (naprawia je krok CD→DVD)
     errors: int = 0
+    cancelled: bool = False     # przerwane przez użytkownika
+    reports: object = None      # podgląd: raporty = aktualny stan (odśwież GUI)
 
     def summary(self) -> str:
+        extra = f", puste pliki {self.created}" if self.created else ""
+        if self.repacked:
+            extra += f", ZIP→deflate {self.repacked}"
+        if self.bad_container:
+            extra += f", zły kontener→przebudowa {self.bad_container}"
         return (f"na miejscu {self.already_ok}, przeniesiono {self.moved}, "
                 f"zmieniono nazwę {self.renamed}, symlinki {self.linked}, "
-                f"skopiowano {self.copied}, wypakowano {self.unpacked}, "
+                f"skopiowano {self.copied}, wypakowano {self.unpacked}{extra}, "
                 f"do ToSort {self.tosorted}, kopie→symlinki {self.deduped}, "
                 f"skasowano z ToSort {self.tosort_deleted}, "
                 f"tłumaczenia {self.substituted}, "
@@ -99,19 +119,61 @@ def _base_title(name: str) -> str:
     return re.sub(r"\s+", " ", out).strip().lower()
 
 
+def _arc_game_sig(entry, game_name: str, names: bool = False) -> str:
+    """Odcisk TREŚCI gry (sumy jej efektywnych ROM-ów; `names` — także nazwy
+    plików w archiwum) — cache na entry. Ta sama gra w DAT-cie rodzica i
+    dziecka ma ten sam odcisk (link dziecko→rodzic), dwie RÓŻNE gry — różny,
+    nawet gdy leżą w tym samym źródłowym zipie."""
+    cache = getattr(entry, "_arc_sig", None)
+    if cache is None:
+        cache = {}
+        try:
+            entry._arc_sig = cache
+        except Exception:
+            pass
+    ck = (game_name, names)
+    sig = cache.get(ck)
+    if sig is None:
+        import hashlib
+        from . import mamesets
+        game = mamesets._by_name(entry).get(game_name)
+        if game is None:
+            sig = "g=" + game_name
+        else:
+            parts = sorted(
+                (f"{r.name.replace(chr(92), '/').lower()}:" if names else "")
+                + f"{r.size or 0}:{(r.crc or '').lower()}:{(r.sha1 or '').lower()}"
+                for r in mamesets.effective_roms(entry, game))
+            sig = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+        cache[ck] = sig
+    return sig
+
+
 def _claim_key(s: RomStatus) -> str:
+    # Gra jako CAŁY plik (CHD / archiwum) — klucz = TREŚĆ gry, NIE ścieżka
+    # źródła. Ta sama gra u rodzica i dziecka to jedna kopia fizyczna niezależnie
+    # od tego, gdzie leży plik (dawniej ścieżka w kluczu: dziecko z własnym
+    # plikiem nie rozpoznawało rodzica → kopia / osobne przepakowanie).
+    # Dwie RÓŻNE gry z jednego źródłowego zipa (pgm w ddp2.zip) mają różne klucze.
     if s.via_chd:
-        # CHD zaspokaja CAŁĄ grę — wszystkie jej ROM-y wskazują ten sam plik,
-        # więc kluczem jest źródłowy .chd (jedno przeniesienie, reszta = ok)
-        return "chdsrc:" + os.path.normcase(s.source_path)
+        return "chdset:" + _arc_game_sig(s.entry, s.game)
     if s.via_archive:
-        # archiwum <gra>.zip trzyma CAŁĄ grę — jedno przeniesienie, reszta = ok
-        return "arcsrc:" + os.path.normcase(s.source_path)
-    if s.rom.sha1:
-        return "sha1:" + s.rom.sha1.lower()
-    if s.rom.md5:
-        return "md5:" + s.rom.md5.lower()
-    return f"crc:{s.rom.crc.lower().zfill(8)}:{s.rom.size}"
+        # + NAZWY w środku: link do zipa z innymi nazwami byłby zły dla dziecka
+        return "arcset:" + _arc_game_sig(s.entry, s.game, names=True)
+    # DEDUP po WSZYSTKICH sumach z DAT-a (size + CRC + MD5 + SHA-1), nie tylko
+    # po najsilniejszej. Link (jedna kopia fizyczna) powstaje TYLKO, gdy dwa
+    # wpisy zgadzają się we WSZYSTKICH dostępnych sumach — inaczej każdy dostaje
+    # własną kopię. Chroni przed błędnym scaleniem plików, które mają zgodny
+    # jeden hash, a różnią się rozmiarem/inną sumą (uszkodzony/spreparowany DAT).
+    r = s.rom
+    parts = [f"size={r.size or 0}"]
+    if r.crc:
+        parts.append("crc=" + r.crc.lower().zfill(8))
+    if r.md5:
+        parts.append("md5=" + r.md5.lower())
+    if r.sha1:
+        parts.append("sha1=" + r.sha1.lower())
+    return "sums:" + "|".join(parts)
 
 
 def _size_ok(path: Path, expected: int) -> bool:
@@ -124,11 +186,43 @@ def _size_ok(path: Path, expected: int) -> bool:
         return False
 
 
+class _VerifyingReader:
+    """Strumień członka zipa liczący SHA-1/CRC w locie; na końcu porównuje z
+    ROM-em z DAT-u — zła treść = wyjątek (nic ze złą treścią nie powstaje)."""
+
+    def __init__(self, fh, rom):
+        import hashlib
+        self._fh, self._rom = fh, rom
+        self._h = hashlib.sha1()
+        self._crc = 0
+
+    def read(self, n: int = -1) -> bytes:
+        import zlib
+        b = self._fh.read(n)
+        if b:
+            self._h.update(b)
+            self._crc = zlib.crc32(b, self._crc)
+            return b
+        r = self._rom
+        if r.sha1 and self._h.hexdigest() != r.sha1.lower():
+            raise ValueError(f"SHA-1 nie zgadza się: {r.name}")
+        if r.crc and f"{self._crc & 0xFFFFFFFF:08x}" != r.crc.lower().zfill(8):
+            raise ValueError(f"CRC nie zgadza się: {r.name}")
+        return b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self._fh.close()
+        return False
+
+
 class Rebuilder:
     def __init__(self, index: FileIndex, *, tosort: Optional[Path] = None,
                  dry_run: bool = True, log: Optional[LogCB] = None,
                  make_links: bool = True, detail: Optional[Callable] = None,
-                 zip_level: int = 6):
+                 zip_level: int = 6, zip_method: str = "deflate"):
         self.index = index
         self.tosort = Path(os.path.abspath(tosort)) if tosort else None
         self.dry_run = dry_run
@@ -140,20 +234,248 @@ class Rebuilder:
         self._detail_cb = detail
         # poziom DEFLATE przy przepakowaniu ZIP (naprawa złych nazw wewn.)
         self._zip_level = max(0, min(int(zip_level), 9))
+        # metoda ZIP z ustawień: gdy "deflate", naprawa NORMALIZUJE docelowe
+        # ZIP-y niezgodne (ZSTD itp.) → DEFLATE (zmiana opcji = egzekwowana)
+        self._zip_method = str(zip_method or "deflate").lower()
         # hash -> ścieżka kopii fizycznej (kanonicznej)
+        # (jeden słownik dla kopii i linków — 0.6.93: klucz bez platformy,
+        # o linku decyduje hierarchia katalogów + treść)
         self._claims: dict[str, Path] = {}
+        # ETAP 1 naprawy: wolne przepakowania zipów (pobranie+wysyłka) czekają
+        # na etap 2 (repair ustawia)
+        self.defer_slow = False
+        self._deferred_zips: set = set()       # zipy odłożone z etapu 1
+        self._zipsums: Optional[set] = None     # SHA-1 zipów opisanych jako plik
+        self._fkeys: dict = {}          # ścieżka → `file:` klucz (_fkey_of_path)
+        # ŹRÓDŁA dopasowane do JAKIEGOKOLWIEK DAT-u w tym przebiegu (normcase abs).
+        # Plik będący źródłem dopasowanej gry NALEŻY do DAT-u (placement go
+        # przeniesie/zlinkuje/wypakuje), więc sweep sierot go NIE rusza do ToSort.
+        self._placed_sources: set[str] = set()
+        # 0.7.02: źródło KAŻDEGO dopasowanego statusu (także gier pominiętych
+        # jako niekompletne) — plik ToSort, którego używa jakikolwiek DAT, nie
+        # jest „nieznany"; prefiksy katalogów WSZYSTKICH DAT-ów (set_hierarchy)
+        # — „treść w kolekcji" = fizycznie w katalogu DAT-u, nie w sierocie
+        self._known_sources: set[str] = set()
+        self._dat_prefixes: Optional[list] = None
         # wszystkie ścieżki kanoniczne tego przebiegu (do sprzątania)
         self._canonical: set[str] = set()
+        # prefiksy katalogów ToSort z opcją kasowania ułożonych kopii (normcase);
+        # niepuste = zbędne luźne pliki (treść już w kolekcji) są KASOWANE,
+        # a nie przenoszone do ToSort
+        self._del_prefixes: list[str] = []
         # brak uprawnień do symlinków: nie przerywaj — pomijaj linki z licznikiem
         self._links_blocked = False
         # przerwane przez użytkownika (to co zrobione — zostaje zrobione)
         self.cancelled = False
+        # ścieżki PRZENIESIONE do ToSort w TYM przebiegu (clean) — dedup NIE
+        # może ich skasować (inaczej: TOSORT→KASUJ = utrata pliku, który był
+        # w kolekcji na starcie). Bufor bezpieczeństwa.
+        self._moved_to_tosort: set = set()
+        # źródła gier skonwertowanych PROSTO ZE ŹRÓDŁA, zaplanowane do
+        # SKASOWANIA po domknięciu katalogu (purge_source_files) — sprzątanie
+        # NIE przenosi ich do ToSort (inaczej np. setki luźnych .pcm MSU-1
+        # lądowały w ToSort jako duplikaty świeżo spakowanego <gra>.zip).
+        self._pending_purge: set = set()
+        # STAN NA ŻYWO (jak RomVault): po udanej operacji ROM-y gry dostają
+        # „jest" w samym raporcie i leci zdarzenie (entry, gra) — okno
+        # przestawia liczby DAT-u od razu, bez żadnego dopasowania
+        self.on_game_fixed: Optional[Callable[[object, str], None]] = None
+        self._cur_rep = None
+        self._bad_seen: set = set()           # CHD ze złym kontenerem (raz na plik)
+        # PODGLĄD: ścieżki, które naprawa by opróżniła / zapełniła
+        self._dry_gone: set = set()
+        self._dry_new: set = set()
+        # katalogi już utworzone/sprawdzone w tym przebiegu (mkdir raz na
+        # katalog — na NAS przez internet każde mkdir to 2 rundy SMB)
+        self._dirs_made: set = set()
+        # RÓWNOLEGŁE LINKI: I/O linku (os.link na NAS) w wątkach, decyzje i
+        # zapis indeksu w wątku właściciela (SQLite jednowątkowe)
+        self._link_pool = None
+        self._link_jobs: list = []            # (future, canonical, claimed)
+        self._link_lock = None
+        self._link_uncommitted = 0
+        # RÓWNOLEGŁE PRZEPAKOWANIA zipów w miejscu (0.7.06): jak linki — I/O w
+        # wątkach, indeks/licznik/log w wątku właściciela.
+        # {normcase ścieżki: (future, ścieżka, raport, gra)}
+        self._repack_pool = None
+        self._repack_jobs: dict = {}
+        # zipy położone w etapie 1, do przepakowania w etapie 2 (0.7.10)
+        self._pending_tz: dict = {}
+        # ARCHIWA gier (via_archive) PRÓBOWANE w tym przebiegu (per ścieżka
+        # kanoniczna): gra wieloplikowa ma N statusów-ROM-ów o tym samym
+        # archiwum/celu — bez tego `_place_archive` (repack/przeniesienie) leciał
+        # RAZ NA KAŻDY ROM. Przy sukcesie chroni to `_canonical`, ale przy
+        # NIEUDANYM repacku (np. MAME merged: indeks ma nazwę członka, której nie
+        # ma w pliku) canonical nie był zajmowany → 15× ta sama próba i „repakuje
+        # co przebieg". Próbujemy RAZ na canonical.
+        self._archive_tried: set = set()
         # podmiany Japan→T-En do wykonania po głównym przebiegu
         self._pending_subst: list[tuple[Path, Path, str, str]] = []
+        # HIERARCHIA DAT-ów — jedyne źródło decyzji „kopia fizyczna czy link".
+        # Pełną ustawia `set_hierarchy` (wszystkie DAT-y, sort_entries); bez
+        # niej `run` dopisuje DAT-y w kolejności raportów (rodzice pierwsi).
+        self._hier = Hierarchy()
 
     def _log(self, msg: str) -> None:
         if self._log_cb:
             self._log_cb(msg)
+
+    @property
+    def hierarchy(self) -> Hierarchy:
+        return self._hier
+
+    def set_hierarchy(self, entries, rules=None) -> None:
+        """Pełna hierarchia DAT-ów (WSZYSTKIE, także pominięte — ich katalogi
+        dalej trzymają kopie fizyczne), w kolejności `sort_entries`."""
+        entries = list(entries or ())
+        self._all_entries = entries
+        self._dat_keys = None                 # zbiór CRC+rozmiar (leniwie)
+        self._dat_profiles = None             # odciski gier płytowych (leniwie)
+        self._hier = Hierarchy(entries, rules)
+        self._dat_prefixes = dir_prefixes([getattr(e, "target_dir", None)
+                                           for e in entries])
+
+    def _claim(self, key: str, path, keep: bool = False,
+               fkey: Optional[str] = None) -> None:
+        """Zapamiętuje kopię fizyczną treści. keep=True — nie nadpisuj już
+        zapamiętanej. `fkey` (`file:<sha1 pliku>`) — gdy `path` ma TE SAME
+        BAJTY co plik źródłowy: DAT opisujący ten plik inaczej (zip jako plik
+        vs gra-archiwum) znajdzie go po sumie całego pliku."""
+        path = Path(path)
+        for k in (key, fkey):
+            if not k:
+                continue
+            if keep:
+                self._claims.setdefault(k, path)
+            else:
+                self._claims[k] = path
+
+    def _claim_of(self, key: str, fkey: Optional[str]):
+        """Gdzie leży ta treść: po opisie z DAT-u, potem po sumie pliku."""
+        c = self._claims.get(key)
+        if c is None and fkey:
+            c = self._claims.get(fkey)
+        return c
+
+    def _file_key(self, s: RomStatus) -> Optional[str]:
+        """`file:<sha1>|<rozmiar>` pliku źródłowego (z indeksu) — tylko gdy
+        status dotyczy CAŁEGO pliku, który trafi do celu bez zmiany bajtów
+        (nie członek, nie nadzbiór, nie przepakowanie do innego kontenera)."""
+        src = s.source_path
+        if not src and s.state in (RomState.HAVE, RomState.HAVE_CHD):
+            src = str(s.canonical_path)       # „jest" bez źródła = plik w celu
+            if s.member:
+                return None
+        elif not src or not self._whole_file(s):
+            return None
+        if s.via_archive and (Path(str(src)).suffix.lower()
+                              != s.canonical_path.suffix.lower()):
+            return None
+        return self._fkey_of_path(src)
+
+    def _fkey_of_path(self, path) -> Optional[str]:
+        """Klucz pliku z indeksu, ZAPAMIĘTANY per ścieżka: po przeniesieniu
+        indeks nie zna już starej ścieżki, a DAT z innym opisem tego pliku
+        (HAVE pod starą ścieżką) musi go znaleźć w tym samym przebiegu."""
+        k = os.path.normcase(os.path.abspath(str(path)))
+        if k in self._fkeys:
+            return self._fkeys[k]
+        try:
+            row = self.index.lookup(path)
+        except Exception:
+            row = None
+        fk = (f"file:{row['sha1'].lower()}|{row['size'] or 0}"
+              if row is not None and row["sha1"] else None)
+        self._fkeys[k] = fk
+        return fk
+
+    def _copy_file(self, src: Path, dest: Path) -> bool:
+        """KOPIA FIZYCZNA src → dest z paskiem postępu + wpis w indeksie (sumy
+        źródła). Podgląd: nic nie robi. False = błąd (policzony i zalogowany)."""
+        if self.dry_run:
+            return True
+        self._ensure_dir(dest.parent)
+        from .fileops import copy_with_progress
+        try:
+            _retry_locked(lambda: copy_with_progress(
+                src, dest, on_progress=self._detail_cb,
+                label=f"kopiuję {dest.name}"))
+        except OSError as e:
+            self.stats.errors += 1
+            self._log(f"BŁĄD kopiowania {dest}: {e}")
+            return False
+        finally:
+            self._detail_clear()
+        row = self.index.lookup(src)
+        if row is not None and row["sha1"]:
+            self.index.record_file(dest, row["crc32"], row["md5"], row["sha1"])
+            # kopia ARCHIWUM: skład jak w źródle (inaczej brak/stary skład)
+            if str(dest).lower().endswith((".zip", ".7z")):
+                self.index.copy_members(src, dest)
+        return True
+
+    def _copy_keep(self, src: Path, dest: Path, entry=None,
+                   label: str = "plik innego DAT-u zostaje") -> bool:
+        """Plik należący do INNEGO DAT-u (który go potrzebuje): źródło zostaje
+        u właściciela, ten DAT dostaje własny egzemplarz.
+
+        0.7.00: HARDLINK, gdy się da — na tym samym woluminie to równorzędna
+        kopia (ta sama treść, żaden koniec nie jest „ważniejszy"), bez
+        pobierania i wysyłania przez NAS. Kopia fizyczna tylko gdy: dane
+        modyfikowalne (`linkable`), DAT docelowy wymusza kopie fizyczne
+        (`dedup_copies=false`), linki wyłączone albo `os.link` się nie uda."""
+        from .hierarchy import linkable
+        self._repack_wait(src, dest)
+        node = self._hier.node(entry) if entry is not None else None
+        if (self.make_links and not self._links_blocked
+                and linkable(src) and linkable(dest)
+                and not (node is not None and node.physical_only)):
+            self._log(f"LINK (hardlink, {label}) {dest}  ⟶  {src}")
+            if self.dry_run:
+                self._dry_linked(dest)
+                self.stats.linked += 1
+                return True
+            self._ensure_dir(dest.parent)
+            try:
+                os.link(src, dest)
+                _ok = True
+            except FileExistsError:
+                _ok = same_file(src, dest)     # już ten sam plik = gotowe
+                if not _ok:
+                    self._log(f"  cel zajęty innym plikiem — robię kopię")
+            except OSError as e:
+                _ok = False
+                self._log(f"  hardlink niemożliwy ({e}) — robię kopię")
+            if _ok:
+                try:
+                    self.index.record_hardlink(dest, src)
+                except Exception:
+                    pass
+                self.stats.linked += 1
+                return True
+        self._log(f"KOPIA ({label}) {src} -> {dest}")
+        if not self._copy_file(Path(src), Path(dest)):
+            return False
+        self.stats.copied += 1
+        return True
+
+    @staticmethod
+    def _whole_file(s: RomStatus) -> bool:
+        """Źródło to CAŁY plik gry (CHD, archiwum z poprawnym zestawem albo
+        plik luzem) — nie członek archiwum ani nadzbiór."""
+        # `member` przy grze-ARCHIWUM to nazwa ROM-u w środku — całym plikiem
+        # jest archiwum. Dawniej każde `member` wykluczało → reguła „plik DAT-u
+        # wyżej = link" nie działała dla ŻADNEGO zipa (1G1R kopiował No-intro)
+        if not s.source_path or (s.member and not s.via_archive):
+            return False
+        return not (s.via_archive and (not s.archive_names_ok
+                                       or getattr(s, "archive_superset", False)))
+
+    def add_pending_purge(self, paths) -> None:
+        """Rejestruje źródła, które konwersja SKASUJE po domknięciu katalogu —
+        faza sprzątania ich nie rusza (kasowanie zamiast przenosin do ToSort)."""
+        for p in paths or ():
+            self._pending_purge.add(os.path.normcase(str(p)))
 
     def add_canonical(self, path) -> None:
         """Rejestruje ścieżkę jako KANONICZNĄ (wynik naprawy). Konwersja woła
@@ -178,32 +500,598 @@ class Rebuilder:
     # --- operacje plikowe (wszystkie honorują dry_run) ---------------------
 
     def _ensure_dir(self, d: Path) -> None:
-        if not self.dry_run:
-            d.mkdir(parents=True, exist_ok=True)
+        if self.dry_run:
+            return
+        k = os.path.normcase(str(d))
+        if k in self._dirs_made:
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        self._dirs_made.add(k)
+
+    # --- linki równolegle ----------------------------------------------------
+    # Pomiar u usera (NAS przez Tailscale, 33 ms): 0,6 s na link SZEREGOWO
+    # (lexists, mkdir ×2, os.link, lstat ×2, 2× commit) → 62 133 linki = 10,4 h
+    # w etapie 1. Linki w obrębie jednego przebiegu są niezależne (cel = plik
+    # fizyczny już na miejscu), więc I/O idzie w puli wątków, a wynik (liczniki,
+    # indeks) obsługuje wątek właściciela.
+    LINK_WORKERS = 16
+    LINK_INFLIGHT = 256
+    LINK_COMMIT_EVERY = 500
+
+    def _link_io(self, link_path: Path, target: Path) -> tuple:
+        """WĄTEK ROBOCZY: tylko system plików. Zwraca (wynik, szczegół)."""
+        from .linker import LinkPrivilegeError
+        try:
+            d = link_path.parent
+            k = os.path.normcase(str(d))
+            with self._link_lock:
+                known = k in self._dirs_made
+            if not known:
+                d.mkdir(parents=True, exist_ok=True)
+                with self._link_lock:
+                    self._dirs_made.add(k)
+            try:
+                kind = create_link(link_path, target, is_dir=False)
+            except FileNotFoundError:
+                d.mkdir(parents=True, exist_ok=True)   # katalog znikł (prune)
+                kind = create_link(link_path, target, is_dir=False)
+            except FileExistsError:
+                if is_link(link_path) or same_file(link_path, target):
+                    return ("already", "sym" if is_link(link_path) else "hard")
+                return ("conflict", "")
+            return ("linked", kind or "hard")
+        except LinkPrivilegeError as e:
+            return ("priv", str(e))
+        except OSError as e:
+            return ("error", str(e))
+
+    def _link_submit(self, link_path: Path, target: Path, rep=None,
+                     game: Optional[str] = None) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        self._repack_wait(target, link_path)     # cel w trakcie przepakowania
+        if self._link_pool is None:
+            self._link_lock = threading.Lock()
+            self._link_pool = ThreadPoolExecutor(self.LINK_WORKERS,
+                                                 thread_name_prefix="link")
+        self._dry_linked(link_path)
+        fut = self._link_pool.submit(self._link_io, link_path, target)
+        self._link_jobs.append((fut, link_path, target, rep, game))
+        self._link_collect(block=len(self._link_jobs) >= self.LINK_INFLIGHT)
+
+    def _link_collect(self, block: bool = False) -> None:
+        """Obsłuż zakończone linki (wątek właściciela). block=True — czekaj na
+        najstarszy, gdy kolejka pełna."""
+        if not self._link_jobs:
+            return
+        if block:
+            self._link_jobs[0][0].result()
+        keep = []
+        for job in self._link_jobs:
+            if job[0].done():
+                self._link_finish(*job)
+            else:
+                keep.append(job)
+        self._link_jobs = keep
+        if self._link_uncommitted >= self.LINK_COMMIT_EVERY:
+            self._link_commit()
+
+    def _link_finish(self, fut, link_path: Path, target: Path, rep=None,
+                     game: Optional[str] = None) -> None:
+        res, info = fut.result()
+        if res in ("linked", "already"):
+            if res == "linked":
+                self.stats.linked += 1
+                self._async_ok = getattr(self, "_async_ok", 0) + 1
+            else:
+                self.stats.already_ok += 1
+            if game is not None:
+                self.mark_game_fixed(rep, game, link_path)
+            if info == "hard":
+                # hardlink = zwykły plik dla skanu: wpis z sumami celu (bez NAS)
+                try:
+                    self.index.record_hardlink(link_path, target, commit=False)
+                    self._link_uncommitted += 1
+                except Exception:
+                    pass
+        elif res == "conflict":
+            if self._resolve_link_conflict(link_path, target, rep, game):
+                self.stats.linked += 1
+                self._async_ok = getattr(self, "_async_ok", 0) + 1
+                if game is not None:
+                    self.mark_game_fixed(rep, game, link_path)
+            else:
+                self.stats.conflicts += 1
+                self._log(f"KONFLIKT: {link_path} zajęte zwykłym plikiem")
+        elif res == "priv":
+            self.stats.links_skipped += 1
+            if not self._links_blocked:
+                self._links_blocked = True
+                self._log(f"UWAGA: {info} Symlinki POMIJAM (nic nie kopiuję) — "
+                          f"uruchom jako administrator, aby je utworzyć.")
+        else:
+            self.stats.errors += 1
+            self._log(f"BŁĄD linku {link_path}: {info}")
+
+    def _link_commit(self) -> None:
+        if self._link_uncommitted:
+            try:
+                self.index._db.commit()
+            except Exception:
+                pass
+            self._link_uncommitted = 0
+
+    def _link_drain(self) -> None:
+        """Dokończ WSZYSTKIE zlecone linki (przed sprzątaniem/dedupem/końcem)."""
+        if not hasattr(self, "_link_jobs"):
+            return
+        while self._link_jobs:
+            self._link_collect(block=True)
+        self._link_commit()
+        if self._link_pool is not None:
+            self._link_pool.shutdown(wait=True)
+            self._link_pool = None
+
+    def _case_rename(self, src: Path, dst: Path) -> bool:
+        """Zmiana SAMEJ wielkości liter nazwy (ten sam plik, Windows/SMB ich
+        nie rozróżnia): przez nazwę tymczasową, potem wpis w indeksie. Podgląd
+        tylko loguje. True = zrobione (w podglądzie: zaplanowane)."""
+        src, dst = Path(src), Path(dst)
+        if str(src) == str(dst):
+            return True                           # nazwa już dokładnie taka
+        self._log(("(podgląd) " if self.dry_run else "")
+                  + f"NAZWA (wielkość liter) {src} -> {dst}")
+        if self.dry_run:
+            return True
+        tmp = dst.with_name(dst.name + ".rh_case_tmp")
+        try:
+            os.rename(src, tmp)
+        except OSError as e:
+            self.stats.errors += 1
+            self._log(f"  BŁĄD zmiany nazwy {src}: {e}")
+            return False
+        try:
+            os.rename(tmp, dst)
+        except OSError as e:
+            try:
+                os.rename(tmp, src)               # przywróć
+            except OSError:
+                pass
+            self.stats.errors += 1
+            self._log(f"  BŁĄD zmiany nazwy {src}: {e}")
+            return False
+        try:
+            self.index.rename(src, dst)
+        except Exception:
+            pass
+        return True
+
+    def _game_crcs(self, rep, game) -> set:
+        """{(crc_int, rozmiar)} niepustych ROM-ów gry z DAT-u."""
+        out: set = set()
+        if rep is None or game is None:
+            return out
+        for st in self._statuses_of(rep, game):
+            r = st.rom
+            if (r.size or 0) and r.crc:
+                try:
+                    out.add((int(r.crc, 16), r.size))
+                except ValueError:
+                    pass
+        return out
+
+    def _occupant_is_other(self, canonical, rep, game, disk: bool) -> bool:
+        """Pod `canonical` leży plik, który NIE jest tą grą (po sumach): nie
+        zawiera wszystkich ROM-ów gry z DAT-u (CRC+rozmiar). `disk` — spis
+        zipa z dysku (naprawa); inaczej z indeksu (podgląd). Nie da się
+        sprawdzić (brak sum gry, nie-zip na dysku) → False (nic nie ruszamy)."""
+        want = self._game_crcs(rep, game)
+        if not want:
+            return False
+        if disk:
+            lst = self._zip_listing(canonical)
+            return lst is not None and not want <= lst[0]
+        r = self.index.lookup(canonical)
+        if r is None or r["missing"] or r["is_link"]:
+            return False
+        from .content import content_sets, holds_roms
+        if not any(content_sets(self.index, r["path"])):
+            return False                      # treść nieznana — nie ruszamy
+        roms = [st.rom for st in self._statuses_of(rep, game)]
+        return not holds_roms(self.index, r["path"], roms)
+
+    def _evict_occupant(self, canonical) -> bool:
+        """Plik o INNEJ treści pod nazwą gry → ToSort (`nieznane`, gdy żaden
+        DAT go nie zna), żeby zrobić miejsce właściwemu. Nic nie kasujemy.
+        True = miejsce zwolnione (podgląd: zaplanowane)."""
+        if self.tosort is None:
+            return False
+        c = Path(os.path.abspath(str(canonical)))
+        row = self.index.lookup(c)
+        src = Path(row["path"]) if row is not None else c
+        if is_protected(src):
+            return False
+        rel = Path(c.parent.name) / src.name
+        if row is not None and self._wholly_unknown(row):
+            dst = self._unknown_dst(rel)
+        else:
+            dst = self.tosort / rel
+        n = 1
+        while not self.dry_run and os.path.lexists(dst):
+            dst = dst.with_name(f"{dst.stem}_{n}{dst.suffix}")
+            n += 1
+        self._log(f"TOSORT (inna treść pod nazwą z DAT-u) {src} -> {dst}")
+        if self._move(src, dst):
+            self.stats.tosorted += 1
+            self._moved_to_tosort.add(os.path.normcase(str(dst)))
+            return True
+        return False
+
+    def _fix_case_at(self, canonical) -> bool:
+        """Plik pod `canonical` w INNEJ wielkości liter (wg indeksu, bez NAS)
+        → `_case_rename` na nazwę z DAT-u. True = zmieniono/zaplanowano."""
+        c = Path(os.path.abspath(str(canonical)))
+        try:
+            r = self.index.lookup(c)
+        except Exception:
+            return False
+        if r is None or r["missing"]:
+            return False
+        actual = Path(r["path"])
+        if actual.name == c.name or (os.path.normcase(str(actual))
+                                     != os.path.normcase(str(c))):
+            return False
+        if self.dry_run and os.path.normcase(str(c)) in self._dry_gone:
+            return False
+        return self._case_rename(actual, c)
+
+    def _fix_case_on_disk(self, path: Path) -> None:
+        """Po podmianie pliku sprawdź na DYSKU, czy nazwa ma wielkość liter jak
+        w DAT-cie (os.replace na istniejący wpis bywa ją zachowuje)."""
+        p = Path(path)
+        try:
+            for n in os.listdir(p.parent):
+                if n != p.name and os.path.normcase(n) == os.path.normcase(p.name):
+                    self._case_rename(p.parent / n, p)
+                    return
+        except OSError:
+            pass
+
+    @staticmethod
+    def _zip_listing(path) -> Optional[tuple]:
+        """({(crc, rozmiar)} niepustych członków, {nazwa_lower}) zipa Z DYSKU
+        (sam central directory, bez dekompresji) albo None (nie zip / błąd)."""
+        if not str(path).lower().endswith(".zip"):
+            return None
+        import zipfile
+        try:
+            with zipfile.ZipFile(path) as z:
+                infos = [i for i in z.infolist() if not i.is_dir()]
+                return ({(i.CRC & 0xFFFFFFFF, i.file_size) for i in infos
+                         if i.file_size},
+                        {i.filename.replace("\\", "/").lower() for i in infos})
+        except (OSError, zipfile.BadZipFile):
+            return None
+
+    def _resolve_link_conflict(self, link_path: Path, target: Path,
+                               rep=None, game: Optional[str] = None) -> bool:
+        """REALNA naprawa (wątek właściciela): miejsce linku zajęte INNYM
+        plikiem. Indeks bywa w błędzie (plik mu nieznany, nieaktualny
+        `link_of`), więc rozstrzygamy Z DYSKU: oba zipy, każdy niepusty członek
+        pliku w miejscu linku jest w pliku docelowym (CRC+rozmiar), a plik
+        docelowy ma nazwy, których chce DAT tej gry → ta sama treść, poprawne
+        nazwy → atomowa podmiana na hardlink. True = podmieniono."""
+        self._repack_wait(link_path, target)
+        mine = self._zip_listing(link_path)
+        theirs = self._zip_listing(target)
+        if not mine or theirs is None or not mine[0] or not mine[0] <= theirs[0]:
+            # pod nazwą gry INNA treść (np. stary zrzut) → ToSort, link (0.7.04)
+            if (self._occupant_is_other(link_path, rep, game, disk=True)
+                    and self._evict_occupant(link_path)):
+                try:
+                    os.link(str(target), str(link_path))
+                except OSError as e:
+                    self._log(f"BŁĄD linku {link_path}: {e}")
+                    return False
+                self._log(f"LINK (tworzę) {link_path}  ⟶  wskazuje na {target}")
+                try:
+                    self.index.record_hardlink(link_path, target)
+                except Exception:
+                    pass
+                return True
+            return False
+        if rep is not None and game is not None:
+            want = {s.rom.name.replace("\\", "/").lower()
+                    for s in self._statuses_of(rep, game) if (s.rom.size or 0)}
+            if want and not want <= theirs[1]:
+                return False              # cel ma inne nazwy niż chce ten DAT
+        from .linker import replace_with_hardlink
+        err = replace_with_hardlink(link_path, target)
+        if err is not None:
+            self._log(f"BŁĄD linku {link_path}: {err}")
+            return False
+        self._log(f"POPRAW LINK (ta sama treść, inne bajty) {link_path} -> "
+                  f"{target}")
+        self._fix_case_on_disk(Path(link_path))   # nazwa jak w DAT-cie (0.7.04)
+        try:
+            self.index.record_hardlink(link_path, target)
+        except Exception:
+            pass
+        return True
+
+    def _ok_ops(self) -> int:
+        """Suma liczników UDANYCH operacji zmieniających kolekcję."""
+        st = self.stats
+        # linki równoległe liczone osobno (kończą się później, oznaczane w
+        # _link_finish) — inaczej zakończenie CUDZEGO linku w trakcie tej gry
+        # oznaczyłoby ją jako naprawioną
+        return (st.moved + st.renamed + st.linked + st.copied + st.unpacked
+                + st.created + st.repacked + st.substituted
+                - getattr(self, "_async_ok", 0))
+
+    def _statuses_of(self, rep, game: str) -> list:
+        """Statusy gry w raporcie — indeks gra→statusy budowany RAZ per raport
+        (przegląd całego DAT-u per naprawioną grę byłby kwadratowy)."""
+        cache = self.__dict__.setdefault("_games_by_rep", {})
+        hit = cache.get(id(rep))
+        if hit is None or hit[0] is not rep:
+            m: dict = {}
+            for x in rep.statuses:
+                m.setdefault(x.game, []).append(x)
+            hit = cache[id(rep)] = (rep, m)
+        return hit[1].get(game, ())
+
+    def mark_game_fixed(self, rep, game: str, canonical=None) -> None:
+        """ROM-y gry `game` w raporcie `rep` (o tej samej ścieżce kanonicznej,
+        gdy podana) → „jest"; zdarzenie do okna. Wywoływane PO udanej operacji
+        — to wypadkowa operacji, nie ponowne dopasowanie."""
+        if rep is None or self.dry_run:
+            return
+        cn = os.path.normcase(str(canonical)) if canonical is not None else None
+        changed = False
+        for x in self._statuses_of(rep, game):
+            if cn is not None and os.path.normcase(str(x.canonical_path)) != cn:
+                continue
+            if x.state in (RomState.MISSING, RomState.NO_HASH):
+                continue
+            new = RomState.HAVE_CHD if x.via_chd else RomState.HAVE
+            if x.state != new or getattr(x, "bad_container", False):
+                x.state = new
+                x.bad_container = False
+                changed = True
+        if changed and self.on_game_fixed is not None:
+            try:
+                self.on_game_fixed(rep.entry, game)
+            except Exception:
+                pass
+
+    def _hier_rom(self, s: RomStatus):
+        """Treść do pytań hierarchii („czy DAT ma tę treść"): WSZYSTKO, co
+        indeks wie o pliku źródłowym — suma ROM-u z DAT-u, suma CAŁEGO pliku,
+        odcisk gry (`data_sha1`: CHD vs DAT torów), nagłówek CHD (`chd_sha1`:
+        `<disk>`), sumy członków archiwum. Ten sam plik bywa opisany różnie
+        (zip jako gra-archiwum w FBNeo vs zip jako plik w dir2dat; CHD jako
+        dysk vs jako tory) — pytanie jedną sumą robiło ping-pong (01.10 TMNT
+        III; 0.6.90 CHD ROMS/psx ↔ Arcade1TB). Tylko lokalny SQLite."""
+        r = s.rom
+        ids = [((r.sha1 or ""), (r.crc or ""), r.size or 0)]
+        if s.source_path:
+            try:
+                row = self.index.lookup(s.source_path)
+            except Exception:
+                row = None
+            if row is not None:
+                ids.append(((row["sha1"] or ""), (row["crc32"] or ""),
+                            row["size"] or 0))
+                for col in ("data_sha1", "chd_sha1"):
+                    v = row[col] if col in row.keys() else ""
+                    if v:
+                        ids.append((v, "", 0))
+            # członkowie, gdy plik JEST archiwum — bez względu na opis w tym
+            # DAT-cie (dir2dat opisuje zip jako zwykły plik)
+            if str(s.source_path).lower().endswith((".zip", ".7z")):
+                try:
+                    for m in self.index.members_of(s.source_path):
+                        ids.append(((m["sha1"] or ""), (m["crc32"] or ""),
+                                    m["size"] or 0))
+                except Exception:
+                    pass
+        from types import SimpleNamespace
+        return SimpleNamespace(ids=ids, sha1=ids[0][0], crc=ids[0][1],
+                               size=ids[0][2])
+
+    def _still_flagged(self, path, column: str) -> bool:
+        """Flaga problemu pliku (bad_zip_method/bad_container) wg AKTUALNEGO
+        indeksu. Raport liczono przed naprawą; w TYM przebiegu podmiana pliku
+        rodzica mogła już przepiąć ten hardlink na poprawny plik (relink_twins)
+        — wtedy nic tu nie robimy. Brak wpisu = wierzymy raportowi."""
+        try:
+            row = self.index.lookup(path)
+        except Exception:
+            return True
+        if row is None or column not in row.keys():
+            return True
+        return row[column] == 1
+
+    def _still_bad_container(self, s: RomStatus) -> bool:
+        """Czy CHD z raportu NADAL ma zły kontener — wg AKTUALNEGO indeksu.
+        Raport liczono przed naprawą; odbudowa CD→DVD w TYM przebiegu (katalog
+        rodzica, wcześniej) zapisuje bad_container=0 — wtedy dziecko linkuje od
+        razu, zamiast czekać na następną naprawę."""
+        src = getattr(s, "source_path", "") or ""
+        return not src or self._still_flagged(src, "bad_container")
 
     def _move(self, src: Path, dst: Path) -> bool:
+        if is_protected(src):
+            # biblioteka źródeł (<ToSort>/cues) — nigdy nie zabieramy: kopia
+            return self._copy_file(Path(src), Path(dst))
         self._ensure_dir(dst.parent)
         if self.dry_run:
+            # PODGLĄD pamięta, co by się przeniosło — dalsze decyzje (np. link
+            # w miejscu, z którego plik zabrał DAT wyżej) widzą stan PO naprawie
+            self._dry_gone.add(os.path.normcase(os.path.abspath(str(src))))
+            self._dry_new.add(os.path.normcase(os.path.abspath(str(dst))))
             return True
         from .fileops import move_with_progress
         try:
             _retry_locked(lambda: move_with_progress(
                 src, dst, on_progress=self._detail_cb,
-                label=f"przenoszę {dst.name}"))
+                label=f"przenoszę {dst.name}", ensure_parent=False))
         except OSError as e:
             self.stats.errors += 1
             self._log(f"BŁĄD przenoszenia {src}: {e}")
             return False
         finally:
             self._detail_clear()
+        self._fkey_of_path(src)        # zapamiętaj sumę starej ścieżki
         self.index.rename(src, dst)
         return True
+
+    # --- stan PODGLĄDU (nic nie dzieje się na dysku, a indeks się nie zmienia):
+    # etap 2 i kolejne DAT-y muszą widzieć skutki operacji już zaplanowanych —
+    # inaczej ten sam link/kasowanie trafia do podglądu drugi raz (zawyżone
+    # liczby). Realna naprawa widzi to w indeksie i na dysku.
+    def _dry_linked(self, path) -> None:
+        """Podgląd: `path` po naprawie będzie LINKIEM (już nie „zabrany")."""
+        if self.dry_run:
+            k = os.path.normcase(os.path.abspath(str(path)))
+            self._dry_gone.discard(k)
+            self._dry_new.add(k)
+
+    def _plan_delete(self, path) -> bool:
+        """Kasowanie `path`: podgląd planuje je RAZ (drugi DAT/etap widzi, że
+        pliku „już nie ma"). False = już zaplanowane albo plik z CHRONIONEJ
+        biblioteki źródeł (<ToSort>/cues) — pomiń."""
+        if is_protected(path):
+            return False
+        if not self.dry_run:
+            return True
+        k = os.path.normcase(os.path.abspath(str(path)))
+        if k in self._dry_gone:
+            return False
+        self._dry_gone.add(k)
+        return True
+
+    # --- widok plików: PODGLĄD z indeksu, NAPRAWA z dysku ------------------
+    # Planowanie (podgląd) NIE pyta NAS — indeks jest źródłem prawdy po skanie.
+    # Realna naprawa sprawdza dysk tuż przed operacją (indeks bywa nieaktualny).
+
+    def _exists(self, p) -> bool:
+        if self.dry_run:
+            r = self.index.lookup(p)
+            return r is not None and not r["missing"]
+        return os.path.lexists(p)
+
+    def _same_game_copy(self, p, target) -> bool:
+        """Pod `p` leży (wg INDEKSU, bez NAS) zwykły plik o INNYCH bajtach niż
+        `target`, ale z TĄ SAMĄ treścią — archiwum: każdy niepusty członek
+        (SHA-1, bez niego CRC+rozmiar) jest w `target` (członek albo cały
+        plik); CHD: ten sam `data_sha1`. Tylko wtedy wolno zastąpić `p`
+        hardlinkiem `target` (treść zostaje w rodzicu)."""
+        if self.dry_run and (os.path.normcase(os.path.abspath(str(p)))
+                             in self._dry_gone):
+            return False
+        r = self.index.lookup(p)
+        if r is None or r["missing"] or r["is_link"]:
+            return False
+        t = self.index.lookup(target)
+        if t is None or t["missing"]:
+            return False
+        nt = os.path.normcase(os.path.abspath(str(target)))
+        if "link_of" in r.keys() and r["link_of"] == nt:
+            return False                          # już hardlink tego pliku
+        if r["sha1"] and r["sha1"] == t["sha1"] and r["size"] == t["size"]:
+            return False                          # te same bajty — zwykły link
+        rk = r.keys()
+        if ("data_sha1" in rk and r["data_sha1"] and t["data_sha1"]
+                and r["data_sha1"] == t["data_sha1"]):
+            return True                           # CHD: ta sama treść danych
+        mine = [m for m in self.index.members_of(p) if (m["size"] or 0)]
+        if not mine:
+            return False
+        from .content import content_sets, has_item
+        tsets = content_sets(self.index, target)
+        return all(has_item(tsets, m["sha1"], m["crc32"], m["size"])
+                   for m in mine)
+
+    def _content_ok(self, p, rom) -> bool:
+        """Pod `p` leży fizyczny plik z TREŚCIĄ tego ROM-u — po SUMACH z
+        indeksu (wszystkie podane po obu stronach muszą się zgadzać, jak w
+        matcherze), nie po nazwie/rozmiarze. Brak porównywalnej sumy = nie
+        wiadomo = nie. Realna naprawa dodatkowo potwierdza plik na dysku."""
+        from .matcher import _row_full_match
+        if self.dry_run and (os.path.normcase(os.path.abspath(str(p)))
+                             in self._dry_gone):
+            return False
+        r = self.index.lookup(p)
+        if r is None or r["missing"] or r["is_link"]:
+            return False
+        comparable = ((rom.sha1 and r["sha1"]) or (rom.crc and r["crc32"])
+                      or (rom.md5 and r["md5"]))
+        if not comparable or not _row_full_match(r, rom):
+            return False
+        if self.dry_run:
+            return True
+        return os.path.isfile(p) and not is_link(p) and _size_ok(p, rom.size)
+
+    def _link_or_absent(self, p) -> bool:
+        """Czy pod `p` jest symlink albo nic (miejsce do (prze)linkowania)."""
+        if self.dry_run:
+            if os.path.normcase(os.path.abspath(str(p))) in self._dry_gone:
+                return True                    # zabrany wcześniej w tym podglądzie
+            r = self.index.lookup(p)
+            return r is None or bool(r["missing"]) or bool(r["is_link"])
+        # NAPRAWA: indeks najpierw. Plik znany indeksowi jako zwykły (albo
+        # hardlink) → nie „link albo nic" — BEZ pytania NAS. Dawniej 2 rundy SMB
+        # na KAŻDĄ grę „jest" z rodzicem (REDUMP/1G1R: tysiące, „80 s bez
+        # postępu", 30.09). Dysk pytamy tylko, gdy indeks nie wie albo mówi link.
+        r = self.index.lookup(p)
+        if r is not None and not r["missing"] and not r["is_link"]:
+            return False
+        return is_link(p) or not os.path.lexists(p)
+
+    def _target_exists(self, p) -> bool:
+        """Cel linku istnieje (podgląd: z indeksu + planowanych przeniesień)."""
+        if self.dry_run:
+            k = os.path.normcase(os.path.abspath(str(p)))
+            if k in self._dry_new:
+                return True
+            if k in self._dry_gone:
+                return False
+            r = self.index.lookup(p)
+            return r is not None and not r["missing"]
+        return Path(p).exists()
+
+    def _linked_to(self, p, target) -> bool:
+        """Czy `p` JUŻ jest linkiem (symlink albo hardlink) do treści `target`."""
+        if self.dry_run:
+            r = self.index.lookup(p)
+            if r is None:
+                return False
+            if r["is_link"]:
+                return True
+            tgt = os.path.normcase(os.path.abspath(str(target)))
+            if "link_of" in r.keys() and r["link_of"] == tgt:
+                return True
+            # nieznany hardlink sprzed zapisu `link_of`: ta sama treść co cel
+            # = nic do zrobienia w planie (realna naprawa rozpozna i zapamięta)
+            t = self.index.lookup(target)
+            return bool(t is not None and r["sha1"] and r["sha1"] == t["sha1"]
+                        and r["size"] == t["size"])
+        if is_link(p):
+            return True
+        if same_file(p, target):
+            self.index.set_link_of(p, target)       # następnym razem bez NAS
+            return True
+        return False
 
     def _symlink(self, link_path: Path, target: Path) -> bool:
         if not self.make_links or self._links_blocked:
             return False
+        self._repack_wait(link_path, target)
         self._ensure_dir(link_path.parent)
         if self.dry_run:
+            self._dry_linked(link_path)
             return True
         try:
             create_link(link_path, target, is_dir=False)
@@ -219,6 +1107,16 @@ class Rebuilder:
             self.stats.errors += 1
             self._log(f"BŁĄD linku {link_path}: {e}")
             return False
+        # HARDLINK (ten sam wolumin) to zwykły plik dla skanu — zapisz w
+        # indeksie, że to ta sama treść co cel: kolejne planowanie (podgląd)
+        # rozpozna „już zlinkowane" bez pytania NAS
+        try:
+            if not is_link(link_path):
+                # sumy + CZŁONKOWIE archiwum celu (bez nich skan otwierał i
+                # hashował każdy link-zip na NAS) + link_of — bez pytania NAS
+                self.index.record_hardlink(link_path, target)
+        except OSError:
+            pass
         return True
 
     def _relink_if_stale(self, link_path: Path, target: Path) -> bool:
@@ -239,13 +1137,17 @@ class Rebuilder:
             current = current.replace("\\\\?\\", "")
             same = (os.path.normcase(os.path.abspath(current))
                     == os.path.normcase(os.path.abspath(str(target))))
-            # cel się zgadza I link nie wisi (cel istnieje) → nic nie rób
-            if same and link_path.exists():
+            # cel się zgadza I CEL istnieje → nic nie rób. Sprawdzamy istnienie
+            # CELU (nie `link_path.exists()`, które PODĄŻA za linkiem — na SMB z
+            # wyłączoną oceną R2R zwraca False dla POPRAWNEGO linku → dawniej
+            # przepinaliśmy dobry link co przebieg).
+            if same and self._target_exists(target):
                 return False
-        if not target.exists():
+        if not self._target_exists(target):
             return False        # nie ma na co pokazać — zostaw jak jest
         self._log(f"POPRAW LINK {link_path} -> {target}")
         if self.dry_run:
+            self._dry_linked(link_path)
             self.stats.linked += 1
             return True
         try:
@@ -255,19 +1157,47 @@ class Rebuilder:
             self._log(f"BŁĄD usuwania starego linku {link_path}: {e}")
             return True         # nie licz jako already_ok — link był zły
         if self._symlink(link_path, target):
-            self.index.mark_link(link_path)
+            # hardlink (ten sam wolumin) NIE jest reparse pointem → w indeksie
+            # zwykły plik; is_link=1 tylko dla realnego symlinku.
+            if is_link(link_path):
+                self.index.mark_link(link_path)
             self.stats.linked += 1
         else:
             self.stats.links_skipped += 1
         return True
 
-    def _clear_dest(self, dst: Path) -> bool:
-        """True gdy ścieżka docelowa jest wolna (usuwa najwyżej symlink)."""
+    def _clear_dest(self, dst: Path, allow_overwrite: bool = False) -> bool:
+        """True gdy ścieżka docelowa jest wolna. Usuwa symlink zawsze; ZWYKŁY
+        plik usuwa TYLKO gdy `allow_overwrite` (mamy ZWERYFIKOWANY poprawny
+        zamiennik dla tej kanonicznej ścieżki — wg DAT-a to jej miejsce, więc
+        niekompletny/zły plik zastępujemy). Bez `allow_overwrite` zwraca False
+        (ochrona przed nadpisaniem nieznanego pliku)."""
+        # PODGLĄD (dry_run): odpowiada INDEKS (świeżo po skanie), nie dysk — bez
+        # tego każda gra przenoszona z ToSort robiła rundę SMB `lexists`/`is_link`
+        # (na NAS podgląd naprawy 6503 gier = minuty stania). EXECUTE nadal robi
+        # prawdziwe sprawdzenie FS niżej.
+        if self.dry_run:
+            row = self.index.lookup(dst)
+            if row is None or row["missing"]:
+                return True                         # wolne (indeks: brak pliku)
+            if row["is_link"]:
+                return True                         # link → usunęlibyśmy
+            return allow_overwrite                  # zwykły plik: tylko z overwrite
         if not os.path.lexists(dst):
             return True
         if is_link(dst):
             if not self.dry_run:
                 remove_link(dst)
+            return True
+        if allow_overwrite:
+            if not self.dry_run:
+                try:
+                    unlink_rw(dst)
+                    self.index.remove_path(dst)
+                except OSError as e:
+                    self._log(f"BŁĄD zastępowania {dst}: {e}")
+                    return False
+            self._log(f"ZASTĄP zły/niekompletny plik: {dst}")
             return True
         return False
 
@@ -282,6 +1212,7 @@ class Rebuilder:
             cancel=None,
             after_place: Optional[Callable[[], None]] = None,
             converted_games: Optional[set] = None,
+            defer_global: bool = False,
             ) -> RebuildStats:
         """only_complete: buduj wyłącznie gry, których WSZYSTKIE pliki są
         dostępne (jak „Only keep complete sets" w RomVaulcie) — bez tego
@@ -292,8 +1223,9 @@ class Rebuilder:
         dedup_roots — po naprawie: fizyczne KOPIE potwierdzonych plików
         w tych korzeniach są zamieniane na symlinki (kopia fizyczna zostaje
         tylko pod ścieżką kanoniczną DAT-a rodzica)."""
-        protected: list[str] = []
         done_reports: list[DatReport] = []
+        for rep in reports:
+            self._hier.add(rep.entry, rules)
         tmap = (self._translation_map(reports)
                 if rules and any(rules(r.entry).get("prefer_translations")
                                  for r in reports) else {})
@@ -304,6 +1236,8 @@ class Rebuilder:
         # a nie „34/35" z definicji całej kolekcji. Pasek trzymamy na self,
         # żeby fazy po pętli (ToSort/dedup) też go ruszały.
         self._on_progress = on_progress
+        self._cancel = cancel               # by fazy po pętli mogły przerwać
+        self._del_prefixes = dir_prefixes(delete_placed_from)
         placed_sources: set[str] = set()
         _actionable = {RomState.ELSEWHERE, RomState.WRONG_NAME}
         place_total = len({os.path.normcase(s.source_path)
@@ -328,9 +1262,6 @@ class Rebuilder:
                 self._log(f"── {rep.entry.name}: POMINIĘTY (reguła skip)")
                 continue
             oc = eff["only_complete"] if eff else only_complete
-            if eff is not None and not eff.get("dedup_copies", True):
-                protected.append(os.path.normcase(
-                    str(rep.entry.target_dir)).rstrip("\\/") + os.sep)
             done_reports.append(rep)
             self._log(f"── {rep.entry.name} ({rep.entry.target_dir})")
             subst_games = (self._plan_substitutions(rep, tmap)
@@ -341,17 +1272,61 @@ class Rebuilder:
                 by_game: dict[str, bool] = {}
                 for s in rep.statuses:
                     # brakujący .cue nie blokuje gry — bywa nieobecny w zrzucie
-                    # (odtwarzalny z .bin, np. przy ekstrakcji z CHD)
+                    # (odtwarzalny z .bin). Pusty plik-znacznik (CREATABLE, np.
+                    # .msu) też nie blokuje — rebuilder go trywialnie utworzy.
                     ok = (s.state not in (RomState.MISSING, RomState.NO_HASH)
                           or s.rom.name.lower().endswith(".cue"))
                     by_game[s.game] = by_game.get(s.game, True) and ok
                 skip_games = {g for g, ok in by_game.items() if not ok}
+            _cur_game = None
+            # DOLNY pasek: gra g/G w TYM DAT-cie (dawniej nikt go tu nie
+            # ustawiał — stał na wartości z poprzedniej fazy, np. „xbox360
+            # 32/32 100%"). Odświeżany co ≥0,25 s; operacje plikowe (kopia,
+            # przepakowanie) nadpisują go swoim postępem i czyszczą.
+            _ng = len({s.game for s in rep.statuses}) or 1
+            _gi = 0
+            _gt = 0.0
+            self._detail_clear()
             for s in rep.statuses:
+                # PRZERWANIE na GRANICY GRY: dokańczamy bieżącą grę (wszystkie jej
+                # pliki), ale NIE bierzemy następnej. Sprawdzamy więc cancel tylko
+                # przy ZMIANIE gry (statusy jednej gry idą po sobie), nie w środku
+                # — inaczej zostałaby np. pół-wypakowana gra MSU1. Bez tego check
+                # był raz na DAT (~389) i „przerwij" mielił całą platformę
+                # (SNESMSU1 = setki gier) mimo żądania stopu.
+                if s.game != _cur_game:
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        break
+                    # NAS padł (uśpienie laptopa)? — czekaj na powrót, nie
+                    # podejmuj decyzji na „znikniętych" plikach
+                    if not netguard.checkpoint(cancel):
+                        self.cancelled = True
+                        break
+                    _cur_game = s.game
+                    _gi += 1
+                    _now = time.monotonic()
+                    if _now - _gt >= 0.25 or _gi == _ng:
+                        _gt = _now
+                        self._detail(_gi, _ng, f"{rep.entry.name}: gra "
+                                               f"{_gi}/{_ng} — {s.game}")
+                # źródło dopasowane do DAT-u = treść ZNANA (także gdy gra jest
+                # niekompletna i pominięta niżej) — nie trafi do ToSort\nieznane
+                if s.source_path:
+                    self._known_sources.add(
+                        os.path.normcase(os.path.abspath(str(s.source_path))))
                 # gra już skonwertowana PROSTO ZE ŹRÓDŁA (finał w docelowym
                 # zgłoszony przez add_canonical; źródło do zbiorczego kasowania)
                 # — placement pomija, inaczej układałby luźne źródło obok CHD.
                 if (converted_games is not None
                         and f"{id(rep.entry)}::{s.game}" in converted_games):
+                    # gra już na CHD w TYM katalogu — placement pomijamy, plik
+                    # chronimy przed sprzątaniem (dziecko i tak zlinkuje do
+                    # niego z hierarchii: leży w katalogu tego DAT-u)
+                    if s.via_chd and s.state in (RomState.HAVE,
+                                                 RomState.HAVE_CHD):
+                        self._canonical.add(
+                            os.path.normcase(str(s.canonical_path)))
                     continue
                 if s.game in subst_games:
                     continue        # zamiast wersji Japan wchodzi tłumaczenie
@@ -359,7 +1334,11 @@ class Rebuilder:
                     if s.state in (RomState.WRONG_NAME, RomState.ELSEWHERE):
                         self.stats.incomplete += 1
                     continue
+                self._cur_rep = rep
+                _ok0 = self._ok_ops()
                 self._process(s)
+                if self._ok_ops() > _ok0:
+                    self.mark_game_fixed(rep, s.game, s.canonical_path)
                 # pasek rośnie o KAŻDY realnie ułożony plik źródłowy (distinct)
                 if s.state in _actionable and s.source_path:
                     src = os.path.normcase(s.source_path)
@@ -367,6 +1346,20 @@ class Rebuilder:
                         placed_sources.add(src)
                         _tick(rep.entry.name)
             _tick(rep.entry.name, force=True)
+            # linki i przepakowania tego DAT-u domknięte, zanim ruszy następny
+            # (pasek i log zgodne z dyskiem; kolejny DAT może linkować do tych
+            # samych celów)
+            self._repack_drain()
+            self._link_drain()
+            if self.cancelled:
+                self._log(f"PRZERWANO naprawę w trakcie DAT-u "
+                          f"{rep.entry.name} — wykonane operacje są na dysku "
+                          f"i w indeksie; wznowienie dokończy resztę.")
+                break
+        if not self.cancelled:
+            self._flush_pending_tz(done_reports)
+        self._repack_drain()
+        self._link_drain()
         self._apply_substitutions()
         if self.cancelled:
             # BEZPIECZEŃSTWO: po przerwaniu NIE sprzątamy i NIE dedupujemy —
@@ -378,7 +1371,10 @@ class Rebuilder:
         # KONWERSJA (jeśli podano) MUSI iść PRZED dedupem/sprzątaniem: zamienia
         # luźne pliki na CHD/RVZ, więc dedup nie zlinkuje plików, które za
         # chwilę zniknęłyby w konwersji (katastrofa wiszących linków D2).
-        if after_place is not None and not self.dry_run:
+        # Także w PODGLĄDZIE (0.7.07): wołający przekazuje mu tryb podglądu —
+        # dawniej konwersje w miejscu w ogóle nie trafiały do podglądu (72
+        # „KONWERSJA→ZIP" w naprawie 05.10 przy 0 w podglądzie).
+        if after_place is not None:
             after_place()
         if clean and self.tosort:
             # policz nie-kanoniczne pliki do przeniesienia → pasek „sprzątanie"
@@ -392,9 +1388,59 @@ class Rebuilder:
             self._clean_done = 0
             for rep in done_reports:
                 self._clean_dir(rep.entry.target_dir)
+        # DEDUP (kopie→symlinki dziecko→rodzic MIĘDZY platformami) jest z natury
+        # GLOBALNY — dziecko może zlinkować do rodzica dopiero gdy rodzic jest już
+        # zrobiony. Przy naprawie „katalog po katalogu" (defer_global=True) NIE
+        # robimy go tu; suite woła `finalize_global` RAZ, po domknięciu wszystkich
+        # katalogów. To samo dot. sprzątania ZBĘDNYCH ARCHIWÓW w ToSort i pustych
+        # katalogów ToSort (operacje na całym ToSort, nie na jednym katalogu).
+        if not defer_global:
+            self._finalize_global(done_reports, dedup_roots, delete_placed_from,
+                                  cancel)
+        else:
+            # per-katalog: domknij TYLKO puste podkatalogi tego katalogu
+            # docelowego (reszta — dedup/ToSort — zostaje na finał).
+            for rep in done_reports:
+                self._prune_empty_dirs(rep.entry.target_dir)
+        return self.stats
+
+    def finalize_global(self, done_reports: Sequence[DatReport],
+                        dedup_roots: Sequence[Path] = (),
+                        delete_placed_from: Sequence[Path] = (),
+                        rules: Optional[Callable[[object], dict]] = None,
+                        cancel=None) -> None:
+        """Globalny finał po naprawie „katalog po katalogu": dedup
+        (kopie→symlinki dziecko→rodzic MIĘDZY platformami), kasowanie zbędnych
+        archiwów w ToSort i pustych katalogów ToSort. Wymaga PEŁNEGO obrazu —
+        wszystkie katalogi już domknięte (rodzice istnieją, więc dzieci mają do
+        czego linkować). Pomijany przy przerwaniu (jak dawniej)."""
+        if self.cancelled or (cancel is not None and cancel.is_set()):
+            return
+        for r in done_reports:
+            self._hier.add(r.entry, rules)
+        self._finalize_global(done_reports, dedup_roots, delete_placed_from,
+                              cancel)
+
+    def _finalize_global(self, done_reports, dedup_roots, delete_placed_from,
+                         cancel) -> None:
         if dedup_roots or delete_placed_from:
-            self._dedup_confirmed(dedup_roots or delete_placed_from, protected,
+            # kierunek linków (dziecko → rodzic wg hierarchii; „rodzic" i
+            # dedup_copies=false fizycznie) rozstrzyga WYŁĄCZNIE hierarchia
+            self._dedup_confirmed(dedup_roots or delete_placed_from,
                                   delete_roots=delete_placed_from)
+        # ZBĘDNE ARCHIWA w ToSort (niezależnie od formatu gry): ZIP/7z, którego
+        # cała zawartość jest już w kolekcji, jest kasowany — także dla gier
+        # LUŹNYCH (nie tylko CHD). Bez tego spakowane źródła MSU-1/SNES zostawały.
+        if delete_placed_from:
+            self._purge_redundant_tosort_archives(delete_placed_from, cancel)
+        # NORMALIZACJA KOMPRESJI ZIP — NIE robimy jej automatycznie w każdej
+        # naprawie. Powód: pliki UTWORZONE w tym przebiegu `pack_zip` od razu
+        # pakuje wybraną metodą (`zip_method`), więc są już poprawne; a stare
+        # zipy trzeba by przepakować TYLKO po ZMIANIE ustawienia metody — to
+        # rzadkie. Skanowanie CAŁEJ kolekcji (otwarcie każdego ZIP-a na NAS)
+        # co przebieg to była główna nieefektywność (i „zawieszenie" przy 100%).
+        # `_normalize_target_zip_compression` / `_complete_zip_canonicals`
+        # zostają do WYWOŁANIA NA ŻĄDANIE (osobny przycisk, gdy zajdzie potrzeba).
         for rep in done_reports:
             self._prune_empty_dirs(rep.entry.target_dir)
         # puste podkatalogi ZOSTAJĄCE w ToSort po zabraniu plików — sprzątamy
@@ -403,21 +1449,47 @@ class Rebuilder:
         for root in delete_placed_from:
             if root:
                 self._prune_empty_dirs(Path(root))
-        return self.stats
 
     def _prune_empty_dirs(self, target_dir: Path) -> None:
-        """Usuwa puste podkatalogi po przenosinach (rmdir — tylko puste)."""
-        if self.dry_run or not target_dir.is_dir():
+        """Usuwa puste podkatalogi po przenosinach (rmdir — tylko puste).
+
+        TYLKO katalogi, z których W TYM PRZEBIEGU coś zniknęło (indeks notuje je
+        przy remove_path/rename) + ich rodzice w górę, dopóki się opróżniają.
+        Dawniej `os.walk` CAŁEGO drzewa i `rmdir` na każdym podkatalogu — na NAS
+        przez internet (Wii: 1266 katalogów gier) minuty ciszy przy ~17 KB/s
+        ruchu (same rundy SMB). Katalogu `target_dir` nie usuwamy nigdy."""
+        if self.dry_run:
             return
-        for dirpath, _dirs, _files in sorted(
-                os.walk(target_dir), key=lambda t: len(t[0]), reverse=True):
-            if os.path.normcase(dirpath) == os.path.normcase(str(target_dir)):
-                continue
-            try:
-                os.rmdir(dirpath)   # pada, gdy katalog nie jest pusty — OK
-                self._log(f"USUNIĘTO pusty katalog: {dirpath}")
-            except OSError:
-                pass
+        self._repack_drain()
+        self._link_drain()
+        if hasattr(self, "_dirs_made"):
+            self._dirs_made.clear()    # katalogi mogą zniknąć — cache od nowa
+        _take = getattr(self.index, "take_vacated_under", None)
+        cands = _take(target_dir) if _take is not None else []
+        if not cands:
+            return
+        _cancel = getattr(self, "_cancel", None)
+        root = os.path.normcase(os.path.abspath(str(target_dir))).rstrip("\\/")
+        tried: set = set()
+        total = len(cands)
+        for i, d in enumerate(cands, 1):
+            if _cancel is not None and _cancel.is_set():
+                self.cancelled = True
+                return
+            if i % 50 == 0 or i == total:
+                self._phase(i, total, f"puste katalogi: {Path(d).name}")
+            cur = d
+            while True:
+                nc = os.path.normcase(cur)
+                if nc == root or not nc.startswith(root + os.sep) or nc in tried:
+                    break
+                tried.add(nc)
+                try:
+                    os.rmdir(cur)   # pada, gdy katalog nie jest pusty — OK
+                    self._log(f"USUNIĘTO pusty katalog: {cur}")
+                except OSError:
+                    break           # niepusty → rodzic tym bardziej
+                cur = os.path.dirname(cur)
 
     # --- tłumaczenia: podmiana wersji Japan na T-En -----------------------------
 
@@ -487,7 +1559,6 @@ class Rebuilder:
     # --- kopie potwierdzonych plików -> symlinki -------------------------------
 
     def _dedup_confirmed(self, roots: Sequence[Path],
-                         protected: Sequence[str],
                          delete_roots: Sequence[Path] = ()) -> None:
         """Plik potwierdzony pod ścieżką kanoniczną (parent) — pozostałe
         fizyczne kopie w obrębie `roots` zamieniamy na symlinki.
@@ -496,51 +1567,87 @@ class Rebuilder:
         linkowane — plik jest już poprawnie ułożony gdzie indziej, więc jego
         kopia w ToSort jest zbędna (weryfikacja: identyczny SHA-1 i rozmiar).
 
-        Podmiana odwracalna (rename → symlink → dopiero usunięcie tmp);
-        katalogi z regułą dedup_copies=false są chronione. Bez uprawnień
+        Link powstaje tylko, gdy pozwala hierarchia (kopia w katalogu DAT-u
+        NIŻEJ niż plik kanoniczny, DAT kopii nie jest
+        „rodzicem" ani nie ma dedup_copies=false).
+        Podmiana odwracalna (rename → symlink → dopiero usunięcie tmp). Bez uprawnień
         do symlinków pass symlinkowy jest pomijany, ale kasowanie z ToSort
         (bezpieczne — kopia potwierdzona) działa dalej.
         """
-        del_prefixes = [os.path.normcase(str(Path(os.path.abspath(r)))).rstrip(
-            "\\/") + os.sep for r in delete_roots if r]
+        del_prefixes = dir_prefixes(delete_roots)
         if self._links_blocked and not del_prefixes:
             self._log("Kopie→symlinki: pominięte (brak uprawnień do symlinków).")
             return
-        prefixes = [os.path.normcase(str(Path(os.path.abspath(r)))).rstrip("\\/")
-                    + os.sep for r in roots if r]
-        canonicals = {os.path.normcase(str(p)) for p in self._claims.values()}
-        _uniq = sorted(set(self._claims.values()))
+        prefixes = dir_prefixes(roots)
+        _all = list(self._claims.values())
+        canonicals = {os.path.normcase(str(p)) for p in _all}
+        _uniq = sorted(set(_all))
         _dtotal = len(_uniq) or 1
         for _di, canonical in enumerate(_uniq, 1):
-            self._phase(_di, _dtotal, "dedup / sprzątanie kopii")
+            if _di % 200 == 0 or _di == _dtotal:
+                self._phase(_di, _dtotal,
+                            f"dedup / sprzątanie kopii: {Path(canonical).name}")
             row = self.index.lookup(canonical)
-            if row is None or not row["sha1"] or row["is_link"] or row["missing"]:
-                continue
+            if (row is None or not row["sha1"] or row["is_link"]
+                    or row["missing"] or not (row["size"] or 0)):
+                continue                      # pusty plik: brak tożsamości (0.7.10)
+            ncanon = os.path.normcase(os.path.abspath(str(canonical)))
+            # 1) KANDYDACI Z INDEKSU (bez NAS): kopie tej treści w `roots`.
+            #    Dawniej NAJPIERW `is_file` na NAS dla KAŻDEGO pliku
+            #    kanonicznego kolekcji (dziesiątki tysięcy) — ~50 min ciszy w
+            #    finale — choć zdecydowana większość nie ma żadnej kopii.
+            cands: list = []
             for r in self.index.find_sha1(row["sha1"],
                                           include_chd_content=False):
-                p = r["path"]
-                np = os.path.normcase(p)
+                np = os.path.normcase(r["path"])
                 if (r["is_link"] or np in canonicals
                         or r["size"] != row["size"]):
                     continue
+                # NIE kasuj/nie ruszaj pliku przeniesionego do ToSort w TYM
+                # przebiegu (clean) — inaczej TOSORT→KASUJ = utrata pliku.
+                if np in self._moved_to_tosort:
+                    continue
                 if not any(np.startswith(rp) for rp in prefixes):
                     continue
-                if any(np.startswith(pp) for pp in protected):
+                # znany HARDLINK tej treści (zapisany przez program) — już jest
+                # tym samym plikiem fizycznym, nic do zrobienia
+                if ("link_of" in r.keys() and r["link_of"] == ncanon):
                     continue
+                cands.append(r)
+            if not cands:
+                continue
+            # 2) FIZYCZNY DOWÓD tylko w realnej naprawie i tylko gdy jest co
+            #    ruszać: plik kanoniczny istnieje (indeks bywa nieaktualny —
+            #    ghost skasowałby jedyny egzemplarz). Podgląd nie dotyka NAS.
+            if not self.dry_run and not Path(canonical).is_file():
+                continue
+            for r in cands:
+                p = r["path"]
+                np = os.path.normcase(p)
                 victim = Path(p)
-                try:
-                    vst = os.lstat(victim)
-                except OSError:
-                    continue
-                if is_link(victim) or vst.st_size != row["size"]:
-                    continue
+                if not self.dry_run:
+                    try:
+                        vst = os.lstat(victim)
+                    except OSError:
+                        continue
+                    if is_reparse_stat(vst) or vst.st_size != row["size"]:
+                        continue
+                    # JUŻ hardlink do kanonicznej (ten sam plik fizyczny) → nic
+                    # nie rób; zapamiętaj w indeksie — kolejne przebiegi (i
+                    # podgląd) pominą go bez pytania NAS.
+                    if same_file(victim, canonical):
+                        self.index.set_link_of(victim, canonical)
+                        continue
 
                 # kopia w ToSort, a plik jest już na miejscu → SKASUJ (zbędna)
                 if any(np.startswith(dp) for dp in del_prefixes):
-                    self._log(f"KASUJ z ToSort (już na miejscu): {victim}")
+                    if not self._plan_delete(victim):
+                        continue
+                    self._log(("(podgląd) " if self.dry_run else "")
+                              + f"KASUJ z ToSort (już na miejscu): {victim}")
                     if not self.dry_run:
                         try:
-                            _retry_locked(lambda v=victim: os.unlink(v))
+                            _retry_locked(lambda v=victim: unlink_rw(v))
                             self.index.remove_path(victim)
                         except OSError as e:
                             self.stats.errors += 1
@@ -549,15 +1656,28 @@ class Rebuilder:
                     self.stats.tosort_deleted += 1
                     continue
 
+                # HIERARCHIA: link tylko DAT niżej → DAT wyżej, ta sama
+                # platforma; ta sama kolekcja / „rodzic" / inna platforma /
+                # dedup_copies=false → zostaje fizyczna. Kopia POZA katalogami
+                # DAT-ów (ToSort itp.) NIGDY nie staje się linkiem — po naprawie
+                # w ToSort nie ma zostawać nic z DAT-ów (kasowanie wyżej).
+                vnode = self._hier.dat_at(victim)
+                if vnode is None or not self._hier.should_link(
+                        vnode.entry, canonical, at=victim):
+                    continue
                 if self._links_blocked:
                     continue
-                self._log(f"KOPIA→SYMLINK {victim} -> {canonical}")
+                if self.dry_run and os.path.normcase(
+                        os.path.abspath(str(victim))) in self._dry_new:
+                    continue                    # podgląd: już zaplanowany link
+                self._log(f"KOPIA→LINK {victim} -> {canonical}")
                 if self.dry_run:
+                    self._dry_linked(victim)
                     self.stats.deduped += 1
                     continue
                 tmp = victim.with_name(victim.name + ".chdbuddy_dedup_tmp")
                 try:
-                    _retry_locked(lambda: os.replace(victim, tmp))
+                    _retry_locked(lambda: replace_rw(victim, tmp))
                 except OSError as e:
                     self.stats.errors += 1
                     self._log(f"BŁĄD rename {victim}: {e}")
@@ -565,26 +1685,616 @@ class Rebuilder:
                 try:
                     create_link(victim, Path(canonical), is_dir=False)
                 except OSError as e:
-                    os.replace(tmp, victim)     # rollback
+                    replace_rw(tmp, victim)     # rollback
                     from .linker import LinkPrivilegeError
                     if isinstance(e, LinkPrivilegeError):
                         self._links_blocked = True
                         self._log(f"UWAGA: {e} Przerywam zamianę kopii.")
                         return
                     self.stats.errors += 1
-                    self._log(f"BŁĄD symlinku {victim}: {e}")
+                    self._log(f"BŁĄD linku {victim}: {e}")
                     continue
                 try:
                     tmp.unlink()
                 except OSError as e:
                     self._log(f"UWAGA: nie usunięto tymczasowego {tmp}: {e}")
-                self.index.mark_link(victim)
+                # HARDLINK to zwykły wpis (nie reparse point) — indeks ma go
+                # widzieć jak plik z tą treścią, nie jak symlink. Tylko realny
+                # symlink oznaczamy is_link=1.
+                if is_link(victim):
+                    self.index.mark_link(victim)
+                elif row["sha1"]:
+                    self.index.record_file(victim, row["crc32"],
+                                           row["md5"], row["sha1"])
+                    self.index.set_link_of(victim, canonical)   # hardlink
                 self.stats.deduped += 1
+
+    # rozszerzenia „śmieciowe" — pliki spoza jakiegokolwiek DAT-a (save'y,
+    # metadane, skróty), które NIE blokują uznania archiwum za zbędne.
+    _JUNK_EXT = {".srm", ".xml", ".url", ".nfo", ".txt"}
+
+    def _content_placed_outside(self, sha1, crc, size, del_prefixes,
+                                exclude: Optional[str] = None) -> bool:
+        """Czy treść (po SHA-1, w razie braku CRC+rozmiar) istnieje jako
+        OBECNY plik POZA katalogami ToSort (`del_prefixes`) — czyli jest już
+        ułożona w kolekcji."""
+        # PUSTA treść (0 B / sumy pustego pliku) nie ma tożsamości — każdy
+        # pusty plik ma te same sumy; „jest w kolekcji" byłoby fałszem (0.7.10)
+        from .matcher import _EMPTY_SUMS
+        if (size is not None and not size) or (
+                (sha1 or "").lower() in _EMPTY_SUMS):
+            return False
+
+        def _in_dat_dirs(np: str) -> bool:
+            # 0.7.02: liczy się kopia FIZYCZNIE w katalogu DAT-u — nie w
+            # sierocie (sama idzie do ToSort\nieznane / kasowania) i nie plik
+            # zaplanowany w tym podglądzie do zabrania
+            if self.dry_run and np in self._dry_gone:
+                return False
+            if self._dat_prefixes is None:
+                return True                   # bez hierarchii — jak dawniej
+            return any(np.startswith(dp) for dp in self._dat_prefixes)
+
+        def _hit(rows) -> bool:
+            for r in rows:
+                if r["missing"]:
+                    continue
+                np = os.path.normcase(r["path"])
+                if any(np.startswith(dp) for dp in del_prefixes):
+                    continue                  # kopia w ToSort — nie liczy
+                if np == exclude or not _in_dat_dirs(np):
+                    continue                  # sam sprawdzany plik / sierota
+                # BEZPIECZNIK (tylko REALNA naprawa): potwierdź FIZYCZNIE, że
+                # kopia w kolekcji ISTNIEJE, zanim skasujemy archiwum ToSort
+                # (indeks bywa nieaktualny — inaczej „kopia" mogłaby być duchem,
+                # utrata jedynego egzemplarza). Ta sama gwarancja co w
+                # _dedup_confirmed. W dry-run ufamy indeksowi — podgląd i tak nic
+                # nie kasuje, a unikamy masowych lexists na NAS.
+                if self.dry_run or os.path.lexists(r["path"]):
+                    return True
+            return False
+        def _hit_member(rows) -> bool:
+            # treść jako CZŁONEK archiwum w kolekcji (np. gra MSU-1 = <gra>.zip)
+            for r in rows:
+                np = os.path.normcase(r["archive"])
+                if any(np.startswith(dp) for dp in del_prefixes):
+                    continue
+                if np == exclude or not _in_dat_dirs(np):
+                    continue
+                if self.dry_run or os.path.lexists(r["archive"]):
+                    return True
+            return False
+        if sha1 and _hit(self.index.find_sha1(sha1, include_chd_content=True)):
+            return True
+        if crc and size and _hit(self.index.find_crc(crc, size)):
+            return True
+        if sha1 and _hit_member(self.index.find_member_sha1(sha1)):
+            return True
+        if crc and size and _hit_member(self.index.find_member_crc(crc, size)):
+            return True
+        return False
+
+    def _purge_redundant_tosort_archives(self, delete_roots, cancel=None) -> None:
+        """Kasuje z ToSort ARCHIWA (zip/7z), których CAŁA zawartość jest już
+        w kolekcji (poza ToSort) — NIEZALEŻNIE od formatu gry (nie tylko CHD).
+        Śmieci spoza DAT-a (`_JUNK_EXT`) i puste markery (size=0) nie blokują.
+        Nie rusza archiwum o NIEZNANEJ zawartości (brak zindeksowanych członków
+        — trzeba pełnego skanu). dry_run tylko loguje."""
+        del_prefixes = dir_prefixes(delete_roots)
+        if del_prefixes == []:
+            return
+        # 1) ZBIERZ archiwa (zip/7z) pod ToSort — do licznika postępu. Bez tego
+        #    faza szła bez PASKA: bar stał na 100% z fazy dedup i wyglądało na
+        #    ZAWIESZONE, choć sprawdzała tysiące archiwów ToSort (user: „stoi").
+        archives: list = []
+        seen: set = set()
+        for r in delete_roots:
+            if not r or not Path(r).is_dir():
+                continue
+            for row in self.index.all_under(r, physical_only=True):
+                p = row["path"]
+                key = os.path.normcase(p)
+                if key in seen or key in self._moved_to_tosort:
+                    continue
+                ext = os.path.splitext(p)[1].lower()
+                if ext not in (".zip", ".7z") and (
+                        ext in self._JUNK_EXT or ext == ".m3u"
+                        or not (row["size"] or 0)):
+                    continue
+                seen.add(key)
+                archives.append(row)
+        total = len(archives) or 1
+        # 2) SPRAWDŹ każde z POSTĘPEM i responsywnym przerwaniem
+        for i, row in enumerate(archives, 1):
+            p = row["path"]
+            if cancel is not None and cancel.is_set():
+                self.cancelled = True
+                break
+            if i % 100 == 0 or i == total:
+                self._phase(i, total, f"sprzątanie ToSort: {Path(p).name}")
+            if os.path.splitext(p)[1].lower() not in (".zip", ".7z"):
+                # LUŹNY plik: zbędny, gdy jego treść leży już w kolekcji
+                # (także jako członek archiwum — luźne .pcm gry MSU-1)
+                members = [{"name": p, "sha1": row["sha1"],
+                            "crc32": row["crc32"], "size": row["size"],
+                            "data_sha1": self._dsha(row)}]
+            else:
+                try:
+                    members = self.index._db.execute(
+                        "SELECT name, sha1, crc32, size FROM members "
+                        "WHERE archive=?", (p,)).fetchall()
+                except Exception:
+                    continue
+            if not members:
+                continue                      # nieznana zawartość — nie ruszamy
+            redundant = True
+            checked = 0
+            for m in members:
+                ext = os.path.splitext(m["name"])[1].lower()
+                if ext in self._JUNK_EXT or (m["size"] or 0) == 0:
+                    continue                  # śmieć/marker — nie blokuje
+                checked += 1
+                ds = self._dsha(m)
+                if not (self._content_placed_outside(
+                        m["sha1"], m["crc32"], m["size"], del_prefixes)
+                        # płyta: ta sama TREŚĆ (odcisk), inna kompresja (0.7.08)
+                        or (ds and self._content_placed_outside(
+                            ds, None, None, del_prefixes))):
+                    redundant = False
+                    break
+            # nic niepustego nie sprawdzono (same puste/śmieci) = treść
+            # nieznana, nie „w kolekcji" (0.7.10: zip z pustym anarch.libretro)
+            if not redundant or not checked or not self._plan_delete(p):
+                continue
+            self._log(("(podgląd) " if self.dry_run else "")
+                      + f"KASUJ z ToSort (zawartość już w kolekcji): {p}")
+            if self.dry_run:
+                self.stats.tosort_deleted += 1
+                continue
+            try:
+                _retry_locked(lambda pp=p: unlink_rw(pp))
+                self.index.remove_path(p)
+                self.stats.tosort_deleted += 1
+            except OSError as e:
+                self.stats.errors += 1
+                self._log(f"BŁĄD kasowania archiwum {p}: {e}")
+
+    def _complete_zip_canonicals(self, reports) -> list:
+        """Ścieżki .zip będące kanoniczną KOMPLETNEJ gry (wszystkie ROM-y
+        obecne). Tylko takie wolno przepakowywać — niekompletnych/arcade nie
+        ruszamy. Pomija linki (kopia fizyczna jest u rodzica)."""
+        out: list = []
+        seen: set = set()
+        for rep in reports:
+            by_game: dict = {}
+            for s in rep.statuses:
+                by_game.setdefault(s.game, []).append(s)
+            for sts in by_game.values():
+                if not all(s.state in (RomState.HAVE, RomState.HAVE_CHD)
+                           for s in sts):
+                    continue                       # niekompletna → nie ruszamy
+                canon = sts[0].canonical_path
+                if str(canon).lower().endswith(".zip") and not is_link(canon):
+                    key = os.path.normcase(str(canon))
+                    if key not in seen and os.path.isfile(canon):
+                        seen.add(key)
+                        out.append(Path(canon))
+        return out
+
+    def _normalize_target_zip_compression(self, zip_paths) -> None:
+        """Przepakowuje podane ZIP-y (kanoniczne KOMPLETNYCH gier) o INNEJ
+        metodzie niż wybrana (`self._zip_method`) na tę metodę — żeby ZMIANA
+        ustawienia „metoda ZIP" była egzekwowana na istniejących plikach (nie
+        tylko nowo pakowanych). dry_run tylko loguje."""
+        from .convert import repack_zip, zip_needs_repack
+        # SPRAWDZENIE metody wymaga OTWARCIA każdego ZIP-a (na NAS — round-trip!).
+        # Przy dziesiątkach tysięcy kompletnych gier to długo — dlatego POKAZUJEMY
+        # postęp (inaczej wyglądało jak zawieszenie przy 100% paska ogólnego) i
+        # dajemy PRZERWAĆ. Puste => nic nie robimy.
+        zip_paths = list(zip_paths)
+        _zt = len(zip_paths) or 1
+        _cancel = getattr(self, "_cancel", None)
+        for _zi, p in enumerate(zip_paths, 1):
+            if _cancel is not None and _cancel.is_set():
+                self.cancelled = True
+                self._log("PRZERWANO normalizację kompresji ZIP.")
+                return
+            if _zi == 1 or _zi % 200 == 0 or _zi == _zt:
+                self._phase(_zi, _zt, "normalizacja kompresji ZIP")
+            p = Path(p)
+            if is_link(p) or not zip_needs_repack(p, self._zip_method):
+                continue                       # link albo już w wybranej metodzie
+            r = repack_zip(p, method=self._zip_method, level=self._zip_level,
+                           log=self._log, dry_run=self.dry_run,
+                           on_progress=self._detail_cb)
+            self._detail_clear()
+            if r.ok:
+                self.stats.repacked += 1
+                if not self.dry_run:
+                    try:
+                        if r.sums is not None:     # policzone w RAM (0.7.06)
+                            crc, md5, sha1 = r.sums
+                        else:
+                            from .fileindex import hash_file
+                            crc, md5, sha1 = hash_file(
+                                p, on_progress=lambda d, t, _n=p.name: self._detail(
+                                    d, t, f"sumy {_n}"))
+                        self.index.record_file(p, crc, md5, sha1)
+                        if r.tz != -1:
+                            self.index.set_tz(p, r.tz)
+                    except Exception:
+                        pass
+                    finally:
+                        self._detail_clear()
+            else:
+                self.stats.errors += 1
+                self._log(f"  BŁĄD repack {p}: {r.message}")
+
+    def _link_over_copy(self, path: Path, target: Path) -> bool:
+        """Dziecko → hardlink pliku rodzica. Symlink / brak pliku → jak dotąd
+        (`_relink_if_stale`). ZWYKŁY plik (własna kopia tej treści, np. zip ze
+        złą metodą obok przepakowanego rodzica) → ATOMOWA podmiana na hardlink
+        (dawniej „popraw link" usuwał tylko linki → WinError 183)."""
+        self._repack_wait(path, target)
+        if self.dry_run:
+            # PODGLĄD z indeksu (bez NAS): zwykły plik/hardlink — `readlink` w
+            # `_relink_if_stale` działa tylko na symlinku, więc każdy POPRAWNY
+            # hardlink dziecka wychodził jako „POPRAW LINK" (0.6.97: 20 tys.
+            # linii przy przepakowaniu TorrentZip rodziców; przepakowanie i tak
+            # przepina hardlinki dzieci — relink_twins)
+            r = self.index.lookup(path)
+            if r is not None and not r["missing"] and not r["is_link"]:
+                if self._linked_to(path, target):
+                    return False
+                self._log(f"POPRAW LINK {path} -> {target}")
+                self._dry_linked(path)
+                self.stats.linked += 1
+                return True
+            return self._relink_if_stale(path, target)
+        if is_link(path) or not os.path.isfile(path):
+            return self._relink_if_stale(path, target)
+        try:
+            if same_file(path, target):
+                return False
+        except OSError:
+            pass
+        from .linker import replace_with_hardlink
+        err = replace_with_hardlink(path, target)
+        if err is not None:
+            self.stats.errors += 1
+            self._log(f"BŁĄD linku {path}: {err}")
+            return True
+        self._log(f"POPRAW LINK {path} -> {target}")
+        try:
+            self.index.record_hardlink(path, target)
+        except Exception:
+            pass
+        self.stats.linked += 1
+        return True
+
+    def _zip_needs_repack(self, path) -> str:
+        """Czy zip `path` przepakować W MIEJSCU — wg AKTUALNEGO indeksu:
+        „method" (zstd/lzma — emulatory nie czytają), „tz" (nie TorrentZip,
+        przy metodzie deflate; 0.6.95), "" (nie). Zip, którego sumę CAŁEGO
+        pliku zna DAT (dir2dat opisuje zipy jako pliki), nie dla „tz": inna
+        suma po przepakowaniu = niezgodność z tamtym DAT-em."""
+        try:
+            row = self.index.lookup(path)
+        except Exception:
+            row = None
+        if row is None:
+            return "method"                  # brak wpisu = wierzymy raportowi
+        keys = row.keys()
+        if "bad_zip_method" in keys and row["bad_zip_method"] == 1:
+            return "method"
+        if ("tz" in keys and row["tz"] == 0 and self._zip_method == "deflate"
+                and (row["sha1"] or "").lower() not in self._zip_file_sums()):
+            return "tz"
+        return ""
+
+    def _zip_file_sums(self) -> set:
+        """SHA-1 zipów/7z opisanych w DAT-ach jako CAŁY plik (ROM `*.zip`)."""
+        if self._zipsums is None:
+            sums: set = set()
+            for node in list(getattr(self._hier, "_by_id", {}).values()):
+                try:
+                    games = node.entry.load().games
+                except Exception:
+                    continue
+                for g in games:
+                    for r in g.roms:
+                        n = (r.name or "").lower()
+                        if r.sha1 and n.endswith((".zip", ".7z")):
+                            sums.add(r.sha1.lower())
+            self._zipsums = sums
+        return self._zipsums
+
+    # --- przepakowania równolegle (0.7.06) -----------------------------------
+    # py-spy u usera: przepakowanie zipa 0,4 MB = 4,25 s, z czego ~95% to
+    # czekanie na operacje plikowe na NAS (każda ~0,3–0,5 s przez Tailscale).
+    # Zipy są niezależne → I/O kilku naraz; zip większy niż REPACK_POOL_MAX
+    # — w wątku właściciela, pojedynczo (pamięć).
+    REPACK_WORKERS = 4
+    REPACK_POOL_MAX = 64 * 1024 * 1024
+
+    def _tz_of(self, path) -> int:
+        """Status TorrentZip pliku wg indeksu (1/0, -1 = nie wiem)."""
+        try:
+            row = self.index.lookup(path)
+            return int(row["tz"]) if row is not None else -1
+        except Exception:
+            return -1
+
+    def _queue_tz(self, dest: Path, tz: int, game: Optional[str]) -> None:
+        """Zip POŁOŻONY przez naprawę (przeniesienie/kopia) ma mieć format
+        katalogu (0.7.10): nie-TorrentZip przy metodzie deflate → przepakowanie
+        w TEJ naprawie. Etap 1 (`defer_slow`) — do etapu 2 tego katalogu;
+        dawniej etap 2 decydował ze statusów sprzed naprawy i zip czekał na
+        następną naprawę. Zip opisany w DAT-cie jako CAŁY plik — nie ruszamy."""
+        if (tz != 0 or self._zip_method != "deflate"
+                or not str(dest).lower().endswith(".zip")):
+            return
+        try:
+            row = self.index.lookup(dest)
+        except Exception:
+            row = None
+        if row is not None and (row["sha1"] or "").lower() in self._zip_file_sums():
+            return
+        if self.defer_slow:
+            self._pending_tz[os.path.normcase(str(dest))] = (Path(dest), game)
+        else:
+            self._repack_bad_zip(Path(dest), reason="tz", game=game)
+
+    def _flush_pending_tz(self, reports) -> None:
+        """Etap 2: przepakuj zipy położone w etapie 1 w katalogach TEGO
+        przebiegu (`_queue_tz`)."""
+        pend = getattr(self, "_pending_tz", None)
+        if not pend or self.defer_slow:
+            return
+        prefixes = dir_prefixes([r.entry.target_dir for r in reports])
+        for key in [k for k in pend if any(k.startswith(dp) for dp in prefixes)]:
+            dest, game = pend.pop(key)
+            self._repack_bad_zip(dest, reason="tz", game=game)
+
+    def _repack_bad_zip(self, path: Path, reason: str = "method",
+                        game: Optional[str] = None) -> None:
+        """Przepakowuje zip W MIEJSCU: zła metoda (zstd/lzma) albo nie
+        TorrentZip → TorrentZip (deflate, bitowo jak RomVault) / wybrana
+        metoda. Aktualizuje sumy i flagi w indeksie, przepina hardlinki.
+        dry_run tylko loguje. Zwykle W TLE (pula) — wynik obsługuje
+        `_repack_finish`; operacje na tej ścieżce czekają (`_repack_wait`)."""
+        what = ("nie TorrentZip → TorrentZip" if reason == "tz"
+                else f"zła metoda → {self._zip_method}")
+        if self.dry_run:
+            self._log(f"(podgląd) REPACK ZIP ({what}): {path}")
+            self.stats.repacked += 1
+            return
+        path = Path(path)
+        self._repack_wait(path)                     # ten sam zip już w toku
+        # link do TEGO zipa jeszcze w toku → zanim ustalimy jego hardlinki
+        # (inaczej link zrobiony do STAREGO pliku zostałby ze starą treścią)
+        self._link_wait_target(path)
+        try:
+            cands = self.index.same_content(path)   # kandydaci (bez NAS)
+        except Exception:
+            cands = []
+        rep = self._cur_rep
+        try:
+            row = self.index.lookup(path)
+            size = int(row["size"] or 0) if row is not None else 0
+        except Exception:
+            size = 0
+        if size and size <= self.REPACK_POOL_MAX:
+            from concurrent.futures import ThreadPoolExecutor
+            if getattr(self, "_repack_pool", None) is None:
+                self._repack_jobs = getattr(self, "_repack_jobs", {})
+                self._repack_pool = ThreadPoolExecutor(
+                    self.REPACK_WORKERS, thread_name_prefix="repack")
+            key = os.path.normcase(os.path.abspath(str(path)))
+            fut = self._repack_pool.submit(self._repack_io, path, cands, None)
+            self._repack_jobs[key] = (fut, path, rep, game)
+            self._repack_collect(
+                block=len(self._repack_jobs) >= 2 * self.REPACK_WORKERS)
+            return
+        res = self._repack_io(path, cands, self._detail_cb)
+        self._detail_clear()
+        self._repack_finish(path, res, rep, game)
+
+    def _repack_io(self, path: Path, cands, on_progress) -> tuple:
+        """WĄTEK ROBOCZY (albo właściciel dla dużych): tylko system plików.
+        Hardlinki zipa ustalone PRZED podmianą (ten sam plik fizyczny), po
+        niej przepięte na nowy plik. Zwraca (wynik, stat, przepięte, błędy,
+        log)."""
+        from .convert import ConvertResult, repack_zip
+        from .linker import replace_with_hardlink
+        logs: list = []
+        twins: list = []
+        st0 = None
+        try:
+            st0 = os.stat(path)
+            for c in cands or ():
+                try:
+                    sc = os.stat(c)
+                except OSError:
+                    continue
+                if (st0.st_ino != 0 and sc.st_ino == st0.st_ino
+                        and sc.st_dev == st0.st_dev):
+                    twins.append(c)
+        except OSError:
+            pass                            # brak pliku → błąd z repack_zip
+        try:
+            r = repack_zip(path, method=self._zip_method, level=self._zip_level,
+                           log=logs.append, dry_run=False,
+                           on_progress=on_progress)
+        except Exception as e:              # nic nie może utknąć w puli
+            r = ConvertResult(False, message=str(e))
+        st = None
+        relinked: list = []
+        errs: list = []
+        if r.ok:
+            try:
+                st = os.stat(path)
+            except OSError:
+                st = None
+            changed = (st is None or st0 is None or st.st_ino != st0.st_ino)
+            for t in (twins if changed else ()):
+                err = replace_with_hardlink(Path(t), path)
+                if err is None:
+                    relinked.append(t)
+                else:
+                    errs.append((t, err))
+        return r, st, relinked, errs, logs
+
+    def _repack_finish(self, path: Path, res: tuple, rep=None,
+                       game: Optional[str] = None) -> None:
+        """WĄTEK WŁAŚCICIELA: log, licznik, indeks (sumy z wyniku — bez
+        ponownego czytania pliku), wpisy przepiętych hardlinków."""
+        r, st, relinked, errs, logs = res
+        for m in logs:
+            self._log(m)
+        if not r.ok:
+            self.stats.errors += 1
+            self._log(f"  BŁĄD repack {path}: {r.message}")
+            return
+        self.stats.repacked += 1
+        self._async_ok = getattr(self, "_async_ok", 0) + 1
+        try:
+            if r.sums is not None:
+                crc, md5, sha1 = r.sums
+            else:                           # duży zip (droga strumieniowa)
+                from .fileindex import hash_file
+                crc, md5, sha1 = hash_file(
+                    path, on_progress=lambda d, t, _n=path.name: self._detail(
+                        d, t, f"sumy {_n}"))
+            self.index.record_file(path, crc, md5, sha1, st=st)
+            self.index.set_bad_zip_method(path, 0)
+            if self._zip_method == "deflate":
+                tz = r.tz
+                if tz == -1:
+                    from .torrentzip import torrentzip_status
+                    tz = torrentzip_status(path)
+                self.index.set_tz(path, tz)
+        except Exception:
+            pass
+        finally:
+            self._detail_clear()
+        # bliźniaki PO zapisie flag — przejmują treść (z tz) nowego pliku
+        for t in relinked:
+            try:
+                self.index.record_hardlink(t, path)
+            except Exception:
+                pass
+            self._log(f"  hardlink przepięty na nowy plik: {t}")
+        for t, e in errs:
+            self._log(f"  BŁĄD przepięcia hardlinku {t}: {e}")
+        if game is not None:
+            self.mark_game_fixed(rep, game, path)
+
+    def _repack_collect(self, block: bool = False) -> None:
+        """Obsłuż zakończone przepakowania; block=True — poczekaj na
+        PIERWSZE zakończone (kolejka pełna). Nie na najstarsze: duży zip
+        (np. 41 MB) blokował dokładanie nowych, choć reszta wątków stała."""
+        if not getattr(self, "_repack_jobs", None):
+            return
+        if block:
+            from concurrent.futures import FIRST_COMPLETED, wait
+            wait([j[0] for j in self._repack_jobs.values()],
+                 return_when=FIRST_COMPLETED)
+        for key in [k for k, j in self._repack_jobs.items() if j[0].done()]:
+            fut, p, rep, game = self._repack_jobs.pop(key)
+            self._repack_finish(p, fut.result(), rep, game)
+
+    def _repack_wait(self, *paths) -> None:
+        """Operacja na ścieżce (źródło, cel linku, miejsce) — jeśli to zip w
+        trakcie przepakowania, najpierw je dokończ (kolejność jak szeregowo)."""
+        if not getattr(self, "_repack_jobs", None):
+            return
+        for p in paths:
+            if not p:
+                continue
+            key = os.path.normcase(os.path.abspath(str(p)))
+            job = self._repack_jobs.pop(key, None)
+            if job is not None:
+                fut, jp, rep, game = job
+                self._repack_finish(jp, fut.result(), rep, game)
+
+    def _repack_drain(self) -> None:
+        """Dokończ WSZYSTKIE przepakowania (koniec DAT-u, przerwanie, finał)."""
+        while getattr(self, "_repack_jobs", None):
+            self._repack_collect(block=True)
+        if getattr(self, "_repack_pool", None) is not None:
+            self._repack_pool.shutdown(wait=True)
+            self._repack_pool = None
+
+    def _link_wait_target(self, path) -> None:
+        """Dokończ linki w toku, których CELEM albo miejscem jest `path`."""
+        jobs = getattr(self, "_link_jobs", None)
+        if not jobs:
+            return
+        key = os.path.normcase(os.path.abspath(str(path)))
+        keep = []
+        for job in jobs:
+            if key in (os.path.normcase(os.path.abspath(str(job[2]))),
+                       os.path.normcase(os.path.abspath(str(job[1])))):
+                job[0].result()
+                self._link_finish(*job)
+            else:
+                keep.append(job)
+        self._link_jobs = keep
 
     def _process(self, s: RomStatus) -> None:
         key = _claim_key(s)
+        # ta sama treść opisana w innym DAT-cie inaczej → wspólny klucz pliku
+        fkey = self._file_key(s)
         canonical = s.canonical_path
         state = s.state
+        # ŹRÓDŁO dopasowanej gry należy do DAT-u — zapamiętaj, by sweep sierot nie
+        # zmiótł go do ToSort (placement go zmigruje do targetu / zlinkuje).
+        if s.source_path:
+            self._placed_sources.add(
+                os.path.normcase(os.path.abspath(str(s.source_path))))
+
+        if (state == RomState.WRONG_NAME and s.source_path
+                and not (s.rom.size or 0) and not s.via_archive
+                and not getattr(s, "via_chd", False)
+                and Path(s.source_path).name != Path(canonical).name
+                and os.path.normcase(os.path.abspath(str(s.source_path)))
+                == os.path.normcase(os.path.abspath(str(canonical)))):
+            # pusty znacznik pod nazwą różną TYLKO wielkością liter → NAZWA
+            # (bez linkowania: puste pliki mają wspólne „sumy") — 0.7.04
+            self._canonical.add(os.path.normcase(str(canonical)))
+            if self._case_rename(Path(s.source_path), Path(canonical)):
+                self.stats.renamed += 1
+            return
+        if state == RomState.CREATABLE:
+            # PUSTY plik-znacznik (size=0, np. .msu w MSU-1): trywialnie
+            # odtwarzalny — tworzymy pusty plik na miejscu. Tylko formaty LUŹNE
+            # (chd/rvz/zip mają własny kontener, nie luźny .msu).
+            fmt = getattr(s.entry, "store_format", "keep")
+            if (fmt in ("keep", "", "extract")
+                    and os.path.normcase(str(canonical)) not in self._canonical):
+                self._canonical.add(os.path.normcase(str(canonical)))
+                if os.path.isfile(canonical) and os.path.getsize(canonical) == 0:
+                    self.stats.already_ok += 1
+                    return
+                self._log(f"PUSTY plik-znacznik {canonical}")
+                if not self.dry_run:
+                    try:
+                        self._ensure_dir(canonical.parent)
+                        if os.path.lexists(canonical):
+                            self._clear_dest(canonical)
+                        with open(canonical, "wb"):
+                            pass
+                        self.index.record_file(
+                            canonical, "00000000",
+                            "d41d8cd98f00b204e9800998ecf8427e",
+                            "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+                    except OSError as e:
+                        self.stats.errors += 1
+                        self._log(f"BŁĄD tworzenia pustego {canonical}: {e}")
+                        return
+                self.stats.created += 1
+            return
 
         if state in (RomState.MISSING, RomState.NO_HASH):
             return
@@ -592,29 +2302,144 @@ class Rebuilder:
         # ta sama ścieżka kanoniczna już obsłużona w tym przebiegu (np. gra
         # wieloplikowa zaspokojona jednym CHD — wszystkie ROM-y wskazują
         # <gra>.chd) — nie powielaj operacji (dublowane LINK-i w podglądzie).
-        if os.path.normcase(str(canonical)) in self._canonical:
+        _cn = os.path.normcase(str(canonical))
+        if _cn in self._canonical and not (
+                self.dry_run and _cn in self._dry_gone
+                and state in (RomState.HAVE, RomState.HAVE_CHD)) and not (
+                not self.defer_slow and _cn in self._deferred_zips):
+            # (podgląd: ścieżkę zabrał DAT wyżej — właściciel dostanie link,
+            #  więc NIE pomijamy; chroniona przed ToSort zostaje i tak)
             self.stats.already_ok += 1
+            return
+        # zip źródła/miejsca w trakcie przepakowania w tle → najpierw je dokończ
+        # (po pominięciu ścieżki już obsłużonej: kolejne ROM-y TEJ SAMEJ gry-
+        # zipa nie czekają na jej przepakowanie)
+        self._repack_wait(s.source_path, canonical)
+
+        # ZŁY KONTENER (bad_container: np. gra DVD zrobiona jako CD). Treść gry
+        # jest DOBRA, zły jest tylko kontener — naprawia go krok
+        # `rebuild_bad_chds` (CD→DVD w miejscu, etap 2 / „Odbuduj CHD"), który
+        # po podmianie przepina WSZYSTKIE hardlinki (relink_twins). Dlatego
+        # kontener NIE blokuje zmiany nazwy ani linków (0.6.94): dawniej gra
+        # kończyła się tu — bez NAZWA (zmiana nazwy w DAT-cie → plik szedł do
+        # ToSort) i bez rezerwacji (dzieci czekały na odbudowę, ~doba).
+        if getattr(s, "bad_container", False) and self._still_bad_container(s):
+            # licz PLIKI, nie odwołania: ten sam CHD widzą ROMS, No-intro i
+            # 1G1R (dzieci) — dawniej 1162 zamiast 572 realnych plików
+            _bk = os.path.normcase(str(s.source_path or canonical))
+            if _bk not in self._bad_seen:
+                self._bad_seen.add(_bk)
+                self.stats.bad_container += 1
+            # realna ścieżka pliku nie jest „obca" dla sprzątania
+            if s.source_path:
+                self._canonical.add(os.path.normcase(str(s.source_path)))
+            # matcher degraduje „jest" do „zła nazwa" także pod WŁAŚCIWĄ
+            # ścieżką (żeby gra liczyła się „do naprawy") — tu to „jest"
+            if s.source_path and (os.path.normcase(os.path.abspath(
+                    str(s.source_path))) == os.path.normcase(
+                    os.path.abspath(str(canonical)))):
+                state = RomState.HAVE_CHD
+
+        # ZŁA METODA ZIP (zstd/lzma — skan oznaczył `bad_zip_method`). Plik JEST
+        # na miejscu, poprawne nazwy, tylko metoda niezgodna z emulatorami →
+        # PRZEPAKUJ w miejscu na wybraną (`zip_method`, zwykle deflate). Robimy
+        # to TYLKO dla oznaczonych (ze skanu) — bez otwierania wszystkich zipów.
+        _zr = (self._zip_needs_repack(canonical)
+               if getattr(s, "bad_zip_method", False) else "")
+        _dk = os.path.normcase(str(canonical))
+        if _zr and self.defer_slow:
+            # ETAP 1: przepakowanie (pobranie + wysyłka) czeka na etap 2; zip
+            # jest ważną kopią — dzieci linkują już teraz, a przepakowanie
+            # przepnie ich hardlinki (relink_twins)
+            self._deferred_zips.add(_dk)
+            _zr = ""
+            # zip leży POD WŁAŚCIWĄ ścieżką (przepakowanie jest w miejscu;
+            # `_zip_needs_repack` pyta indeks o `canonical`) — matcher oznaczył go
+            # „zła nazwa" tylko po to, by liczył się „do naprawy". W etapie 1
+            # to „jest" (bez fałszywego KONFLIKT dla własnej kopii dziecka)
+            state = RomState.HAVE
+        _was_deferred = False
+        if not self.defer_slow and _dk in self._deferred_zips:
+            self._deferred_zips.discard(_dk)    # etap 2 obsługuje go RAZ
+            _was_deferred = True
+        if _zr:
+            cn = _dk
+            if cn in self._canonical and not _was_deferred:
+                self.stats.already_ok += 1
+                return
+            self._canonical.add(cn)
+            # ta sama treść ma kopię fizyczną w DAT-cie WYŻEJ (przepakowaną w tym
+            # przebiegu) → link do niej; własne przepakowanie dziecka rozbiłoby
+            # hardlink na drugą kopię fizyczną
+            pclaimed = self._claim_of(key, fkey)
+            if (pclaimed is not None
+                    and os.path.normcase(str(pclaimed)) != cn
+                    and self._hier.should_link(s.entry, pclaimed,
+                                               at=canonical)):
+                if not self._link_over_copy(Path(canonical), Path(pclaimed)):
+                    self.stats.already_ok += 1
+                return
+            self._repack_bad_zip(Path(canonical), reason=_zr, game=s.game)
+            # naprawa W MIEJSCU = dalej kopia fizyczna tej treści: dzieci linkują
+            # do niej (jak przy HAVE). Bez zgłoszenia dziecko nie znało rodzica
+            # i robiło KOPIĘ (598 zipów No-intro → 1G1R, 29.09)
+            self._claim(key, canonical, keep=True)
             return
 
         if state in (RomState.HAVE, RomState.HAVE_CHD):
-            self._claims.setdefault(key, canonical)
+            # gdzie ta treść JUŻ leży — PRZED własnym zgłoszeniem (inaczej
+            # własny klucz zasłaniał kopię zgłoszoną pod sumą pliku przez DAT
+            # z innym opisem tego pliku)
+            claim = self._claim_of(key, fkey)
+            self._claim(key, canonical, keep=True, fkey=fkey)
             self._canonical.add(os.path.normcase(str(canonical)))
-            # Gdy to trafienie jest SYMLINKIEM, a kopia fizyczna (claim) leży
-            # gdzie indziej niż wskazuje link — przepnij. Klasyczny przypadek:
-            # użytkownik zmienił katalog docelowy rodzica, rodzic (przetwarzany
-            # pierwszy) przeniósł swój plik do nowego miejsca w TYM przebiegu,
-            # a link dziecka nadal celuje w stare miejsce → wisi.
-            claim = self._claims.get(key)
-            if (is_link(canonical) and claim is not None
+            # Chroń plik także pod REALNĄ ścieżką (gdyby różniła się od
+            # kanonicznej) — `_clean_dir` porównuje realne ścieżki z indeksu
+            # (regresja 0.6.18: 1876 RVZ GameCube/Wii zmiecione do ToSort).
+            if s.source_path:
+                self._canonical.add(os.path.normcase(str(s.source_path)))
+            # Ta lokalizacja miała plik przy skanie (HAVE), ale kopia fizyczna
+            # (claim) należy do INNEGO miejsca — bo:
+            #  (a) to trafienie jest SYMLINKIEM celującym w stary/zły cel, albo
+            #  (b) rodzic wyższego tieru PRZENIÓSŁ tę jedyną kopię do siebie w
+            #      TYM przebiegu (re-parenting: dochodzi DAT do ROMS, gra była
+            #      fizycznie tylko w 1G1R → ROMS zabiera plik, a 1G1R zostałoby
+            #      PUSTE). W obu razach ta lokalizacja ma być LINKIEM do claim.
+            # ZASADA (user): jedna kopia fizyczna na grę, reszta linki — żadne
+            # miejsce docelowe nie może zostać puste, gdy treść istnieje.
+            if (claim is not None
                     and os.path.normcase(str(claim))
-                    != os.path.normcase(str(canonical))):
+                    != os.path.normcase(str(canonical))
+                    and self._link_or_absent(canonical)):
                 if self._relink_if_stale(canonical, Path(claim)):
                     return
             self.stats.already_ok += 1
             return
 
-        # hash już ma kopię fizyczną gdzie indziej => link
-        claimed = self._claims.get(key)
+        # hash już ma kopię fizyczną gdzie indziej => link albo własna kopia
+        claimed = self._claim_of(key, fkey)  # gdzie ta treść JUŻ leży
+        # Źródło leży w katalogu DAT-u WYŻEJ (ma tę treść) → to jego
+        # kopia fizyczna: ten DAT ją linkuje albo kopiuje, NIGDY nie przenosi.
+        if (state == RomState.ELSEWHERE and self._whole_file(s)
+                and self._hier.owned_above(s.entry, s.source_path,
+                                           self._hier_rom(s))):
+            prior = self._claim_of(key, fkey)
+            if prior is not None and self._hier.above(s.entry, str(prior)):
+                # rodzic JUŻ ułożył tę treść w TYM przebiegu (np. spłaszczył
+                # <gra>/<gra>.rvz → <gra>.rvz) — link do NOWEGO miejsca, bo
+                # stara ścieżka ze skanu już nie istnieje
+                claimed = prior
+            else:
+                claimed = Path(s.source_path)
+                self._claim(key, claimed, fkey=fkey)
+        # LINK tylko do kopii w DAT-cie wyżej (hierarchia); inaczej
+        # (jeśli treść już gdzieś leży) — własna kopia fizyczna z `claimed`
+        pclaimed = self._claim_of(key, fkey)
+        link_ok = (pclaimed is not None
+                   and self._hier.should_link(s.entry, pclaimed,
+                                              at=canonical))
+        if link_ok:
+            claimed = pclaimed
         # LUŹNE pliki gier przeznaczonych do konwersji (chd/rvz) NIE mogą być
         # celem linków: konwersja kasuje źródła po sukcesie i linki wiszą
         # (katastrofa D2: wspólny Track 2 dysków 2-4 wskazywał plik zjedzony
@@ -626,10 +2451,9 @@ class Rebuilder:
         if (claimed is not None and not s.via_chd and not s.via_archive
                 and getattr(s.entry, "store_format", "keep") in ("chd", "rvz")
                 and Path(claimed).suffix.lower() not in (".chd", ".rvz")):
-            tprefix = os.path.normcase(
-                str(s.entry.target_dir)).rstrip("\\/") + os.sep
-            if os.path.normcase(str(claimed)).startswith(tprefix):
-                # wspólna ścieżka gier TEJ SAMEJ biblioteki — własna kopia
+            if not link_ok:
+                # wspólna ścieżka gier TEJ SAMEJ biblioteki (albo DAT trzymający
+                # wszystko fizycznie) — własna kopia
                 src0 = Path(s.source_path) if s.source_path else None
                 if (not s.member and src0 and os.path.lexists(src0)
                         and os.path.normcase(str(src0))
@@ -640,45 +2464,103 @@ class Rebuilder:
                         self.stats.conflicts += 1
                         return
                     self._log(f"KOPIA (tymczasowa, do konwersji) {canonical}")
-                    if not self.dry_run:
-                        self._ensure_dir(canonical.parent)
-                        from .fileops import copy_with_progress
-                        try:
-                            _retry_locked(lambda: copy_with_progress(
-                                claimed, canonical, on_progress=self._detail_cb,
-                                label=f"kopiuję {canonical.name}"))
-                        except OSError as e:
-                            self.stats.errors += 1
-                            self._log(f"BŁĄD kopiowania {canonical}: {e}")
-                            return
-                        finally:
-                            self._detail_clear()
-                        row = self.index.lookup(claimed)
-                        if row is not None and row["sha1"]:
-                            self.index.record_file(canonical, row["crc32"],
-                                                   row["md5"], row["sha1"])
+                    if not self._copy_file(Path(claimed), canonical):
+                        return
                     self.stats.copied += 1
                     self._canonical.add(os.path.normcase(str(canonical)))
+                    self._claim(key, canonical, keep=True)
                     return
             else:
                 # DZIECKO: poczekaj na kontener końcowy rodzica
                 self.stats.links_skipped += 1
                 self._log(f"ODROCZONE (link po konwersji rodzica): {canonical}")
                 return
+        # Własna kopia ARCHIWUM, którego nazwy wewnętrzne są inne niż w TYM
+        # DAT-cie (MSX „10-Yard Fight (Japan).rom" vs FBNeo „10yard.rom") —
+        # skopiowanie całego zipa dałoby złe nazwy. Idzie ścieżką archiwum
+        # niżej: przepakowanie z poprawnymi nazwami, źródło zostaje u właściciela.
+        if (claimed is not None and not link_ok and s.via_archive
+                and not s.archive_names_ok):
+            claimed = None
         if claimed is not None:
             if os.path.normcase(str(canonical)) == os.path.normcase(str(claimed)):
                 # kolejny ROM tej samej gry wskazuje tę samą ścieżkę (CHD)
                 self.stats.already_ok += 1
                 return
-            if os.path.lexists(canonical):
-                if is_link(canonical):
+            # Symlink TYLKO dziecko → rodzic wg hierarchii. W każdym innym
+            # przypadku (ta sama kolekcja, „rodzic", inna platforma,
+            # dedup_copies=false) duplikat treści dostaje WŁASNĄ kopię fizyczną.
+            if not link_ok:
+                # własna kopia fizyczna tej platformy — dzieci linkują do niej.
+                # „Już jest" tylko po SUMACH (0.6.98): dawniej nazwa+rozmiar —
+                # inna rewizja o tym samym rozmiarze była „OK" i zgłaszana
+                # jako kopia gry (dzieci linkowały do złej treści)
+                self._fix_case_at(canonical)      # nazwa co do litery (0.7.04)
+                if self._content_ok(canonical, s.rom):
+                    self._claim(key, canonical, keep=True)
                     self.stats.already_ok += 1
-                else:
+                    self._canonical.add(os.path.normcase(str(canonical)))
+                    return
+                if not self._clear_dest(canonical) and not (
+                        self._occupant_is_other(canonical, self._cur_rep, s.game,
+                                                disk=not self.dry_run)
+                        and self._evict_occupant(canonical)):
                     self.stats.conflicts += 1
-                    self._log(f"KONFLIKT: {canonical} zajęte zwykłym plikiem")
+                    # niesprawdzalna treść pod nazwą gry — nic nie ruszamy
+                    self._log(f"KONFLIKT: {canonical} zajęte zwykłym plikiem "
+                              f"(inna treść niż w DAT-cie)")
+                    return
+                # własny egzemplarz: HARDLINK (0.7.00 — równorzędna kopia bez
+                # transferu przez NAS), kopia fizyczna tylko gdy DAT jej
+                # wymaga (dedup_copies=false) albo dane modyfikowalne
+                if not self._copy_keep(Path(claimed), Path(canonical), s.entry,
+                                       label="dedup w kolekcji → własny plik"):
+                    return
+                self._claim(key, canonical, keep=True)
                 self._canonical.add(os.path.normcase(str(canonical)))
                 return
-            self._log(f"LINK   {canonical} -> {claimed}")
+            # w miejscu linku plik pod nazwą różną TYLKO wielkością liter
+            # („…Seed…" vs DAT „…SEED…") → najpierw nazwa jak w DAT-cie (0.7.04)
+            self._fix_case_at(canonical)
+            # Miejsce linku zajęte TĄ SAMĄ grą o innych bajtach (np. stara nazwa
+            # wewnątrz zipa: `.ngp` zamiast `.bin`) — po SUMACH to ta sama treść
+            # co plik rodzica → podmiana na hardlink, nie KONFLIKT (0.7.01)
+            if (self.make_links and not self._links_blocked
+                    and self._same_game_copy(canonical, claimed)):
+                if not self._link_over_copy(Path(canonical), Path(claimed)):
+                    self.stats.already_ok += 1
+                self._canonical.add(os.path.normcase(str(canonical)))
+                return
+            if (not self.dry_run and self.make_links and not self._links_blocked
+                    and os.path.normcase(str(canonical)) not in self._canonical):
+                # REALNA naprawa: link w puli wątków. Istnienie/„już zlinkowane"
+                # rozstrzyga sam os.link (FileExistsError → same_file), bez
+                # osobnego lexists przed każdym linkiem.
+                self._log(f"LINK (tworzę) {canonical}  ⟶  wskazuje na {claimed}")
+                self._canonical.add(os.path.normcase(str(canonical)))
+                self._link_submit(Path(canonical), Path(claimed),
+                                  self._cur_rep, s.game)
+                return
+            if self._exists(canonical):
+                # is_link → symlink; same_file → hardlink do celu (nie reparse
+                # point, więc is_link go nie widzi) — oba to „już zlinkowane".
+                if self._linked_to(canonical, claimed):
+                    self.stats.already_ok += 1
+                    self._canonical.add(os.path.normcase(str(canonical)))
+                    return
+                # pod nazwą gry INNA treść (np. stary zrzut) → ToSort, a na
+                # miejsce link (0.7.04); niesprawdzalne → KONFLIKT jak dotąd
+                if not (self._occupant_is_other(canonical, self._cur_rep,
+                                                s.game, disk=not self.dry_run)
+                        and self._evict_occupant(canonical)):
+                    self.stats.conflicts += 1
+                    self._log(f"KONFLIKT: {canonical} zajęte zwykłym plikiem")
+                    self._canonical.add(os.path.normcase(str(canonical)))
+                    return
+            # Kierunek: TWORZYMY symlink w `canonical` (miejsce dziecka), który
+            # WSKAZUJE na istniejący plik fizyczny `claimed` (rodzic). Etykieta
+            # jawnie nazywa role — „A -> B" mylnie czytało się jak „przenieś A do B".
+            self._log(f"LINK (tworzę) {canonical}  ⟶  wskazuje na {claimed}")
             # zarejestruj kanoniczną (nawet gdy link się nie uda) — rodzeństwo
             # tej samej gry wskazuje tę samą ścieżkę i nie ma się powielać
             self._canonical.add(os.path.normcase(str(canonical)))
@@ -697,38 +2579,90 @@ class Rebuilder:
         # cała gra jako jedno archiwum (kartridż): przenieś całość albo
         # PRZEPAKUJ z poprawnymi nazwami wewnętrznymi (weryfikacja SHA-1/CRC).
         if s.via_archive:
+            cnorm = os.path.normcase(str(canonical))
+            # RAZ na canonical: gra wieloplikowa daje N statusów o tym samym
+            # archiwum/celu; bez tego nieudany repack ponawiał się per ROM.
+            if cnorm in self._archive_tried:
+                return
+            # ETAP 1 (0.7.00): przepakowanie z INNEGO miejsca (nadzbiór albo
+            # złe nazwy w środku = pobranie + wysyłka przez NAS) czeka na etap
+            # 2 — etap 1 ma być szybki (19 min DSi „wypakuj 1 z 4" 02.10).
+            # Przeniesienie / hardlink dokładnego zipa zostaje w etapie 1.
+            if (self.defer_slow and str(canonical).lower().endswith(".zip")
+                    and os.path.normcase(str(src)) != cnorm
+                    and (not s.archive_names_ok
+                         or getattr(s, "archive_superset", False))):
+                return
+            self._archive_tried.add(cnorm)
             if self._place_archive(s, src, canonical):
-                self._claims[key] = canonical
+                # te same bajty tylko przy przeniesieniu/kopii całości
+                _same = (s.archive_names_ok
+                         and not getattr(s, "archive_superset", False))
+                self._claim(key, canonical, fkey=fkey if _same else None)
+                self._canonical.add(cnorm)
+            return
+
+        # ten sam plik, nazwa różna TYLKO wielkością liter (WipEout → Wipeout):
+        # NAZWA przez nazwę tymczasową — `_clear_dest` uznałby miejsce za
+        # zajęte przez „inny" plik (0.7.04)
+        if (not s.member
+                and os.path.normcase(os.path.abspath(str(src)))
+                == os.path.normcase(os.path.abspath(str(canonical)))
+                and src.name != Path(canonical).name):
+            if self._case_rename(src, Path(canonical)):
+                self.stats.renamed += 1
+                self._claim(key, canonical, fkey=fkey)
                 self._canonical.add(os.path.normcase(str(canonical)))
             return
 
         if not self._clear_dest(canonical):
-            self.stats.conflicts += 1
-            self._log(f"KONFLIKT: {canonical} zajęte zwykłym plikiem")
-            return
+            # pod nazwą gry INNA treść → ToSort i układamy dalej (0.7.04)
+            if not (self._occupant_is_other(canonical, self._cur_rep, s.game,
+                                            disk=not self.dry_run)
+                    and self._evict_occupant(canonical)):
+                self.stats.conflicts += 1
+                self._log(f"KONFLIKT: {canonical} zajęte zwykłym plikiem")
+                return
 
         if s.member:  # trafienie wewnątrz archiwum => wypakuj z weryfikacją
             self._log(f"WYPAKUJ {src} :: {s.member} -> {canonical}")
             if self._extract_member(src, s.member, canonical, s.rom):
                 self.stats.unpacked += 1
-                self._claims[key] = canonical
+                self._claim(key, canonical)
                 self._canonical.add(os.path.normcase(str(canonical)))
             return
 
         # via_chd/via_archive: przenosimy CAŁY plik (chd/archiwum), którego
         # rozmiar != rozmiar pojedynczego ROM-a z DAT-a — pomijamy kontrolę.
-        if not _size_ok(src, 0 if (s.via_chd or s.via_archive) else s.rom.size):
+        if not self.dry_run and not _size_ok(
+                src, 0 if (s.via_chd or s.via_archive) else s.rom.size):
             self.stats.skipped += 1
             self._log(f"POMIŃ: plik zmienił się od skanu: {src}")
             return
+        if is_protected(src) or (state == RomState.ELSEWHERE
+                                 and self._hier.must_keep_source(
+                s.entry, str(src), str(canonical), self._hier_rom(s))):
+            # plik INNEGO DAT-u, który nie zlinkuje (np. ROMS — fizycznie): własna kopia,
+            # źródło zostaje u właściciela
+            self._canonical.add(os.path.normcase(str(src)))
+            if self._copy_keep(src, canonical, s.entry):
+                self._claim(key, canonical, fkey=fkey)
+                self._canonical.add(os.path.normcase(str(canonical)))
+            return
         verb = "NAZWA " if state == RomState.WRONG_NAME else "PRZENIEŚ"
         self._log(f"{verb} {src} -> {canonical}")
-        if self._move(src, canonical):
+        moved = self._move(src, canonical)
+        # Plik NADAL pod starą ścieżką (podgląd albo nieudane przeniesienie) to
+        # dalej poprawna gra — sprzątanie NIE może go zmieść do ToSort (podgląd
+        # spłaszczania 1876 RVZ pokazywał każdy plik 2×: NAZWA + TOSORT).
+        if self.dry_run or not moved:
+            self._canonical.add(os.path.normcase(str(src)))
+        if moved:
             if state == RomState.WRONG_NAME:
                 self.stats.renamed += 1
             else:
                 self.stats.moved += 1
-            self._claims[key] = canonical
+            self._claim(key, canonical, fkey=fkey)
             self._canonical.add(os.path.normcase(str(canonical)))
 
     def _place_archive(self, s: RomStatus, src: Path, dest: Path) -> bool:
@@ -741,30 +2675,67 @@ class Rebuilder:
           w archiwum"). Nic ze złą zawartością nie ląduje pod docelową nazwą.
         """
         same = os.path.normcase(str(src)) == os.path.normcase(str(dest))
-        simple = (s.archive_names_ok
+        if same and src.name != dest.name:
+            # ta sama ścieżka, nazwa różna TYLKO wielkością liter → najpierw
+            # NAZWA jak w DAT-cie (0.7.04), dalej jak dla pliku na miejscu
+            if not self._case_rename(src, dest):
+                return False
+            if (s.archive_names_ok and not getattr(s, "archive_superset", False)
+                    and src.suffix.lower() == dest.suffix.lower()):
+                self.stats.renamed += 1
+                return True
+            src = dest
+        # NADZBIÓR (np. MAME merged: parent+klony w jednym zipie) — NIGDY nie
+        # przenosimy całości (zabralibyśmy ROM-y innych gier i wsadzili śmieci
+        # do docelowego); trzeba WYPAKOWAĆ tylko ROM-y tej gry, a źródło ZOSTAWIĆ.
+        superset = getattr(s, "archive_superset", False)
+        simple = (s.archive_names_ok and not superset
                   and src.suffix.lower() == dest.suffix.lower())
+        # źródło to plik INNEGO DAT-u, który go potrzebuje i nie zlinkuje (np.
+        # ROMS — fizycznie, albo przepakowanie = inne bajty) → własna KOPIA,
+        # źródło zostaje (bez przerzucania w kółko)
+        keep_src = (not same and (is_protected(src) or self._hier.must_keep_source(
+            s.entry, str(src), str(dest), self._hier_rom(s), same_bytes=simple)))
         if simple:
             if same:
                 self.stats.already_ok += 1
                 return True
-            if not self._clear_dest(dest):
+            # kanoniczna ścieżka DAT-a: zastąp niekompletny/zły plik poprawnym
+            if not self._clear_dest(dest, allow_overwrite=True):
                 self.stats.conflicts += 1
-                self._log(f"KONFLIKT: {dest} zajęte zwykłym plikiem")
+                self._log(f"KONFLIKT: {dest} — nie zastąpiono")
                 return False
-            self._log(f"PRZENIEŚ archiwum {src} -> {dest}")
-            if self._move(src, dest):
-                self.stats.moved += 1
-                return True
-            return False
+            # format katalogu (TorrentZip) wg treści ŹRÓDŁA — przed
+            # przeniesieniem (podgląd nie przenosi; wiersz celu jeszcze nie ma)
+            _tz_src = self._tz_of(src)
+            if keep_src:
+                ok = self._copy_keep(src, dest, s.entry)
+            else:
+                self._log(f"PRZENIEŚ archiwum {src} -> {dest}")
+                ok = self._move(src, dest)
+                if ok:
+                    self.stats.moved += 1
+            if ok:
+                self._queue_tz(dest, _tz_src, s.game)
+            return ok
 
         # przepakowanie umiemy tylko do ZIP-a; inny cel => zwykłe przeniesienie
         if dest.suffix.lower() != ".zip":
+            if superset:
+                # nadzbioru nie da się „wyjąć" do nie-ZIP-a bez rozpakowania —
+                # nie ruszamy (nie kasujemy cudzych ROM-ów)
+                self.stats.skipped += 1
+                self._log(f"POMIŃ: {src.name} to nadzbiór (merged), a cel "
+                          f"{dest.suffix} nie jest ZIP — zostawiam źródło")
+                return False
             if same:
                 self.stats.already_ok += 1
                 return True
-            if not self._clear_dest(dest):
+            if not self._clear_dest(dest, allow_overwrite=True):
                 self.stats.conflicts += 1
                 return False
+            if keep_src:
+                return self._copy_keep(src, dest, s.entry)
             self._log(f"PRZENIEŚ archiwum {src} -> {dest}")
             if self._move(src, dest):
                 self.stats.moved += 1
@@ -777,28 +2748,70 @@ class Rebuilder:
             self.stats.errors += 1
             self._log(f"BŁĄD przepakowania: brak gry {s.game} w DAT-cie")
             return False
-        if not same and not self._clear_dest(dest):
+        # ARCADE: docelowy zip wg formatu (split-klon = tylko ROM-y unikalne) —
+        # TEN SAM helper co matcher, więc po przepakowaniu gra jest HAVE (bez pętli).
+        from . import mamesets
+        target_roms = mamesets.effective_roms(s.entry, game)
+        # POWÓD do logu — liczony PRZED `_clear_dest` (ono zdejmuje cel z
+        # indeksu); tylko indeks, bez NAS
+        if same:
+            why = ""
+        else:
+            _row = self.index.lookup(dest)
+            why = ("; plik w celu niekompletny/zły — zastępuję"
+                   if _row is not None and not _row["missing"]
+                   else f"; gry brak w {dest.parent}")
+        if not same and not self._clear_dest(dest, allow_overwrite=True):
             self.stats.conflicts += 1
-            self._log(f"KONFLIKT: {dest} zajęte zwykłym plikiem")
+            self._log(f"KONFLIKT: {dest} — nie zastąpiono")
             return False
-        self._log(f"PRZEPAKUJ {src.name} -> {dest.name} (poprawne nazwy wewn.)")
-        if not self._rebuild_zip(s.source_path, src, dest, game.roms):
+        # NADZBIÓR ARCADE PRZEPAKOWYWANY W MIEJSCU (własny zip gry, złe nazwy
+        # wewn.): NIE wycinamy dodatkowych ROM-ów — to ROM-y rodzica/BIOS-u/
+        # klonów (16.09: 4095 takich przepakowań w fbneo wycinało cudze ROM-y).
+        # Poprawiamy tylko nazwy ROM-ów TEJ gry, resztę przepisujemy bez zmian.
+        keep_extras = bool(superset and same and mamesets.is_arcade(s.entry))
+        what = ("poprawne nazwy wewn., dodatki zachowane" if keep_extras
+                else "wypakuj ROM-y gry z nadzbioru" if superset
+                else "poprawne nazwy wewn.")
+        # inne miejsce źródła (np. ToSort\mame\gra.zip → fbneo\gra.zip) — pełna
+        # ścieżka, inaczej „gra.zip -> gra.zip" wyglądało jak przepakowanie w miejscu
+        # los ŹRÓDŁA jawnie w logu (i w podglądzie): czy przepakowanie je
+        # kasuje, czy zostaje u właściciela — bez tego nie było widać, że
+        # naprawa zabiera pliki innym DAT-om
+        fate = ("" if same else
+                " [źródło zostaje: plik innego DAT-u]" if keep_src else
+                " [źródło zostaje: nadzbiór]" if superset else
+                " [źródło zostanie skasowane]")
+        # ILE plików bierzemy ze źródła (członkowie z indeksu, bez NAS) — przy
+        # nadzbiorze MAME „9 z 43" mówi, że to wyjęcie gry, nie kopia całości
+        _n_src = len(self.index.members_of(src))
+        count = (f": {len(target_roms)} ROM-ów gry, reszta bez zmian"
+                 if keep_extras else
+                 f": {len(target_roms)} z {_n_src} plików źródła" if _n_src
+                 else f": {len(target_roms)} plików")
+        self._log(f"PRZEPAKUJ {src.name if same else src} -> "
+                  f"{dest.name if same else dest} ({what}{count}{why}){fate}")
+        if not self._rebuild_zip(s.source_path, src, dest, target_roms,
+                                 keep_extras=keep_extras):
             return False
         self.stats.renamed += 1
-        if not same and not self.dry_run:      # usuń stare (błędnie nazwane) źródło
+        # Źródło kasujemy TYLKO gdy to był DOKŁADNY zestaw ze złymi nazwami.
+        # NADZBIORU (merged) NIE kasujemy — zawiera ROM-y innych gier. Pliku
+        # INNEGO DAT-u (keep_src) też nie — to jego kopia fizyczna.
+        if not same and not self.dry_run and not superset and not keep_src:
             try:
-                _retry_locked(lambda: os.unlink(src))
-                self.index.remove_path(src)
+                _retry_locked(lambda: unlink_tracked(src, self.index))
             except OSError as e:
                 self._log(f"UWAGA: nie usunięto starego archiwum {src}: {e}")
         return True
 
     def _rebuild_zip(self, archive_key: str, src: Path, dest: Path,
-                     game_roms) -> bool:
+                     game_roms, keep_extras: bool = False) -> bool:
         """Buduje ZIP `dest` z POPRAWNYMI nazwami wewnętrznymi. Dane bierze z
         `src` dopasowując po SUMIE (nie nazwie) i weryfikuje SHA-1/CRC każdego
         pliku przed zapisem. Zła zawartość => przerwanie (nic nie powstaje)."""
         import hashlib
+        import time
         import zipfile
         import zlib
         self._ensure_dir(dest.parent)
@@ -806,38 +2819,153 @@ class Rebuilder:
             return True
         tmp = dest.with_name(dest.name + ".chdbuddy_rebuild_tmp")
         try:
-            with zipfile.ZipFile(src) as zin, \
-                    zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED,
-                                    compresslevel=self._zip_level) as zout:
+            with zipfile.ZipFile(src) as zin:
+                # mapa z RZECZYWISTEGO archiwum (central directory, bez dekompresji):
+                # (crc,rozmiar) -> nazwa oraz zbiór nazw. Indeks bywa nieaktualny
+                # dla MAME merged/parent (nazwa członka w indeksie ≠ nazwa w pliku)
+                # → nie ufamy nazwie z indeksu, dobieramy z pliku po sumie.
+                _names = set()
+                _by_crc: dict = {}
+                for _zi in zin.infolist():
+                    if _zi.is_dir():
+                        continue
+                    _names.add(_zi.filename)
+                    _by_crc.setdefault(
+                        (f"{_zi.CRC & 0xFFFFFFFF:08x}", _zi.file_size),
+                        _zi.filename)
+                # NAJPIERW dobierz członka dla KAŻDEGO ROM-u (sam central
+                # directory, bez czytania danych) — brak wykryty od razu, a nie
+                # po przepisaniu setek MB z NAS (MSU-1: 1–3 min na grę na nic)
+                plan: list = []
                 for rom in game_roms:
                     member = self.index.member_name_in(
                         archive_key, rom.sha1, rom.crc, rom.size)
+                    if member not in _names:          # indeks nieaktualny / merged
+                        member = (_by_crc.get(
+                            (rom.crc.lower().zfill(8), rom.size))
+                            if rom.crc and rom.size else None)
+                    if member is None and not (rom.size or 0):
+                        # PUSTY ROM (np. .msu MSU-1: 0 B, w DAT-cie bez sum) —
+                        # nie ma czego szukać, tworzymy pusty plik
+                        plan.append((rom, None))
+                        continue
                     if member is None:
                         raise KeyError(f"brak {rom.name} w {src.name}")
-                    data = zin.read(member)
-                    if rom.sha1 and hashlib.sha1(data).hexdigest() != rom.sha1.lower():
-                        raise ValueError(f"SHA-1 nie zgadza się: {rom.name}")
-                    if rom.crc and (f"{zlib.crc32(data) & 0xFFFFFFFF:08x}"
-                                    != rom.crc.lower().zfill(8)):
-                        raise ValueError(f"CRC nie zgadza się: {rom.name}")
-                    zout.writestr(rom.name, data)   # POPRAWNA nazwa wewnętrzna
+                    plan.append((rom, member))
+                extras: list = []
+                if keep_extras:
+                    # pozostałe członki (ROM-y innych gier w nadzbiorze) — bez zmian
+                    _taken = {m for _, m in plan if m is not None}
+                    _names_out = {r.name for r, _ in plan}
+                    extras = [_zi for _zi in zin.infolist()
+                              if not _zi.is_dir() and _zi.filename not in _taken
+                              and _zi.filename not in _names_out]
+                # TorrentZip (0.6.95) dla deflate; zstd — zwykły zip
+                if self._zip_method == "deflate":
+                    self._write_tz(zin, dest, tmp, plan, extras)
+                else:
+                    self._write_plain_zip(zin, dest, tmp, plan, extras)
         except Exception as e:
             self.stats.errors += 1
             self._log(f"BŁĄD przepakowania {src.name}: {e}")
             tmp.unlink(missing_ok=True)
             return False
+        finally:
+            self._detail_clear()
         try:
-            _retry_locked(lambda: os.replace(tmp, dest))
+            _retry_locked(lambda: replace_rw(tmp, dest))
         except OSError as e:
             self.stats.errors += 1
             self._log(f"BŁĄD zapisu {dest}: {e}")
             tmp.unlink(missing_ok=True)
             return False
         try:
-            self.index.reindex_archive(dest, full=True)
+            self.index.reindex_archive(dest, full=True,
+                                       on_progress=self._detail_cb)
         except OSError as e:
             self._log(f"UWAGA: nie zaindeksowano {dest}: {e}")
+        finally:
+            self._detail_clear()
         return True
+
+    def _write_tz(self, zin, dest: Path, tmp: Path, plan, extras) -> None:
+        """Zapis TorrentZip (bitowo jak RomVault). ROM-y planu weryfikowane
+        SHA-1/CRC W TRAKCIE strumieniowania — zła treść = wyjątek."""
+        from .torrentzip import write_torrentzip
+        entries: list = []
+        written: set = set()
+        for rom, member in plan:
+            if rom.name in written:
+                continue
+            written.add(rom.name)
+            if member is None:
+                entries.append((rom.name, b""))
+                continue
+            entries.append((rom.name,
+                            (lambda m=member, r=rom: _VerifyingReader(zin.open(m), r)),
+                            zin.getinfo(member).file_size))
+        for zi in extras:
+            if zi.filename in written:
+                continue
+            written.add(zi.filename)
+            entries.append((zi.filename, (lambda n=zi.filename: zin.open(n)),
+                            zi.file_size))
+
+        def _prog(done, total, label):
+            self._detail(done, total, f"przepakowuję {label}")
+        write_torrentzip(tmp, entries, on_progress=_prog, label=dest.name)
+
+    def _write_plain_zip(self, zin, dest: Path, tmp: Path, plan, extras) -> None:
+        """Zwykły zip wybraną metodą (zstd) — jak przed 0.6.95."""
+        import hashlib
+        import time
+        import zipfile
+        import zlib
+        comp = getattr(zipfile, "ZIP_ZSTANDARD", zipfile.ZIP_DEFLATED)
+        _written: set = set()
+        _n = len(plan) + len(extras)
+        with zipfile.ZipFile(tmp, "w", comp,
+                             compresslevel=self._zip_level) as zout:
+            def _copy(member: str, name: str, i: int):
+                total = zin.getinfo(member).file_size
+                label = f"przepakowuję {dest.name}: {name} ({i}/{_n})"
+                h = hashlib.sha1()
+                crc = 0
+                done = 0
+                self._detail(0, total, label)
+                zi = zipfile.ZipInfo(name, time.localtime(time.time())[:6])
+                zi.compress_type = zout.compression
+                zi.compress_level = zout.compresslevel
+                zi.external_attr = 0o600 << 16
+                zi.file_size = total
+                with zin.open(member) as fin, zout.open(zi, "w") as fout:
+                    while True:
+                        buf = fin.read(4 * 1024 * 1024)
+                        if not buf:
+                            break
+                        h.update(buf)
+                        crc = zlib.crc32(buf, crc)
+                        fout.write(buf)
+                        done += len(buf)
+                        self._detail(done, total, label)
+                return h.hexdigest(), f"{crc & 0xFFFFFFFF:08x}"
+
+            for i, (rom, member) in enumerate(plan, 1):
+                if member is None:
+                    zout.writestr(rom.name, b"")
+                    _written.add(rom.name)
+                    continue
+                sha1_hex, crc_hex = _copy(member, rom.name, i)
+                if rom.sha1 and sha1_hex != rom.sha1.lower():
+                    raise ValueError(f"SHA-1 nie zgadza się: {rom.name}")
+                if rom.crc and crc_hex != rom.crc.lower().zfill(8):
+                    raise ValueError(f"CRC nie zgadza się: {rom.name}")
+                _written.add(rom.name)
+            for i, _zi in enumerate(extras, len(plan) + 1):
+                if _zi.filename in _written:
+                    continue
+                _copy(_zi.filename, _zi.filename, i)
+                _written.add(_zi.filename)
 
     def _extract_member(self, archive: Path, member: str, dst: Path,
                         rom) -> bool:
@@ -849,6 +2977,16 @@ class Rebuilder:
             return True
         from .fileindex import hash_file
         tmp = dst.with_name(dst.name + ".chdbuddy_extract_tmp")
+        if archive.suffix.lower() != ".7z":
+            # indeks bywa nieaktualny dla MAME merged/parent (nazwa członka w
+            # indeksie ≠ nazwa w pliku → „no item named X"). Dobierz z pliku po
+            # CRC+rozmiar; None = ROM-a naprawdę nie ma w tym archiwum.
+            member = self._resolve_zip_member(archive, member, rom)
+            if member is None:
+                self.stats.errors += 1
+                self._log(f"BŁĄD wypakowania {archive}: brak {rom.name} "
+                          f"(po sumie) — archiwum nie zawiera tego ROM-u")
+                return False
         self._detail(0, 0, f"wypakowuję {dst.name}")
         try:
             if archive.suffix.lower() == ".7z":
@@ -881,7 +3019,7 @@ class Rebuilder:
             tmp.unlink(missing_ok=True)
             return False
         try:
-            _retry_locked(lambda: os.replace(tmp, dst))
+            _retry_locked(lambda: replace_rw(tmp, dst))
         except OSError as e:
             self.stats.errors += 1
             self._log(f"BŁĄD zapisu {dst}: {e}")
@@ -889,6 +3027,28 @@ class Rebuilder:
             return False
         self.index.record_file(dst, crc_hex, md5_hex, sha1_hex)
         return True
+
+    @staticmethod
+    def _resolve_zip_member(archive: Path, member: str, rom):
+        """Rzeczywista nazwa członka ZIP-a: gdy podana `member` jest w pliku —
+        zostaje; inaczej dobierz po CRC+rozmiar z central directory (bez
+        dekompresji). None = nie ma (ani nazwy, ani sumy). Treść i tak weryfikuje
+        SHA-1 po wypakowaniu."""
+        import zipfile
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                if member and member in set(zf.namelist()):
+                    return member
+                if rom.crc and rom.size:
+                    want = (rom.crc.lower().zfill(8), int(rom.size))
+                    for zi in zf.infolist():
+                        if zi.is_dir():
+                            continue
+                        if (f"{zi.CRC & 0xFFFFFFFF:08x}", zi.file_size) == want:
+                            return zi.filename
+        except (OSError, zipfile.BadZipFile):
+            return member                          # niech dalsza logika zgłosi błąd
+        return None
 
     @staticmethod
     def _extract_zip(archive: Path, member: str, tmp: Path,
@@ -922,23 +3082,435 @@ class Rebuilder:
             src = Path(td) / member
             if not src.is_file():
                 raise FileNotFoundError(f"7z nie wypakował '{member}'")
-            os.replace(src, tmp)
+            replace_rw(src, tmp)
 
     # --- sprzątanie nieznanych do ToSort -------------------------------------
 
+    def sweep_orphans(self, stray_dirs: Sequence[Path],
+                      rom_bases: Sequence[Path]) -> int:
+        """Przenosi do ToSort PLIKI w folderach-sierotach, których treść NIE należy
+        do żadnego DAT-u. `stray_dirs` liczy `dirrules.stray_dirs` (rodzeństwo
+        zarządzanych platform, nie target/kandydat/przodek żadnego DAT-u).
+
+        KLUCZOWE: plik będący ŹRÓDŁEM dopasowanej gry (`_placed_sources`) NALEŻY do
+        jakiegoś DAT-u — placement zmigruje go do skonfigurowanego targetu (folder
+        output DAT-u jest edytowalny; np. `commodore64`→`c64`), więc TU go
+        POMIJAMY. Do ToSort trafia tylko treść niepasująca do ŻADNEGO DAT-u. Dzięki
+        temu nie ma sprzeczności w podglądzie (te same pliki nie są naraz „przenieś
+        do targetu" i „→ToSort"). Zachowujemy względną ścieżkę od rom_root."""
+        if self.tosort is None or not stray_dirs:
+            return 0
+        ncase = os.path.normcase
+        base_list = [Path(os.path.abspath(str(b))) for b in rom_bases if b]
+
+        def _rel(p: Path) -> Path:
+            for b in base_list:
+                try:
+                    return p.relative_to(b)
+                except ValueError:
+                    continue
+            return Path(p.name)
+
+        moved = 0
+        for _si, d in enumerate(stray_dirs, 1):
+            d = Path(os.path.abspath(str(d)))
+            self._phase(_si, len(stray_dirs), f"nieznane → ToSort: {d.name}")
+            files: list[Path] = []
+            # PODGLĄD: pliki z INDEKSU (bez obchodu NAS); katalog nieobecny w
+            # indeksie (nieskanowany) — wtedy wyjątkowo obchód dysku, żeby
+            # plan nie był uboższy od realnej naprawy
+            rows = (self.index.all_under(d, physical_only=False)
+                    if self.dry_run else [])
+            if rows:
+                files = [Path(r["path"]) for r in rows]
+            else:
+                if not d.is_dir():
+                    continue
+                try:
+                    for root, _dirs, fs in os.walk(d):
+                        for f in fs:
+                            files.append(Path(root) / f)
+                except OSError:
+                    continue
+            for _fi, src in enumerate(files, 1):
+                if _fi % 25 == 0:            # postęp z nazwą pliku (NAS: minuty)
+                    self._phase(_si, len(stray_dirs),
+                                f"nieznane → ToSort: {d.name} "
+                                f"({_fi}/{len(files)}) {src.name}")
+                if is_frontend_under(src, d):
+                    continue                 # plik frontendu (images\, gamelist…)
+                # treść JUŻ leży w kolekcji na swoim miejscu (np. stary katalog
+                # DAT-u przeniesionego gdzie indziej: hardlinki do ROMS) — ta
+                # sama reguła co w sprzątaniu katalogu DAT-u: przy kasowaniu
+                # ułożonych kopii z ToSort usuń zbędną kopię/nazwę, zamiast
+                # wynosić ją do ToSort (29.09: 7052 hardlinki No-intro płyt).
+                # PRZED ochroną „źródła": matcher wybiera źródło spośród równych
+                # kopii (alfabetycznie), a gra mogła dostać link do kopii w
+                # DAT-cie wyżej — taka sierota też jest zbędna (0.7.10, redearth)
+                keeper = None
+                if self._del_prefixes:
+                    row = self.index.lookup(src)
+                    keeper = self._redundant_copy(row) if row is not None else None
+                if (keeper is None and ncase(os.path.abspath(str(src)))
+                        in self._placed_sources):
+                    continue                 # należy do DAT-u → migruje placement
+                if self._del_prefixes:
+                    if keeper is not None:
+                        if not self._plan_delete(src):
+                            continue            # podgląd: już zaplanowane
+                        self._log(("(podgląd) " if self.dry_run else "")
+                                  + f"KASUJ zbędną kopię (sierota): {src} "
+                                  f"(jest w {keeper})")
+                        if not self.dry_run:
+                            try:
+                                if unlink_tracked(src, self.index):
+                                    self.stats.tosort_deleted += 1
+                            except OSError as e:
+                                self._log(f"  nie skasowano {src}: {e}")
+                        else:
+                            self.stats.tosort_deleted += 1
+                        continue
+                # 0.7.02: treść, której nie zna ŻADEN DAT → ToSort\nieznane;
+                # źródło dopasowane do DAT-u (np. gra niekompletna) → ToSort
+                # (czeka na brakujące pliki), jak dotąd
+                _row = self.index.lookup(src)
+                _known = not (self._wholly_unknown(_row) if _row is not None
+                              else ncase(os.path.abspath(str(src)))
+                              not in self._known_sources)
+                dst = (self.tosort / _rel(src) if _known
+                       else self._unknown_dst(_rel(src)))
+                n = 1
+                # kolizja nazw w ToSort — tylko realnie (w podglądzie nazwa
+                # celu jest informacyjna, bez pytania NAS o każdy plik)
+                while not self.dry_run and os.path.lexists(dst):
+                    dst = dst.with_name(f"{dst.stem}_{n}{dst.suffix}")
+                    n += 1
+                self._log((f"ZNANY→ToSort (treść znana DAT-om): " if _known else
+                           f"NIEZNANY→ToSort\\nieznane (brak DAT-a): ")
+                          + f"{src}  ⟶  {dst}")
+                if self._move(src, dst):
+                    moved += 1
+                    self.stats.tosorted += 1
+                    self._moved_to_tosort.add(ncase(str(dst)))
+            if not self.dry_run:
+                self._prune_empty_dirs(d)     # puste sieroty po zabraniu plików
+        return moved
+
+    UNKNOWN_DIRNAME = "nieznane"
+
+    def _unknown_dst(self, rel) -> Path:
+        """Cel dla treści, której nie zna żaden DAT: <ToSort>\\nieznane\\<rel>."""
+        return self.tosort / self.UNKNOWN_DIRNAME / Path(rel)
+
+    def _dat_known(self, crc, size) -> bool:
+        """Treść (CRC+rozmiar) jest ROM-em JAKIEGOKOLWIEK DAT-u (także
+        wyłączonego). Zbiór budowany raz z `set_hierarchy` (0.7.05); bez
+        hierarchii (testy jednostkowe) → False (jak dawniej)."""
+        if not (size or 0) or not crc:
+            return False
+        if getattr(self, "_dat_keys", None) is None:
+            keys: set = set()
+            for e in getattr(self, "_all_entries", None) or ():
+                try:
+                    games = e.load().games
+                except Exception:
+                    continue
+                for g in games:
+                    for r in g.roms:
+                        if r.crc and (r.size or 0):
+                            try:
+                                keys.add((int(r.crc, 16) << 34) | int(r.size))
+                            except ValueError:
+                                pass
+            self._dat_keys = keys
+        try:
+            return ((int(str(crc), 16) << 34) | int(size)) in self._dat_keys
+        except (TypeError, ValueError):
+            return False
+
+    def _dat_profile_known(self, dsha) -> bool:
+        """Odcisk TREŚCI płyty (`data_sha1` CHD/RVZ) = odcisk gry płytowej
+        JAKIEGOKOLWIEK DAT-u (0.7.08). Zbiór budowany raz, jak `_dat_known`."""
+        if not dsha:
+            return False
+        if getattr(self, "_dat_profiles", None) is None:
+            from .datfile import game_profile
+            from .matcher import _disc_like
+            prof: set = set()
+            for e in getattr(self, "_all_entries", None) or ():
+                try:
+                    games = e.load().games
+                except Exception:
+                    continue
+                for g in games:
+                    if _disc_like(g):
+                        pr = game_profile(g.data_roms)
+                        if pr:
+                            prof.add(pr.lower())
+            self._dat_profiles = prof
+        return str(dsha).lower() in self._dat_profiles
+
+    @staticmethod
+    def _dsha(m) -> str:
+        """`data_sha1` wiersza (odcisk treści płyty) albo "" (członek zipa,
+        plik bez sondy)."""
+        try:
+            return (m["data_sha1"] or "").lower()
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    def _wholly_unknown(self, row) -> bool:
+        """Plik do wyniesienia jest CAŁKIEM nieznany: nie jest źródłem żadnego
+        DAT-u i żadna część jego treści (członek / cały plik, po sumach) nie
+        leży w katalogach DAT-ów → `ToSort\\nieznane`. Znany albo mieszany →
+        ToSort jak dotąd (finał przepakuje mieszany: zostaną tylko nieznane)."""
+        np = os.path.normcase(os.path.abspath(str(row["path"])))
+        if np in self._known_sources:
+            return False
+        dp = self._del_prefixes or dir_prefixes([self.tosort])
+        if str(row["path"]).lower().endswith((".zip", ".7z")):
+            members = list(self.index.members_of(row["path"]))
+        else:
+            members = [row]
+        for m in members:
+            if not (m["size"] or 0):
+                continue
+            # znana DAT-om (0.7.05) albo leży w kolekcji → nie „nieznane"
+            if self._dat_known(m["crc32"], m["size"]):
+                return False
+            if self._content_placed_outside(
+                    m["sha1"], m["crc32"], m["size"], dp, exclude=np):
+                return False
+            # płyta (CHD/RVZ): po odcisku TREŚCI, nie sumie pliku (0.7.08)
+            ds = self._dsha(m)
+            if ds and (self._dat_profile_known(ds) or self._content_placed_outside(
+                    ds, None, None, dp, exclude=np)):
+                return False
+        return True
+
+    def sort_tosort_unknown(self, delete_roots, cancel=None) -> int:
+        """FINAŁ (0.7.02, zasada usera): pliki w ToSort, których NIE używa
+        jako źródła żaden DAT → `<ToSort>\\nieznane\\<ścieżka>`.
+
+        - luźny plik / archiwum bez członków znanych z katalogów DAT-ów →
+          przeniesienie (ten sam wolumin = zmiana nazwy);
+        - archiwum ZIP mieszane (część członków leży w katalogach DAT-ów) →
+          TorrentZip tylko z członkami NIEZNANYMI do `nieznane`, oryginał
+          kasowany (znani są potwierdzeni w kolekcji); 7z mieszane — bez zmian.
+        Pomija: `nieznane`, bibliotekę `cues` (chroniona), pliki przeniesione do
+        ToSort w tym przebiegu i zaplanowane do skasowania. Zwraca liczbę
+        przeniesionych/przepakowanych."""
+        if self.tosort is None:
+            return 0
+        del_prefixes = dir_prefixes(delete_roots)
+        done = 0
+        rows: list = []
+        for r in delete_roots or ():
+            if not r:
+                continue
+            root = Path(os.path.abspath(str(r)))
+            unk = dir_prefixes([root / self.UNKNOWN_DIRNAME])[0]
+            for row in self.index.all_under(root, physical_only=True):
+                np = os.path.normcase(row["path"])
+                if (np.startswith(unk) or np in self._moved_to_tosort
+                        or np in self._known_sources
+                        or (self.dry_run and np in self._dry_gone)
+                        or is_protected(row["path"])):
+                    continue
+                rows.append((root, row))
+        total = len(rows) or 1
+        for i, (root, row) in enumerate(rows, 1):
+            if cancel is not None and cancel.is_set():
+                self.cancelled = True
+                break
+            src = Path(row["path"])
+            if i % 50 == 0 or i == total:
+                self._phase(i, total, f"ToSort → nieznane: {src.name}")
+            if not self.dry_run and not src.is_file():
+                continue
+            try:
+                rel = src.relative_to(root)
+            except ValueError:
+                rel = Path(src.name)
+            dst = self.tosort / self.UNKNOWN_DIRNAME / rel
+            n = 1
+            while not self.dry_run and os.path.lexists(dst):
+                dst = dst.with_name(f"{dst.stem}_{n}{dst.suffix}")
+                n += 1
+            ext = src.suffix.lower()
+            if ext in (".zip", ".7z"):
+                members = list(self.index.members_of(src))
+            else:                             # luźny plik = jeden „członek"
+                members = [{"name": src.name, "sha1": row["sha1"],
+                            "crc32": row["crc32"], "size": row["size"],
+                            "data_sha1": self._dsha(row)}]
+            real = [m for m in members if (m["size"] or 0)]
+            # w kolekcji (katalogi DAT-ów) / znane DAT-om (poza kolekcją: braki,
+            # tory gier na CHD) / NIEZNANE żadnemu DAT-owi (0.7.05)
+            placed, dat_known, unknown = [], [], []
+            for m in real:
+                ds = self._dsha(m)
+                if (self._content_placed_outside(m["sha1"], m["crc32"],
+                                                 m["size"], del_prefixes)
+                        or (ds and self._content_placed_outside(
+                            ds, None, None, del_prefixes))):
+                    placed.append(m)
+                elif (self._dat_known(m["crc32"], m["size"])
+                      or (ds and self._dat_profile_known(ds))):
+                    dat_known.append(m)
+                else:
+                    unknown.append(m)
+            if real and not unknown:
+                continue                      # treść znana — nie „nieznane"
+            if dat_known:
+                continue                      # część znana DAT-om — zostaje w ToSort
+            if placed:
+                if ext != ".zip":
+                    continue                  # 7z mieszane — nie umiemy
+                if self._repack_unknown_only(src, dst, members, placed):
+                    done += 1
+                continue
+            self._log(("(podgląd) " if self.dry_run else "")
+                      + f"NIEZNANE w ToSort → nieznane: {src}  ⟶  {dst}")
+            if self._move(src, dst):
+                done += 1
+                self.stats.tosorted += 1
+                self._moved_to_tosort.add(os.path.normcase(str(dst)))
+        return done
+
+    def _repack_unknown_only(self, src: Path, dst: Path, members,
+                             known) -> bool:
+        """Zip mieszany: TorrentZip z członkami NIEZNANYMI (spoza katalogów
+        DAT-ów) pod `dst`, oryginał kasowany. Podgląd tylko loguje."""
+        kn = {m["name"] for m in known}
+        keep = [m for m in members if m["name"] not in kn]
+        self._log(("(podgląd) " if self.dry_run else "")
+                  + f"PRZEPAKUJ (tylko nieznane, {len(keep)} z {len(members)} "
+                  f"plików; znane są w kolekcji): {src}  ⟶  {dst}")
+        if self.dry_run:
+            self._dry_gone.add(os.path.normcase(os.path.abspath(str(src))))
+            return True
+        import zipfile
+        from .torrentzip import write_torrentzip
+        self._ensure_dir(dst.parent)
+        tmp = dst.with_name(dst.name + ".chdbuddy_rebuild_tmp")
+        try:
+            with zipfile.ZipFile(src) as zin:
+                names = set(zin.namelist())
+                entries = [(m["name"], (lambda n=m["name"]: zin.open(n)))
+                           for m in keep if m["name"] in names]
+                if len(entries) != len(keep):
+                    raise ValueError("skład zipa niezgodny z indeksem")
+
+                def _prog(d, t, lab):
+                    self._detail(d, t, f"przepakowuję {lab}")
+                write_torrentzip(tmp, entries, on_progress=_prog,
+                                 label=dst.name)
+            with zipfile.ZipFile(tmp) as zchk:
+                if zchk.testzip() is not None:
+                    raise ValueError("błąd CRC po przepakowaniu")
+            replace_rw(tmp, dst)
+            _retry_locked(lambda: unlink_rw(src))
+            self.index.remove_path(src)
+            try:
+                self.index.reindex_archive(dst)
+            except Exception:
+                pass
+            self.stats.repacked += 1
+            self._moved_to_tosort.add(os.path.normcase(str(dst)))
+            return True
+        except Exception as e:
+            self.stats.errors += 1
+            self._log(f"BŁĄD przepakowania {src}: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        finally:
+            self._detail_clear()
+
+    def _redundant_copy(self, row) -> Optional[str]:
+        """Kanoniczna ścieżka (plik albo ARCHIWUM), w której treść wiersza
+        `row` już leży w kolekcji — albo None. Liczą się tylko ścieżki
+        kanoniczne tego przebiegu (nie inna sierota obok), fizyczne (nie link,
+        który mógłby wskazywać właśnie na ten plik) i poza ToSort. Członkowie
+        archiwów też: luźne .pcm/.sfc gry MSU-1 spakowanej w <gra>.zip."""
+        size = row["size"] or 0
+        if not size:
+            return None
+        own = os.path.normcase(row["path"])
+        keeper = self._keeper_of(row["sha1"], row["crc32"], size, own)
+        if keeper is not None:
+            return keeper
+        # ARCHIWUM: treść = pliki w środku, nie bajty zipa (inna nazwa
+        # wewnętrzna / starszy zip = inne bajty, ta sama gra). Zbędne, gdy
+        # KAŻDY niepusty członek leży już w kolekcji (0.6.98: 1484 duplikaty
+        # pod starymi nazwami szły do ToSort i wracały do kasowania)
+        try:
+            mem = self.index.members_of(row["path"])
+        except Exception:
+            mem = []
+        first = None
+        for m in mem:
+            if not (m["size"] or 0):
+                continue
+            k = self._keeper_of(m["sha1"], m["crc32"], m["size"], own)
+            if k is None:
+                return None
+            first = first or k
+        return first
+
+    def _keeper_of(self, sha1, crc, size: int, own: str) -> Optional[str]:
+        """Kanoniczna, fizyczna ścieżka tego przebiegu (poza ToSort i poza
+        `own`) z treścią o tej sumie — plik luzem albo archiwum z takim
+        członkiem; None, gdy nie ma."""
+        if sha1:
+            cands = [(r["path"], r["is_link"])
+                     for r in self.index.find_sha1(sha1, include_chd_content=False)]
+            cands += [(r["archive"], 0) for r in self.index.find_member_sha1(sha1)]
+        elif crc:
+            cands = [(r["path"], r["is_link"])
+                     for r in self.index.find_crc(crc, size)]
+            cands += [(r["archive"], 0)
+                      for r in self.index.find_member_crc(crc, size)]
+        else:
+            return None
+        for path, link in cands:
+            np = os.path.normcase(path)
+            if link or np == own or np not in self._canonical:
+                continue
+            if any(np.startswith(dp) for dp in self._del_prefixes):
+                continue
+            # realna naprawa: potwierdź FIZYCZNIE (indeks bywa nieaktualny)
+            if self.dry_run or (os.path.lexists(path)
+                                and not is_link(Path(path))):
+                return path
+        return None
+
     def _clean_dir(self, target_dir: Path) -> None:
+        """Nie-kanoniczne pliki katalogu docelowego: zły link → usuń; treść już
+        ułożona w kolekcji (przy włączonym kasowaniu z ToSort) → usuń; reszta →
+        ToSort. PODGLĄD opiera się wyłącznie na indeksie (zero rund SMB na plik
+        — na NAS to były minuty ciszy); realna naprawa sprawdza system plików."""
         assert self.tosort is not None
+        _cancel = getattr(self, "_cancel", None)
         for row in self.index.all_under(target_dir, physical_only=False):
             if os.path.normcase(row["path"]) in self._canonical:
                 continue
+            if os.path.normcase(row["path"]) in self._pending_purge:
+                continue            # źródło skonwertowanej gry — zostanie SKASOWANE
+            if _cancel is not None and _cancel.is_set():
+                self.cancelled = True
+                return
+            src = Path(row["path"])
             self._clean_done = getattr(self, "_clean_done", 0) + 1
             self._phase(self._clean_done, getattr(self, "_clean_total", 1),
-                        "sprzątanie do ToSort")
-            src = Path(row["path"])
+                        f"sprzątanie: {src.name}")
             # LINK, który nie jest kanoniczną ścieżką żadnej dopasowanej gry
             # (np. błędny link 5S→1S sprzed poprawki odcisków) — USUŃ; linki
             # tworzy wyłącznie program, więc nieuzasadniony = śmieć.
-            if is_link(src):
+            if row["is_link"] if self.dry_run else is_link(src):
                 self._log(f"USUŃ zły link: {src}")
                 if not self.dry_run:
                     try:
@@ -947,15 +3519,51 @@ class Rebuilder:
                     except OSError as e:
                         self._log(f"  nie usunięto: {e}")
                 continue
-            if not src.is_file():
+            if not self.dry_run and not src.is_file():
                 continue
+            # PLAYLISTY .m3u (multi-disc) NIE są w DAT-cie, ale są potrzebne i
+            # program sam je generuje — NIE ruszamy ich do ToSort.
+            if src.suffix.lower() == ".m3u":
+                continue
+            # pliki FRONTENDU (images\, videos\, gamelist.xml… — RetroBat):
+            # nie są grami, sprzątanie ich nie rusza (0.6.94)
+            if is_frontend_under(src, target_dir):
+                continue
+            # treść JUŻ jest w kolekcji (np. luźne pliki MSU-1 obok <gra>.zip):
+            # w ToSort byłaby tylko zbędną kopią — kasujemy, gdy włączone jest
+            # kasowanie ułożonych kopii z ToSort
+            if self._del_prefixes:
+                keeper = self._redundant_copy(row)
+                if keeper is not None:
+                    if not self._plan_delete(src):
+                        continue                # podgląd: już zaplanowane
+                    self._log(("(podgląd) " if self.dry_run else "")
+                              + f"KASUJ zbędną kopię: {src} (jest w {keeper})")
+                    if self.dry_run:
+                        self.stats.tosort_deleted += 1
+                        continue
+                    try:
+                        if _retry_locked(lambda pp=src: unlink_tracked(
+                                pp, self.index)):
+                            self.stats.tosort_deleted += 1
+                    except OSError as e:
+                        self._log(f"  nie skasowano: {e}")
+                    continue
             rel = src.relative_to(target_dir)
-            dst = self.tosort / target_dir.name / rel
-            # nie nadpisuj niczego w ToSort — dołóż licznik
+            # 0.7.02: treść nieznana żadnemu DAT-owi → ToSort\nieznane; źródło
+            # dopasowane do DAT-u (np. gra niekompletna) → ToSort, jak dotąd
+            if self._wholly_unknown(row):
+                dst = self._unknown_dst(Path(target_dir.name) / rel)
+            else:
+                dst = self.tosort / target_dir.name / rel
+            # nie nadpisuj niczego w ToSort — dołóż licznik (podgląd bez
+            # sprawdzania NAS: nazwa celu jest tam tylko informacyjna)
             n = 1
-            while os.path.lexists(dst):
+            while not self.dry_run and os.path.lexists(dst):
                 dst = dst.with_name(f"{dst.stem}_{n}{dst.suffix}")
                 n += 1
             self._log(f"TOSORT {src} -> {dst}")
             if self._move(src, dst):
                 self.stats.tosorted += 1
+                # oznacz jako przeniesione w tym przebiegu — dedup go NIE skasuje
+                self._moved_to_tosort.add(os.path.normcase(str(dst)))

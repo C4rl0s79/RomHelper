@@ -30,6 +30,13 @@ from PySide6.QtWidgets import (
 
 from ..core.dirrules import DirRules, save_rule, suggest_format
 from ..core.i18n import tr
+from ..core import mamesets
+
+_ARCADE_LABELS = [
+    ("split", "split — klon tylko z ROM-ami unikalnymi (najmniejsze, wg DAT-u)"),
+    ("non-merged", "non-merged — każdy set kompletny i samodzielny (BIOS osobno)"),
+    ("merged", "merged — klony wewnątrz zipa rodzica"),
+]
 
 _FORMAT_LABELS = [
     ("keep", "zostaw jak jest (bez konwersji)"),
@@ -61,9 +68,20 @@ class DatSettingsDialog(QDialog):
             "only_complete": bool(eff.get("only_complete", True)),
             "dedup_copies": bool(eff.get("dedup_copies", True)),
             "prefer_translations": bool(eff.get("prefer_translations", False)),
+            "role": eff.get("role", "collection"),
             "format": (inherited_format or "keep") if is_child
                       else eff.get("format", "keep"),
+            "arcade_format": mamesets.normalize_format(
+                eff.get("arcade_format", "split")),
         }
+        # ARCADE parent/clone? Wybór formatu setów (split/merged/non-merged)
+        # pokazujemy TYLKO dla DAT-ów z logiką parent/clone (cloneof/romof/isbios).
+        self._is_arcade = False
+        try:
+            entry.load()
+            self._is_arcade = mamesets.has_parent_clone(entry.games)
+        except Exception:
+            self._is_arcade = False
 
         lay = QVBoxLayout(self)
         form = QFormLayout()
@@ -112,12 +130,27 @@ class DatSettingsDialog(QDialog):
             label = tr("Format przechowywania (rodzic):")
         form.addRow(label, frow)
 
+        # FORMAT ZESTAWÓW ARCADE (tylko DAT parent/clone)
+        self.cmb_arcade = None
+        if self._is_arcade:
+            self.cmb_arcade = QComboBox()
+            for key, lbl in _ARCADE_LABELS:
+                self.cmb_arcade.addItem(tr(lbl), key)
+            ai = self.cmb_arcade.findData(self._initial["arcade_format"])
+            self.cmb_arcade.setCurrentIndex(ai if ai >= 0 else 0)
+            self.cmb_arcade.setToolTip(tr(
+                "DAT ma logikę parent/clone (MAME/FBNeo). Wybierz jak trzymać "
+                "sety: split (wg DAT-u), non-merged (samodzielne) lub merged. "
+                "BIOS zawsze osobno. Przy „tylko kompletne” w non-merged wystarczy "
+                "jedna grywalna wersja na rodzinę parent/clone."))
+            form.addRow(tr("Format zestawów arcade:"), self.cmb_arcade)
+
         # reguły
         self.chk_skip = QCheckBox(tr("pomiń ten DAT (nie raportuj / nie buduj)"))
         self.chk_skip.setChecked(bool(eff.get("skip", False)))
         self.chk_complete = QCheckBox(tr("buduj tylko kompletne gry"))
         self.chk_complete.setChecked(bool(eff.get("only_complete", True)))
-        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → symlinki"))
+        self.chk_dedup = QCheckBox(tr("kopie potwierdzonych → hardlinki"))
         self.chk_dedup.setChecked(bool(eff.get("dedup_copies", True)))
         self.chk_trans = QCheckBox(tr("podmieniaj wersje (Japan) na tłumaczenia [T-En]"))
         self.chk_trans.setChecked(bool(eff.get("prefer_translations", False)))
@@ -125,15 +158,27 @@ class DatSettingsDialog(QDialog):
                   self.chk_trans):
             form.addRow("", c)
 
+        # ROLA DAT-u: zwykła kolekcja albo pula tłumaczeń
+        self.cmb_role = QComboBox()
+        self.cmb_role.addItem(tr("kolekcja (parent/child)"), "collection")
+        self.cmb_role.addItem(tr("tłumaczenia (pula wariantów do podmiany)"),
+                              "translations")
+        ri = self.cmb_role.findData(eff.get("role", "collection"))
+        self.cmb_role.setCurrentIndex(ri if ri >= 0 else 0)
+        self.cmb_role.setToolTip(tr(
+            "„tłumaczenia” = ten DAT to źródło fanowskich tłumaczeń; jego gry "
+            "służą do podmiany w innych DAT-ach (nie jest celem podstawowym)."))
+        form.addRow(tr("Rola DAT-u:"), self.cmb_role)
+
         if is_child:
             note_txt = tr("To DAT-DZIECKO swojej platformy — jego pliki to "
-                        "symlinki do plików RODZICA, więc format jest "
+                        "hardlinki do plików RODZICA, więc format jest "
                         "dziedziczony i niezmienialny tutaj. Zmień go w "
                         "ustawieniach DAT-a rodzica (albo w oknie hierarchii).")
         else:
             note_txt = tr("Format (chd/rvz/zip) to docelowy sposób przechowywania "
                         "RODZICA — dzieci platformy dziedziczą go automatycznie "
-                        "(są symlinkami). Konwersja przy naprawie jest osobnym "
+                        "(są hardlinkami). Konwersja przy naprawie jest osobnym "
                         "krokiem; teraz zapisujesz preferencję.")
         note = QLabel(note_txt)
         note.setWordWrap(True)
@@ -178,9 +223,12 @@ class DatSettingsDialog(QDialog):
             "only_complete": self.chk_complete.isChecked(),
             "dedup_copies": self.chk_dedup.isChecked(),
             "prefer_translations": self.chk_trans.isChecked(),
+            "role": self.cmb_role.currentData(),
         }
         if not self.is_child:                 # dziecko dziedziczy format rodzica
             current["format"] = self.cmb_format.currentData()
+        if self.cmb_arcade is not None:       # tylko DAT parent/clone
+            current["arcade_format"] = self.cmb_arcade.currentData()
         # zapisz TYLKO to, co user zmienił względem stanu początkowego
         # (strip_defaults=False: nadpisanie na wartość domyślną też przetrwa)
         updates = {k: v for k, v in current.items()

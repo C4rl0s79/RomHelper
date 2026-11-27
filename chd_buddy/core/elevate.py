@@ -58,6 +58,15 @@ def can_symlink(probe_dir: Path | None = None) -> bool:
 
 def symlink_status() -> tuple[bool, str]:
     """(czy_można, opis) — do pokazania w GUI."""
+    if os.name != "nt":
+        # Na Linuksie symlink to zwykła operacja użytkownika; jedyne realne
+        # przyczyny odmowy to system plików bez symlinków (FAT/exFAT/NTFS
+        # zamontowany bez uprawnień) albo katalog tylko do odczytu.
+        if can_symlink():
+            return True, "Symlinki: DOSTĘPNE."
+        return False, ("Symlinki: NIEDOSTĘPNE — system plików ich nie wspiera "
+                       "(FAT/exFAT?) albo katalog jest tylko do odczytu. Bez "
+                       "nich miejsca dzieci zostaną PUSTE (nic nie kopiujemy).")
     if can_symlink():
         how = "administrator" if is_admin() else "tryb dewelopera"
         return True, f"Symlinki: DOSTĘPNE ({how})."

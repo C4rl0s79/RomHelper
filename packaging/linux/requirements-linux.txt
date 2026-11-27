@@ -1,0 +1,13 @@
+# Zależności chd_buddy na Linuksie (instaluje install.sh do .venv).
+# Rdzeń i CLI korzystają tylko ze stdlib — poniżej GUI i funkcje opcjonalne.
+
+PySide6>=6.6       # GUI (wymaga bibliotek systemowych Qt — patrz DEPS.md)
+py7zr>=0.21        # odczyt archiwów .7z / .zip
+Pillow>=10.0       # ikony gier (boxarty → PNG)
+requests>=2.31     # pobieranie aktualizacji emulatorów
+
+# Uwagi:
+# - pywin32 NIE jest potrzebne: skróty na Linuksie to pliki .desktop,
+#   generowane bez COM-a.
+# - chd-rs-py celowo pominięte (sdist bez wheeli, wymaga toolchainu Rusta);
+#   metadane CHD czytamy przez `chdman info`.
